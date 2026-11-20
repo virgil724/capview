@@ -26,7 +26,19 @@ Tested on Windows 11 with **AVerMedia Live Gamer Ultra (GC553)** capturing `NV12
 
 - **Audio**: WASAPI shared event-driven passthrough (`48 kHz` capture → `96 kHz` DAC auto-resampled). GC553 audio arrival via WASAPI is `18.9–21.8 ms` during simultaneous video capture (measured with `caplat sync`, within `1–4 ms` of video).
 - **Zero frame drops**: Sustained `60.0 fps` with `0` dropped frames in fullscreen VRR mode.
-- **Comparison**: Typical OBS Studio preview on the same setup lands around `~45–55 ms` due to OBS's compositor tick (`0–16.7 ms`) and DWM/preview buffering.
+
+### Comparison vs OBS Studio & Other Tools (GC553, 1080p60 → 165 Hz Monitor)
+
+| Tool | Binary / Install | Capture → Screen Center | Extra Latency Sources | Notes |
+| :--- | :---: | :---: | :--- | :--- |
+| **`capview` (`F11` VRR)** | **2.5 MB single `.exe`** | **~22.9 ms** *(measured)* | None (MF + 0.8 ms iFlip/VRR) | Zero setup, auto-pairs audio, brand-agnostic |
+| **`capview` (Windowed)** | **2.5 MB single `.exe`** | **~37–38 ms** *(measured)* | DWM composition (~14–15 ms) | Convenient while multitasking |
+| **OBS Studio Preview** | ~300 MB installer | **~45–55 ms** *(estimated)* | 60 fps compositor wait (0–16.7 ms) + DWM preview queue | Great for streaming/recording; overkill for playing |
+| **OBS Virtual Camera → ffmpeg** | ~300 MB + ffmpeg | **~63+ ms** *(measured to app)* | Compositor + virtual-cam queue + DirectShow/ffmpeg | Measured `63 ms` before display |
+| **VLC / PotPlayer** | ~50–150 MB | **~60–150 ms** *(typical)* | DirectShow input buffering + player sync queue | Not designed for live console gameplay |
+| **Vendor Apps (RECentral / 4K Utility)** | ~200–500 MB | **~35–50 ms** *(typical)* | Brand-locked UI / compositor pipeline | Tied to one capture card brand |
+
+> **Note on physical limit**: At 60 Hz, a single HDMI frame takes `16.67 ms` to scan out. USB capture cards must receive a full frame before handing it to Windows (`18.1 ms` on GC553 via Media Foundation), so `~22–25 ms` to the center of a 165 Hz monitor is near the physical floor for USB 60 Hz capture. For zero-added latency when playing locally, use the capture card's HDMI passthrough output directly to a monitor.
 
 ## Usage
 
