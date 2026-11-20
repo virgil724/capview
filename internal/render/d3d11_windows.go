@@ -67,20 +67,36 @@ type AudioControl interface {
 	Volume() float32
 }
 
+// Host bridges the renderer with dynamic device/mode switching and the native
+// right-click context menu.
+type Host interface {
+	ModeLabel() string
+	Audio() AudioControl
+	BuildMenu(fullscreen, vsync bool) []win.MenuItem
+	HandleMenu(id uint32) (toggleFS, toggleVSync, quit bool)
+}
+
+// FinalState records the window state at exit so it can be persisted.
+type FinalState struct {
+	Fullscreen bool
+	VSync      bool
+	WindowRect win.RECT
+}
+
 // Config configures the D3D11 viewer window and swap chain.
 type Config struct {
-	Display    string // "\\.\DISPLAY1" or "primary" (default)
-	Fullscreen bool   // start in borderless fullscreen (recommended for VRR / iFlip)
-	VSync      bool   // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
-	ModeLabel  string // shown in titlebar & stats
-	PrintStats bool   // print 1-line stats every second to stdout
-	Freq       int64  // QPC frequency
-	Audio      AudioControl
+	Display    string    // "\\.\DISPLAY1" or "primary" (default)
+	Fullscreen bool      // start in borderless fullscreen
+	VSync      bool      // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
+	SavedRect  *win.RECT // optional saved windowed position/size
+	PrintStats bool      // print 1-second latency stats to stdout
+	Freq       int64     // QPC frequency
+	Host       Host
 }
 
 // Run creates the viewer window and renders frames from mailbox until closed
-// (ESC, Q, or window close) or srcDone closes.
-func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr func() error) error {
+// (ESC, Q, or window close).
+func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -90,13 +106,13 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 
 	fac, err := win.CreateFactory()
 	if err != nil {
-		return fmt.Errorf("DXGI factory: %w", err)
+		return FinalState{}, fmt.Errorf("DXGI factory: %w", err)
 	}
 	defer fac.Release()
 
 	targetRect, err := resolveDisplayRect(fac, cfg.Display)
 	if err != nil {
-		return err
+		return FinalState{}, err
 	}
 
 	var (
@@ -104,6 +120,7 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 		needResize     bool
 		toggleFS       bool
 		toggleVSync    bool
+		openMenu       bool
 		borderless     = cfg.Fullscreen
 		savedWinRect   = defaultWindowRect(targetRect)
 		useVSync       = cfg.VSync
@@ -112,6 +129,9 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 		cursorVisible  = true
 		lastMouseMove  = time.Now()
 	)
+	if cfg.SavedRect != nil && cfg.SavedRect.Right-cfg.SavedRect.Left >= 320 && cfg.SavedRect.Bottom-cfg.SavedRect.Top >= 180 {
+		savedWinRect = *cfg.SavedRect
+	}
 	setCursor := func(show bool) {
 		if cursorVisible != show {
 			win.ShowCursor(show)
@@ -129,6 +149,19 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 		initRect = targetRect
 	}
 
+	getAudio := func() AudioControl {
+		if cfg.Host != nil {
+			return cfg.Host.Audio()
+		}
+		return nil
+	}
+	getModeLabel := func() string {
+		if cfg.Host != nil {
+			return cfg.Host.ModeLabel()
+		}
+		return ""
+	}
+
 	wndProc := win.NewWndProc(func(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
 		switch msg {
 		case win.WM_CLOSE, win.WM_DESTROY:
@@ -141,13 +174,18 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 			lastMouseMove = time.Now()
 			setCursor(true)
 			return 0
+		case win.WM_RBUTTONUP:
+			lastMouseMove = time.Now()
+			setCursor(true)
+			openMenu = true
+			return 0
 		case win.WM_MOUSEWHEEL:
-			if cfg.Audio != nil {
+			if a := getAudio(); a != nil {
 				delta := int16(wp >> 16)
 				if delta > 0 {
-					cfg.Audio.AdjustVolume(0.05)
+					a.AdjustVolume(0.05)
 				} else if delta < 0 {
-					cfg.Audio.AdjustVolume(-0.05)
+					a.AdjustVolume(-0.05)
 				}
 			}
 			return 0
@@ -163,18 +201,18 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 				toggleVSync = true
 				return 0
 			case win.VK_M:
-				if cfg.Audio != nil {
-					cfg.Audio.ToggleMute()
+				if a := getAudio(); a != nil {
+					a.ToggleMute()
 				}
 				return 0
 			case win.VK_UP:
-				if cfg.Audio != nil {
-					cfg.Audio.AdjustVolume(0.05)
+				if a := getAudio(); a != nil {
+					a.AdjustVolume(0.05)
 				}
 				return 0
 			case win.VK_DOWN:
-				if cfg.Audio != nil {
-					cfg.Audio.AdjustVolume(-0.05)
+				if a := getAudio(); a != nil {
+					a.AdjustVolume(-0.05)
 				}
 				return 0
 			}
@@ -188,9 +226,9 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 		return win.DefWindowProc(hwnd, msg, wp, lp)
 	})
 
-	hwnd, err := win.CreateViewerWindow("capview_wnd", "capview - "+cfg.ModeLabel, initRect, borderless, wndProc)
+	hwnd, err := win.CreateViewerWindow("capview_wnd", "capview - "+getModeLabel(), initRect, borderless, wndProc)
 	if err != nil {
-		return fmt.Errorf("create window: %w", err)
+		return FinalState{}, fmt.Errorf("create window: %w", err)
 	}
 	defer win.DestroyWindow(hwnd)
 
@@ -198,7 +236,7 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 
 	dev, ctx, err := win.CreateDevice(0)
 	if err != nil {
-		return fmt.Errorf("D3D11 device: %w", err)
+		return FinalState{}, fmt.Errorf("D3D11 device: %w", err)
 	}
 	defer dev.Release()
 	defer ctx.Release()
@@ -225,38 +263,38 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 	}
 	sc, err := fac.CreateSwapChainForHwnd(dev.Object, hwnd, &scDesc)
 	if err != nil {
-		return fmt.Errorf("swap chain: %w", err)
+		return FinalState{}, fmt.Errorf("swap chain: %w", err)
 	}
 	defer sc.Release()
 
 	// Compile shaders.
 	vsCode, err := win.CompileHLSL(fullscreenVS, "main", "vs_5_0")
 	if err != nil {
-		return err
+		return FinalState{}, err
 	}
 	vs, err := dev.CreateVertexShader(vsCode)
 	if err != nil {
-		return fmt.Errorf("create VS: %w", err)
+		return FinalState{}, fmt.Errorf("create VS: %w", err)
 	}
 	defer vs.Release()
 
 	nv12Code, err := win.CompileHLSL(nv12PS, "main", "ps_5_0")
 	if err != nil {
-		return err
+		return FinalState{}, err
 	}
 	psNV12, err := dev.CreatePixelShader(nv12Code)
 	if err != nil {
-		return fmt.Errorf("create NV12 PS: %w", err)
+		return FinalState{}, fmt.Errorf("create NV12 PS: %w", err)
 	}
 	defer psNV12.Release()
 
 	yuy2Code, err := win.CompileHLSL(yuy2PS, "main", "ps_5_0")
 	if err != nil {
-		return err
+		return FinalState{}, err
 	}
 	psYUY2, err := dev.CreatePixelShader(yuy2Code)
 	if err != nil {
-		return fmt.Errorf("create YUY2 PS: %w", err)
+		return FinalState{}, fmt.Errorf("create YUY2 PS: %w", err)
 	}
 	defer psYUY2.Release()
 
@@ -269,14 +307,14 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 		MaxLOD:         3.402823466e+38, // FLT_MAX
 	})
 	if err != nil {
-		return fmt.Errorf("create sampler: %w", err)
+		return FinalState{}, fmt.Errorf("create sampler: %w", err)
 	}
 	defer sampler.Release()
 
 	// Back-buffer RTV (recreated on resize).
 	rtv, err := makeBackBufferRTV(dev, sc)
 	if err != nil {
-		return err
+		return FinalState{}, err
 	}
 	defer func() {
 		if rtv != 0 {
@@ -332,6 +370,26 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 			break
 		}
 
+		if openMenu {
+			openMenu = false
+			if cfg.Host != nil {
+				items := cfg.Host.BuildMenu(borderless, useVSync)
+				if id := win.ShowContextMenu(hwnd, items); id != 0 {
+					tFS, tVS, q := cfg.Host.HandleMenu(id)
+					if tFS {
+						toggleFS = true
+					}
+					if tVS {
+						toggleVSync = true
+					}
+					if q {
+						quit = true
+						break
+					}
+				}
+				lastMouseMove = time.Now()
+			}
+		}
 		if toggleFS {
 			toggleFS = false
 			if !borderless {
@@ -356,24 +414,16 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 					rtv = 0
 				}
 				if err := sc.ResizeBuffers(2, uint32(winW), uint32(winH), win.DXGI_FORMAT_B8G8R8A8_UNORM, swapChainFlags); err != nil {
-					return fmt.Errorf("resize buffers: %w", err)
+					return FinalState{}, fmt.Errorf("resize buffers: %w", err)
 				}
 				rtv, err = makeBackBufferRTV(dev, sc)
 				if err != nil {
-					return err
+					return FinalState{}, err
 				}
 			}
 		}
 
 		select {
-		case <-srcDone:
-			if srcErr != nil {
-				if err := srcErr(); err != nil {
-					return fmt.Errorf("capture stopped: %w", err)
-				}
-			}
-			return nil
-
 		case <-statsTicker.C:
 			if borderless && time.Since(lastMouseMove) > 2*time.Second {
 				setCursor(false)
@@ -381,12 +431,12 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 				setCursor(true)
 			}
 			tearingActive := !useVSync && supportsTear
-			line := tracker.Summary().FormatLine(cfg.ModeLabel, tearingActive)
-			if cfg.Audio != nil {
-				if cfg.Audio.Muted() {
+			line := tracker.Summary().FormatLine(getModeLabel(), tearingActive)
+			if a := getAudio(); a != nil {
+				if a.Muted() {
 					line += " | vol MUTED"
 				} else {
-					line += fmt.Sprintf(" | vol %d%%", int(cfg.Audio.Volume()*100+0.5))
+					line += fmt.Sprintf(" | vol %d%%", int(a.Volume()*100+0.5))
 				}
 			}
 			win.SetWindowTitle(hwnd, "capview | "+line)
@@ -417,7 +467,7 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 				var err error
 				tex0, srv0, tex1, srv1, err = createVideoTextures(dev, f.FourCC, f.Width, f.Height)
 				if err != nil {
-					return err
+					return FinalState{}, err
 				}
 				texW, texH, texFmt = f.Width, f.Height, f.FourCC
 			}
@@ -425,14 +475,14 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 			// Upload CPU frame -> GPU dynamic texture(s).
 			if f.FourCC == "NV12" {
 				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width, f.Height); err != nil {
-					return err
+					return FinalState{}, err
 				}
 				if err := uploadPlane(ctx, tex1, f.Plane1, f.Stride1, f.Width, f.Height/2); err != nil {
-					return err
+					return FinalState{}, err
 				}
 			} else {
 				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width*2, f.Height); err != nil {
-					return err
+					return FinalState{}, err
 				}
 			}
 
@@ -467,7 +517,7 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 			}
 			presentQPC := win.QPC()
 			if pErr != nil && !errors.Is(pErr, win.ErrOccluded) {
-				return fmt.Errorf("present: %w", pErr)
+				return FinalState{}, fmt.Errorf("present: %w", pErr)
 			}
 
 			// Track present count and poll frame statistics for exact vblank timing.
@@ -499,7 +549,15 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr f
 			}, presentQPC)
 		}
 	}
-	return nil
+
+	if !borderless {
+		savedWinRect = win.GetWindowRect(hwnd)
+	}
+	return FinalState{
+		Fullscreen: borderless,
+		VSync:      useVSync,
+		WindowRect: savedWinRect,
+	}, nil
 }
 
 func makeBackBufferRTV(dev win.Device, sc win.SwapChain) (win.Object, error) {

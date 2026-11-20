@@ -5,12 +5,15 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/virgil724/capview/internal/audio"
 	"github.com/virgil724/capview/internal/capture"
+	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
 	"github.com/virgil724/capview/internal/win"
 )
@@ -25,6 +28,7 @@ func main() {
 	}
 	if err := runView(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		win.ShowErrorBox("capview", err.Error())
 		os.Exit(1)
 	}
 }
@@ -70,77 +74,404 @@ func runList() error {
 	return nil
 }
 
+type appHost struct {
+	mu      sync.Mutex
+	cfg     config.Config
+	cfgPath string
+	freq    int64
+	mailbox *capture.Mailbox
+	vid     *capture.Source
+	aud     *audio.Passthrough
+
+	// Menu action map populated on BuildMenu and consumed on HandleMenu.
+	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
+}
+
+func (h *appHost) startVideo() error {
+	src, err := capture.Start(capture.Config{
+		Device:        h.cfg.Device,
+		Width:         h.cfg.Width,
+		Height:        h.cfg.Height,
+		FPS:           h.cfg.FPS,
+		Format:        h.cfg.Format,
+		AutoReconnect: true,
+		Mailbox:       h.mailbox,
+	}, h.freq)
+	if err != nil {
+		return err
+	}
+	h.vid = src
+	h.cfg.Device = src.Mode.Device
+	h.cfg.Width = src.Mode.Width
+	h.cfg.Height = src.Mode.Height
+	h.cfg.FPS = src.Mode.FPS
+	fmt.Printf("video: %q (%s)\n", src.Mode.Device, src.Mode)
+	return nil
+}
+
+func (h *appHost) stopVideo() {
+	if h.vid != nil {
+		h.vid.Stop()
+		<-h.vid.Done()
+		h.vid = nil
+	}
+}
+
+func (h *appHost) startAudio() {
+	if h.cfg.AudioDisabled {
+		return
+	}
+	hint := h.cfg.Device
+	if h.vid != nil {
+		hint = h.vid.Mode.Device
+	}
+	aud, err := audio.Start(audio.Config{
+		InputDevice:  h.cfg.AudioIn,
+		OutputDevice: h.cfg.AudioOut,
+		VideoHint:    hint,
+		Volume:       h.cfg.Volume,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: audio passthrough disabled: %v\n", err)
+		return
+	}
+	if h.cfg.Muted {
+		aud.ToggleMute()
+	}
+	h.aud = aud
+	fmt.Printf("audio: %q (%d Hz) -> %q (%d Hz)\n", aud.InputName, aud.InputRate, aud.OutputName, aud.OutputRate)
+}
+
+func (h *appHost) stopAudio() {
+	if h.aud != nil {
+		h.cfg.Volume = h.aud.Volume()
+		h.cfg.Muted = h.aud.Muted()
+		h.aud.Stop()
+		<-h.aud.Done()
+		h.aud = nil
+	}
+}
+
+func (h *appHost) ModeLabel() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.vid == nil {
+		return "no signal"
+	}
+	if st := h.vid.Status(); st != "" {
+		return h.vid.Mode.String() + " (" + st + ")"
+	}
+	return h.vid.Mode.String()
+}
+
+func (h *appHost) Audio() render.AudioControl {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.aud == nil {
+		return nil
+	}
+	return h.aud
+}
+
+func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.menuActions = make(map[uint32]func() (bool, bool, bool))
+	nextID := uint32(100)
+	addAction := func(fn func() (bool, bool, bool)) uint32 {
+		id := nextID
+		nextID++
+		h.menuActions[id] = fn
+		return id
+	}
+
+	// 1. Video devices submenu.
+	var vidItems []win.MenuItem
+	if devs, err := capture.ListDevices(); err == nil {
+		for _, d := range devs {
+			devName := d
+			vidItems = append(vidItems, win.MenuItem{
+				ID:      addAction(func() (bool, bool, bool) { h.switchVideoDevice(devName); return false, false, false }),
+				Label:   devName,
+				Checked: h.vid != nil && strings.EqualFold(h.vid.Mode.Device, devName),
+			})
+		}
+	}
+	if len(vidItems) == 0 {
+		vidItems = []win.MenuItem{{Label: "(none)", Disabled: true}}
+	}
+
+	// 2. Resolution / FPS submenu for current device.
+	var modeItems []win.MenuItem
+	if h.vid != nil {
+		if modes, err := capture.ListModes(h.vid.Mode.Device); err == nil {
+			for _, m := range modes {
+				mode := m
+				cur := h.vid.Mode.Width == mode.Width &&
+					h.vid.Mode.Height == mode.Height &&
+					math.Abs(h.vid.Mode.FPS-mode.FPS) < 0.5
+				modeItems = append(modeItems, win.MenuItem{
+					ID:      addAction(func() (bool, bool, bool) { h.switchVideoMode(mode); return false, false, false }),
+					Label:   fmt.Sprintf("%dx%d @ %.0f fps (%s)", mode.Width, mode.Height, math.Round(mode.FPS), mode.FourCC),
+					Checked: cur,
+				})
+			}
+		}
+	}
+	if len(modeItems) == 0 {
+		modeItems = []win.MenuItem{{Label: "(unavailable)", Disabled: true}}
+	}
+
+	// 3. Audio input & output submenus.
+	inEps, outEps, _ := audio.ListEndpoints()
+	var audInItems []win.MenuItem
+	audInItems = append(audInItems, win.MenuItem{
+		ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn("", true); return false, false, false }),
+		Label:   "Disabled",
+		Checked: h.cfg.AudioDisabled,
+	})
+	audInItems = append(audInItems, win.MenuItem{
+		ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn("auto", false); return false, false, false }),
+		Label:   "Auto (match video card)",
+		Checked: !h.cfg.AudioDisabled && strings.EqualFold(h.cfg.AudioIn, "auto"),
+	})
+	for _, ep := range inEps {
+		name := ep
+		audInItems = append(audInItems, win.MenuItem{
+			ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn(name, false); return false, false, false }),
+			Label:   name,
+			Checked: !h.cfg.AudioDisabled && h.aud != nil && strings.EqualFold(h.aud.InputName, name),
+		})
+	}
+
+	var audOutItems []win.MenuItem
+	audOutItems = append(audOutItems, win.MenuItem{
+		ID:      addAction(func() (bool, bool, bool) { h.switchAudioOut("default"); return false, false, false }),
+		Label:   "System Default",
+		Checked: strings.EqualFold(h.cfg.AudioOut, "default") || h.cfg.AudioOut == "",
+	})
+	for _, ep := range outEps {
+		name := ep
+		audOutItems = append(audOutItems, win.MenuItem{
+			ID:      addAction(func() (bool, bool, bool) { h.switchAudioOut(name); return false, false, false }),
+			Label:   name,
+			Checked: !strings.EqualFold(h.cfg.AudioOut, "default") && h.aud != nil && strings.EqualFold(h.aud.OutputName, name),
+		})
+	}
+
+	muted := h.aud != nil && h.aud.Muted()
+
+	return []win.MenuItem{
+		{Label: "Video Device", Submenu: vidItems},
+		{Label: "Resolution / FPS", Submenu: modeItems},
+		{Label: "Audio Input", Submenu: audInItems},
+		{Label: "Audio Output", Submenu: audOutItems},
+		{Separator: true},
+		{
+			ID:      addAction(func() (bool, bool, bool) { return true, false, false }),
+			Label:   "Fullscreen (F11)",
+			Checked: fullscreen,
+		},
+		{
+			ID:      addAction(func() (bool, bool, bool) { return false, true, false }),
+			Label:   "Low-Latency VRR / Tearing (V)",
+			Checked: !vsync,
+		},
+		{
+			ID: addAction(func() (bool, bool, bool) {
+				if h.aud != nil {
+					h.aud.ToggleMute()
+				}
+				return false, false, false
+			}),
+			Label:    "Mute Audio (M)",
+			Checked:  muted,
+			Disabled: h.aud == nil,
+		},
+		{Separator: true},
+		{
+			ID:    addAction(func() (bool, bool, bool) { return false, false, true }),
+			Label: "Quit (ESC)",
+		},
+	}
+}
+
+func (h *appHost) HandleMenu(id uint32) (toggleFS, toggleVSync, quit bool) {
+	h.mu.Lock()
+	fn := h.menuActions[id]
+	h.mu.Unlock()
+	if fn != nil {
+		return fn()
+	}
+	return false, false, false
+}
+
+func (h *appHost) switchVideoDevice(dev string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prev := h.cfg.Device
+	h.stopVideo()
+	h.cfg.Device = dev
+	if err := h.startVideo(); err != nil {
+		win.ShowErrorBox("capview", fmt.Sprintf("Failed to open %s:\n%v", dev, err))
+		h.cfg.Device = prev
+		_ = h.startVideo()
+		return
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) switchVideoMode(m capture.Mode) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prevW, prevH, prevFPS, prevFmt := h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format
+	h.stopVideo()
+	h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = m.Width, m.Height, m.FPS, m.FourCC
+	if err := h.startVideo(); err != nil {
+		win.ShowErrorBox("capview", fmt.Sprintf("Failed to switch to %s:\n%v", m, err))
+		h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = prevW, prevH, prevFPS, prevFmt
+		_ = h.startVideo()
+		return
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) switchAudioIn(dev string, disabled bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopAudio()
+	h.cfg.AudioDisabled = disabled
+	if !disabled {
+		h.cfg.AudioIn = dev
+		h.startAudio()
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) switchAudioOut(dev string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopAudio()
+	h.cfg.AudioOut = dev
+	h.startAudio()
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
 func runView(args []string) error {
+	cfgPath := config.DefaultPath()
+	cfg, _ := config.Load(cfgPath)
+
 	fs := flag.NewFlagSet("capview", flag.ExitOnError)
-	device := fs.String("device", "auto", "Media Foundation video device name, substring, or 'auto'")
-	size := fs.String("size", "1920x1080", "capture resolution WxH")
-	fps := fs.Float64("fps", 60, "target capture frame rate")
-	format := fs.String("format", "auto", "pixel format: auto, NV12, or YUY2")
-	display := fs.String("display", "primary", "target display (e.g. '\\\\.\\DISPLAY2' or 'primary')")
-	fullscreen := fs.Bool("fullscreen", false, "start in borderless fullscreen (press F11/F/Alt+Enter to toggle)")
-	vsync := fs.Bool("vsync", false, "wait for display vblank instead of VRR / ALLOW_TEARING")
+	device := fs.String("device", cfg.Device, "Media Foundation video device name, substring, or 'auto'")
+	size := fs.String("size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), "capture resolution WxH")
+	fps := fs.Float64("fps", cfg.FPS, "target capture frame rate")
+	format := fs.String("format", cfg.Format, "pixel format: auto, NV12, or YUY2")
+	display := fs.String("display", cfg.Display, "target display (e.g. '\\\\.\\DISPLAY2' or 'primary')")
+	fullscreen := fs.Bool("fullscreen", cfg.Fullscreen, "start in borderless fullscreen (press F11/F/Alt+Enter to toggle)")
+	vsync := fs.Bool("vsync", cfg.VSync, "wait for display vblank instead of VRR / ALLOW_TEARING")
 	printStats := fs.Bool("stats", true, "print 1-second latency stats to stdout")
-	noAudio := fs.Bool("no-audio", false, "disable WASAPI audio passthrough")
-	audioIn := fs.String("audio-in", "auto", "WASAPI audio capture device name, substring, or 'auto'")
-	audioOut := fs.String("audio-out", "default", "WASAPI audio playback device name, substring, or 'default'")
-	volume := fs.Float64("volume", 1.0, "initial audio volume (0.0 to 1.0)")
+	noAudio := fs.Bool("no-audio", cfg.AudioDisabled, "disable WASAPI audio passthrough")
+	audioIn := fs.String("audio-in", cfg.AudioIn, "WASAPI audio capture device name, substring, or 'auto'")
+	audioOut := fs.String("audio-out", cfg.AudioOut, "WASAPI audio playback device name, substring, or 'default'")
+	volume := fs.Float64("volume", float64(cfg.Volume), "initial audio volume (0.0 to 1.0)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	w, h, err := parseSize(*size)
-	if err != nil {
-		return err
+	// Only override saved config fields for flags explicitly provided on CLI.
+	setFlags := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	if setFlags["device"] {
+		cfg.Device = *device
 	}
-
-	freq := win.QPCFrequency()
-	src, err := capture.Start(capture.Config{
-		Device: *device,
-		Width:  w,
-		Height: h,
-		FPS:    *fps,
-		Format: *format,
-	}, freq)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		src.Stop()
-		<-src.Done()
-	}()
-
-	var audCtrl render.AudioControl
-	if !*noAudio {
-		aud, err := audio.Start(audio.Config{
-			InputDevice:  *audioIn,
-			OutputDevice: *audioOut,
-			VideoHint:    src.Mode.Device,
-			Volume:       float32(*volume),
-		})
+	if setFlags["size"] {
+		w, h, err := parseSize(*size)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: audio passthrough disabled: %v\n", err)
-		} else {
-			defer func() {
-				aud.Stop()
-				<-aud.Done()
-			}()
-			audCtrl = aud
-			fmt.Printf("audio: %q (%d Hz) -> %q (%d Hz)\n", aud.InputName, aud.InputRate, aud.OutputName, aud.OutputRate)
+			return err
+		}
+		cfg.Width, cfg.Height = w, h
+	}
+	if setFlags["fps"] {
+		cfg.FPS = *fps
+	}
+	if setFlags["format"] {
+		cfg.Format = *format
+	}
+	if setFlags["display"] {
+		cfg.Display = *display
+	}
+	if setFlags["fullscreen"] {
+		cfg.Fullscreen = *fullscreen
+	}
+	if setFlags["vsync"] {
+		cfg.VSync = *vsync
+	}
+	if setFlags["no-audio"] {
+		cfg.AudioDisabled = *noAudio
+	}
+	if setFlags["audio-in"] {
+		cfg.AudioIn = *audioIn
+	}
+	if setFlags["audio-out"] {
+		cfg.AudioOut = *audioOut
+	}
+	if setFlags["volume"] {
+		cfg.Volume = float32(*volume)
+	}
+
+	host := &appHost{
+		cfg:     cfg,
+		cfgPath: cfgPath,
+		freq:    win.QPCFrequency(),
+		mailbox: capture.NewMailbox(),
+	}
+	if err := host.startVideo(); err != nil {
+		return err
+	}
+	defer host.stopVideo()
+
+	host.startAudio()
+	defer host.stopAudio()
+
+	fmt.Println("hotkeys: [Right-Click] menu | [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [M] mute | [Up/Down/Wheel] volume | [ESC / Q] quit")
+
+	var savedRect *win.RECT
+	if cfg.WinW >= 320 && cfg.WinH >= 180 {
+		r := win.RECT{Left: cfg.WinX, Top: cfg.WinY, Right: cfg.WinX + cfg.WinW, Bottom: cfg.WinY + cfg.WinH}
+		savedRect = &r
+	}
+
+	finalState, err := render.Run(render.Config{
+		Display:    cfg.Display,
+		Fullscreen: cfg.Fullscreen,
+		VSync:      cfg.VSync,
+		SavedRect:  savedRect,
+		PrintStats: *printStats,
+		Freq:       host.freq,
+		Host:       host,
+	}, host.mailbox)
+
+	// Persist user preferences on clean exit.
+	host.mu.Lock()
+	if host.aud != nil {
+		host.cfg.Volume = host.aud.Volume()
+		host.cfg.Muted = host.aud.Muted()
+	}
+	host.cfg.Fullscreen = finalState.Fullscreen
+	host.cfg.VSync = finalState.VSync
+	if w := finalState.WindowRect.Right - finalState.WindowRect.Left; w >= 320 {
+		if h := finalState.WindowRect.Bottom - finalState.WindowRect.Top; h >= 180 {
+			host.cfg.WinX = finalState.WindowRect.Left
+			host.cfg.WinY = finalState.WindowRect.Top
+			host.cfg.WinW = w
+			host.cfg.WinH = h
 		}
 	}
+	_ = config.Save(cfgPath, host.cfg)
+	host.mu.Unlock()
 
-	fmt.Printf("video: %q (%s)\n", src.Mode.Device, src.Mode)
-	fmt.Println("hotkeys: [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [M] mute | [Up/Down/Wheel] volume | [ESC / Q] quit")
-
-	return render.Run(render.Config{
-		Display:    *display,
-		Fullscreen: *fullscreen,
-		VSync:      *vsync,
-		ModeLabel:  src.Mode.String(),
-		PrintStats: *printStats,
-		Freq:       freq,
-		Audio:      audCtrl,
-	}, src.Mailbox, src.Done(), src.Err)
+	return err
 }
 
 func parseSize(s string) (int, int, error) {

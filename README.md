@@ -15,22 +15,25 @@ Designed for playing console games (Switch, PS5, etc.) directly on a PC monitor 
 ## Usage
 
 ```powershell
-# Build
-go build -o capview.exe ./cmd/capview
+# Build double-click desktop app (no console window)
+go build -ldflags="-s -w -H=windowsgui" -o capview.exe ./cmd/capview
 
-# List displays and capture devices
-.\capview.exe list
+# Build CLI version (prints 1s latency telemetry to terminal; supports `list`)
+go build -ldflags="-s -w" -o capview-cli.exe ./cmd/capview
 
-# Launch windowed on primary monitor (auto-picks capture card + audio; press F11 for fullscreen)
+# List displays, video capture devices, and WASAPI audio devices
+.\capview-cli.exe list
+
+# Launch (double-click capview.exe, or run from terminal)
 .\capview.exe
-
-# Explicit device / resolution / start in borderless fullscreen
-.\capview.exe --device "Live Gamer Ultra-Video" --size 1920x1080 --fps 60 --fullscreen
 ```
 
-### Hotkeys
+Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
 
-- `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s in fullscreen)
+### Controls
+
+- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Fullscreen, VRR/VSync, Mute, Quit)
+- `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s; engages Independent Flip / VRR for <1 ms display latency)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
 - `M`: Mute / unmute audio
 - `Up` / `Down` / Mouse Wheel: Volume +/- 5%
@@ -40,4 +43,4 @@ go build -o capview.exe ./cmd/capview
 
 - [x] Stage 1: Pure-Go Media Foundation capture + D3D11 flip-model NV12/YUY2 renderer + VRR/tearing + live latency stats
 - [x] Stage 2: WASAPI low-latency audio passthrough (event-driven, clock-drift capped ring buffer, sample-rate conversion, volume/mute)
-- [ ] Stage 3: Native right-click menu + saved settings + auto-reconnect on signal change + `windowsgui` double-click build
+- [x] Stage 3: Native right-click menu + saved settings (`%APPDATA%\capview\config.json`) + auto-reconnect on signal change + `windowsgui` double-click build

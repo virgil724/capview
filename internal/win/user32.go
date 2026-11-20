@@ -32,6 +32,12 @@ var (
 	procGetMonitorInfoW               = modUser32.NewProc("GetMonitorInfoW")
 	procLoadCursorW                   = modUser32.NewProc("LoadCursorW")
 	procShowCursor                    = modUser32.NewProc("ShowCursor")
+	procCreatePopupMenu               = modUser32.NewProc("CreatePopupMenu")
+	procAppendMenuW                   = modUser32.NewProc("AppendMenuW")
+	procTrackPopupMenu                = modUser32.NewProc("TrackPopupMenu")
+	procDestroyMenu                   = modUser32.NewProc("DestroyMenu")
+	procGetCursorPos                  = modUser32.NewProc("GetCursorPos")
+	procMessageBoxW                   = modUser32.NewProc("MessageBoxW")
 	procGetModuleHandleW              = modKernel32.NewProc("GetModuleHandleW")
 	procQueryPerformanceCounter       = modKernel32.NewProc("QueryPerformanceCounter")
 	procQueryPerformanceFrequency     = modKernel32.NewProc("QueryPerformanceFrequency")
@@ -46,6 +52,7 @@ const (
 	WM_KEYDOWN    = 0x0100
 	WM_SYSKEYDOWN = 0x0104
 	WM_MOUSEMOVE  = 0x0200
+	WM_RBUTTONUP  = 0x0205
 	WM_MOUSEWHEEL = 0x020A
 
 	VK_RETURN = 0x0D
@@ -223,6 +230,89 @@ func ShowCursor(show bool) {
 	} else {
 		procShowCursor.Call(0)
 	}
+}
+
+// MenuItem describes one entry in a native Win32 context menu.
+type MenuItem struct {
+	ID        uint32
+	Label     string
+	Checked   bool
+	Disabled  bool
+	Separator bool
+	Submenu   []MenuItem
+}
+
+// ShowContextMenu displays a native Win32 popup menu at the current cursor
+// position and returns the chosen item ID (0 if dismissed).
+func ShowContextMenu(hwnd uintptr, items []MenuItem) uint32 {
+	hmenu := buildMenu(items)
+	if hmenu == 0 {
+		return 0
+	}
+	defer procDestroyMenu.Call(hmenu)
+
+	var pt struct{ X, Y int32 }
+	procGetCursorPos.Call(uintptr(unsafe.Pointer(&pt)))
+	procSetForegroundWindow.Call(hwnd)
+
+	const (
+		tpmReturnCmd   = 0x0100
+		tpmRightButton = 0x0002
+	)
+	cmd, _, _ := procTrackPopupMenu.Call(
+		hmenu,
+		tpmReturnCmd|tpmRightButton,
+		uintptr(pt.X), uintptr(pt.Y),
+		0, hwnd, 0,
+	)
+	return uint32(cmd)
+}
+
+func buildMenu(items []MenuItem) uintptr {
+	const (
+		mfString    = 0x0000
+		mfChecked   = 0x0008
+		mfPopup     = 0x0010
+		mfGrayed    = 0x0001
+		mfSeparator = 0x0800
+	)
+	h, _, _ := procCreatePopupMenu.Call()
+	if h == 0 {
+		return 0
+	}
+	for _, it := range items {
+		if it.Separator {
+			procAppendMenuW.Call(h, mfSeparator, 0, 0)
+			continue
+		}
+		lbl, _ := windows.UTF16PtrFromString(it.Label)
+		if len(it.Submenu) > 0 {
+			sub := buildMenu(it.Submenu)
+			flags := uintptr(mfPopup | mfString)
+			if it.Disabled {
+				flags |= mfGrayed
+			}
+			procAppendMenuW.Call(h, flags, sub, uintptr(unsafe.Pointer(lbl)))
+			continue
+		}
+		flags := uintptr(mfString)
+		if it.Checked {
+			flags |= mfChecked
+		}
+		if it.Disabled {
+			flags |= mfGrayed
+		}
+		procAppendMenuW.Call(h, flags, uintptr(it.ID), uintptr(unsafe.Pointer(lbl)))
+	}
+	return h
+}
+
+// ShowErrorBox displays a native Windows error dialog (useful for windowsgui builds).
+func ShowErrorBox(title, message string) {
+	const mbIconError = 0x10
+	t, _ := windows.UTF16PtrFromString(title)
+	m, _ := windows.UTF16PtrFromString(message)
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbIconError)
 }
 
 func DefWindowProc(h uintptr, msg uint32, wp, lp uintptr) uintptr {

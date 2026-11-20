@@ -9,20 +9,24 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/virgil724/capview/internal/win"
 )
 
 // Config describes a Media Foundation capture session.
 type Config struct {
-	Device string  // exact friendly name, substring, or "auto"
-	Width  int     // requested width (default 1920)
-	Height int     // requested height (default 1080)
-	FPS    float64 // requested frame rate (default 60)
-	Format string  // "auto" (NV12 preferred, then YUY2), "NV12", or "YUY2"
+	Device        string  // exact friendly name, substring, or "auto"
+	Width         int     // requested width (default 1920)
+	Height        int     // requested height (default 1080)
+	FPS           float64 // requested frame rate (default 60)
+	Format        string  // "auto" (NV12 preferred, then YUY2), "NV12", or "YUY2"
+	AutoReconnect bool    // automatically retry if signal drops or device resets
+	Mailbox       *Mailbox
 }
 
 // Mode is the native capture mode negotiated with the device.
@@ -86,6 +90,87 @@ func ListDevices() ([]string, error) {
 		return nil
 	})
 	return names, err
+}
+
+// ListModes returns deduplicated supported NV12/YUY2 modes of device, sorted by
+// resolution and frame rate descending.
+func ListModes(device string) ([]Mode, error) {
+	var modes []Mode
+	err := withMF(func() error {
+		devs, err := win.EnumVideoCaptureDevices()
+		if err != nil {
+			return err
+		}
+		dev, chosenName := pickDevice(devs, device)
+		if dev.Object == 0 {
+			return fmt.Errorf("no video device matching %q", device)
+		}
+		defer dev.Release()
+
+		src, err := dev.ActivateMediaSource()
+		if err != nil {
+			return err
+		}
+		defer func() { win.ShutdownMediaSource(src); src.Release() }()
+
+		attrs, err := win.NewAttributes(1)
+		if err != nil {
+			return err
+		}
+		defer attrs.Release()
+		attrs.SetUINT32(&win.MF_READWRITE_DISABLE_CONVERTERS, 1)
+
+		rd, err := win.NewSourceReader(src, attrs)
+		if err != nil {
+			return err
+		}
+		defer rd.Release()
+
+		type key struct{ w, h, fps int }
+		seen := make(map[key]Mode)
+		for i := uint32(0); ; i++ {
+			t, err := rd.NativeMediaType(win.MF_SOURCE_READER_FIRST_VIDEO_STREAM, i)
+			if err != nil {
+				break
+			}
+			sub, _ := t.GetGUID(&win.MF_MT_SUBTYPE)
+			fs, _ := t.GetUINT64(&win.MF_MT_FRAME_SIZE)
+			fr, _ := t.GetUINT64(&win.MF_MT_FRAME_RATE)
+			t.Release()
+
+			cc := win.FourCC(sub)
+			if !supportedFormats[cc] {
+				continue
+			}
+			m := Mode{
+				Device: chosenName,
+				FourCC: cc,
+				Width:  int(fs >> 32),
+				Height: int(fs & 0xffffffff),
+			}
+			if d := fr & 0xffffffff; d != 0 {
+				m.FPS = float64(fr>>32) / float64(d)
+			}
+			k := key{m.Width, m.Height, int(math.Round(m.FPS))}
+			if prev, ok := seen[k]; !ok || (prev.FourCC != "NV12" && m.FourCC == "NV12") {
+				seen[k] = m
+			}
+		}
+		for _, m := range seen {
+			modes = append(modes, m)
+		}
+		sort.Slice(modes, func(i, j int) bool {
+			if modes[i].Width != modes[j].Width {
+				return modes[i].Width > modes[j].Width
+			}
+			if modes[i].Height != modes[j].Height {
+				return modes[i].Height > modes[j].Height
+			}
+			return modes[i].FPS > modes[j].FPS
+		})
+		return nil
+	})
+	return modes, err
 }
 
 // Mailbox holds the single most recent frame (drop-oldest on overwrite) so
@@ -227,6 +312,7 @@ type Source struct {
 	done    chan struct{}
 	errMu   sync.Mutex
 	err     error
+	status  atomic.Value // string ("", "reconnecting...")
 	Mode    Mode
 	Mailbox *Mailbox
 }
@@ -236,6 +322,12 @@ func (s *Source) Err() error {
 	s.errMu.Lock()
 	defer s.errMu.Unlock()
 	return s.err
+}
+func (s *Source) Status() string {
+	if v, ok := s.status.Load().(string); ok {
+		return v
+	}
+	return ""
 }
 func (s *Source) Stop() { s.stop.Store(true) }
 
@@ -253,20 +345,49 @@ func Start(cfg Config, freq int64) (*Source, error) {
 	if cfg.Format == "" {
 		cfg.Format = "auto"
 	}
+	mb := cfg.Mailbox
+	if mb == nil {
+		mb = NewMailbox()
+	}
 	s := &Source{
 		done:    make(chan struct{}),
-		Mailbox: NewMailbox(),
+		Mailbox: mb,
 	}
+	s.status.Store("")
 	ready := make(chan error, 1)
 	go func() {
-		err := withMF(func() error { return s.run(cfg, freq, ready) })
+		var err error
+		first := true
+		for !s.stop.Load() {
+			var rdy chan<- error
+			if first {
+				rdy = ready
+			}
+			err = withMF(func() error { return s.run(cfg, freq, rdy) })
+			if first {
+				first = false
+				select {
+				case ready <- err:
+					// Failed on initial open: exit immediately so caller can report it.
+					s.errMu.Lock()
+					s.err = err
+					s.errMu.Unlock()
+					close(s.done)
+					return
+				default:
+				}
+			}
+			if s.stop.Load() || !cfg.AutoReconnect {
+				break
+			}
+			s.status.Store("waiting for signal...")
+			for i := 0; i < 10 && !s.stop.Load(); i++ {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
 		s.errMu.Lock()
 		s.err = err
 		s.errMu.Unlock()
-		select {
-		case ready <- err:
-		default:
-		}
 		close(s.done)
 	}()
 	if err := <-ready; err != nil {
@@ -320,7 +441,10 @@ func (s *Source) run(cfg Config, freq int64, ready chan<- error) error {
 	if err != nil {
 		return fmt.Errorf("set %s: %w", mode, err)
 	}
-	ready <- nil
+	s.status.Store("")
+	if ready != nil {
+		ready <- nil
+	}
 
 	for !s.stop.Load() {
 		sample, flags, ts, err := rd.ReadSample(stream)
@@ -447,6 +571,12 @@ func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 	var best win.Attributes
 	var bestMode Mode
 	bestRank, bestDiff := 99, math.Inf(1)
+
+	// Fallback: highest FPS, then highest resolution, preferring NV12 over YUY2.
+	var fb win.Attributes
+	var fbMode Mode
+	fbRank := 99
+
 	var seen []string
 	for i := uint32(0); ; i++ {
 		t, err := rd.NativeMediaType(win.MF_SOURCE_READER_FIRST_VIDEO_STREAM, i)
@@ -460,23 +590,47 @@ func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 		if d := fr & 0xffffffff; d != 0 {
 			m.FPS = float64(fr>>32) / float64(d)
 		}
-		if m.Width == cfg.Width && m.Height == cfg.Height {
-			seen = append(seen, fmt.Sprintf("%s@%.2f", m.FourCC, m.FPS))
-		}
 		r := rank(m.FourCC)
-		diff := math.Abs(m.FPS - cfg.FPS)
-		if m.Width != cfg.Width || m.Height != cfg.Height || r < 0 || !supportedFormats[m.FourCC] ||
-			r > bestRank || (r == bestRank && diff >= bestDiff) {
+		if r < 0 || !supportedFormats[m.FourCC] {
 			t.Release()
 			continue
 		}
-		if best.Object != 0 {
-			best.Release()
+		seen = append(seen, fmt.Sprintf("%s %dx%d@%.0f", m.FourCC, m.Width, m.Height, m.FPS))
+
+		// Exact resolution match?
+		if m.Width == cfg.Width && m.Height == cfg.Height {
+			diff := math.Abs(m.FPS - cfg.FPS)
+			if r < bestRank || (r == bestRank && diff < bestDiff) {
+				if best.Object != 0 {
+					best.Release()
+				}
+				best, bestMode, bestRank, bestDiff = t, m, r, diff
+				continue
+			}
 		}
-		best, bestMode, bestRank, bestDiff = t, m, r, diff
+
+		// Track best fallback mode in case requested resolution is unavailable.
+		betterFB := fb.Object == 0 ||
+			m.FPS > fbMode.FPS+0.5 ||
+			(math.Abs(m.FPS-fbMode.FPS) <= 0.5 && m.Width*m.Height > fbMode.Width*fbMode.Height) ||
+			(math.Abs(m.FPS-fbMode.FPS) <= 0.5 && m.Width*m.Height == fbMode.Width*fbMode.Height && r < fbRank)
+		if betterFB {
+			if fb.Object != 0 {
+				fb.Release()
+			}
+			fb, fbMode, fbRank = t, m, r
+			continue
+		}
+		t.Release()
 	}
-	if best.Object == 0 {
-		return best, Mode{}, fmt.Errorf("no usable %dx%d mode (format %s); device offers %v", cfg.Width, cfg.Height, cfg.Format, seen)
+	if best.Object != 0 {
+		if fb.Object != 0 {
+			fb.Release()
+		}
+		return best, bestMode, nil
 	}
-	return best, bestMode, nil
+	if fb.Object != 0 {
+		return fb, fbMode, nil
+	}
+	return best, Mode{}, fmt.Errorf("no usable NV12/YUY2 mode (format %s); device offers %v", cfg.Format, seen)
 }
