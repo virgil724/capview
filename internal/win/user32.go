@@ -67,6 +67,9 @@ const (
 	SWP_NOOWNERZORDER = 0x0200
 	SWP_FRAMECHANGED  = 0x0020
 	HWND_TOP          = 0
+	HWND_TOPMOST      = ^uintptr(0) // -1
+	HWND_NOTOPMOST    = ^uintptr(1) // -2
+	WS_EX_TOPMOST     = 0x00000008
 
 	MONITOR_DEFAULTTONEAREST = 2
 	IDC_ARROW                = 32512
@@ -154,10 +157,12 @@ func CreateViewerWindow(class, title string, r RECT, borderless bool, wndProc ui
 	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 
 	style := uintptr(WS_OVERLAPPEDWINDOW | WS_VISIBLE)
+	exStyle := uintptr(0)
 	if borderless {
 		style = uintptr(WS_POPUP | WS_VISIBLE)
+		exStyle = uintptr(WS_EX_TOPMOST)
 	}
-	h, _, err := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(ttl)),
+	h, _, err := procCreateWindowExW.Call(exStyle, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(ttl)),
 		style, uintptr(r.Left), uintptr(r.Top), uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top),
 		0, 0, inst, 0)
 	if h == 0 {
@@ -196,14 +201,14 @@ func SetBorderless(hwnd uintptr, enable bool, savedRect RECT) {
 		mi.Size = uint32(unsafe.Sizeof(mi))
 		procGetMonitorInfoW.Call(mon, uintptr(unsafe.Pointer(&mi)))
 		procSetWindowLongPtrW.Call(hwnd, GWL_STYLE, uintptr(WS_POPUP|WS_VISIBLE))
-		procSetWindowPos.Call(hwnd, HWND_TOP,
+		procSetWindowPos.Call(hwnd, HWND_TOPMOST,
 			uintptr(mi.Monitor.Left), uintptr(mi.Monitor.Top),
 			uintptr(mi.Monitor.Right-mi.Monitor.Left), uintptr(mi.Monitor.Bottom-mi.Monitor.Top),
 			SWP_NOOWNERZORDER|SWP_FRAMECHANGED)
 		return
 	}
 	procSetWindowLongPtrW.Call(hwnd, GWL_STYLE, uintptr(WS_OVERLAPPEDWINDOW|WS_VISIBLE))
-	procSetWindowPos.Call(hwnd, HWND_TOP,
+	procSetWindowPos.Call(hwnd, HWND_NOTOPMOST,
 		uintptr(savedRect.Left), uintptr(savedRect.Top),
 		uintptr(savedRect.Right-savedRect.Left), uintptr(savedRect.Bottom-savedRect.Top),
 		SWP_NOOWNERZORDER|SWP_FRAMECHANGED)

@@ -19,6 +19,7 @@ var (
 
 // Interface IDs.
 var (
+	IID_IDXGIDevice1    = guid(0x77db970f, 0x6276, 0x48ba, 0xba, 0x28, 0x07, 0x01, 0x43, 0xb4, 0x39, 0x2c)
 	IID_IDXGIFactory2   = guid(0x50c83a1c, 0xe072, 0x4c48, 0x87, 0xb0, 0x36, 0x30, 0xfa, 0x36, 0xa6, 0xd0)
 	IID_IDXGIFactory5   = guid(0x7632e1f5, 0xee65, 0x4dca, 0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d)
 	IID_ID3D11Texture2D = guid(0x6f15aaf2, 0xd208, 0x4e89, 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c)
@@ -26,6 +27,7 @@ var (
 
 // vtable indices (verified against mingw-w64 dxgi.h / dxgi1_2.h / dxgi1_5.h).
 const (
+	vtDevice1SetMaximumFrameLatency  = 12
 	vtFactoryMakeWindowAssociation   = 8
 	vtFactory1EnumAdapters1          = 12
 	vtFactory2CreateSwapChainForHwnd = 15
@@ -201,4 +203,14 @@ func (s SwapChain) GetLastPresentCount() (uint32, error) {
 	var n uint32
 	err := hr(s.call(vtSwapChainGetLastPresentCount, uintptr(unsafe.Pointer(&n))))
 	return n, err
+}
+
+// SetMaximumFrameLatency caps the DXGI device frame queue (1 = lowest latency).
+func SetMaximumFrameLatency(d3dDevice Object, maxLatency uint32) error {
+	dev1, err := d3dDevice.QueryInterface(&IID_IDXGIDevice1)
+	if err != nil {
+		return err
+	}
+	defer dev1.Release()
+	return hr(dev1.call(vtDevice1SetMaximumFrameLatency, uintptr(maxLatency)))
 }

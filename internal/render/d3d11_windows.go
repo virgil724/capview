@@ -79,8 +79,8 @@ type Config struct {
 }
 
 // Run creates the viewer window and renders frames from mailbox until closed
-// (ESC, Q, or window close) or srcDone fires.
-func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
+// (ESC, Q, or window close) or srcDone closes.
+func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan struct{}, srcErr func() error) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -202,6 +202,7 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
 	}
 	defer dev.Release()
 	defer ctx.Release()
+	_ = win.SetMaximumFrameLatency(dev.Object, 1)
 
 	winW, winH := win.GetClientSize(hwnd)
 	if winW <= 0 {
@@ -365,9 +366,11 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
 		}
 
 		select {
-		case err := <-srcDone:
-			if err != nil {
-				return fmt.Errorf("capture stopped: %w", err)
+		case <-srcDone:
+			if srcErr != nil {
+				if err := srcErr(); err != nil {
+					return fmt.Errorf("capture stopped: %w", err)
+				}
 			}
 			return nil
 

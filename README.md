@@ -21,11 +21,11 @@ go build -o capview.exe ./cmd/capview
 # List displays and capture devices
 .\capview.exe list
 
-# Launch borderless fullscreen on primary monitor (auto-picks capture card)
+# Launch windowed on primary monitor (auto-picks capture card + audio; press F11 for fullscreen)
 .\capview.exe
 
-# Explicit device / resolution / windowed mode
-.\capview.exe --device "Live Gamer Ultra-Video" --size 1920x1080 --fps 60 --fullscreen=false
+# Explicit device / resolution / start in borderless fullscreen
+.\capview.exe --device "Live Gamer Ultra-Video" --size 1920x1080 --fps 60 --fullscreen
 ```
 
 ### Hotkeys

@@ -33,7 +33,7 @@ type Passthrough struct {
 	volBits atomic.Uint32 // float32 bits [0..1]
 	muted   atomic.Bool
 	stop    atomic.Bool
-	done    chan error
+	done    chan struct{}
 }
 
 // ListEndpoints returns active audio capture and playback endpoint names.
@@ -76,7 +76,7 @@ func Start(cfg Config) (*Passthrough, error) {
 		cfg.Volume = 1.0
 	}
 	p := &Passthrough{
-		done: make(chan error, 1),
+		done: make(chan struct{}),
 	}
 	p.SetVolume(cfg.Volume)
 
@@ -87,7 +87,7 @@ func Start(cfg Config) (*Passthrough, error) {
 		case ready <- err:
 		default:
 		}
-		p.done <- err
+		close(p.done)
 	}()
 	if err := <-ready; err != nil {
 		return nil, err
@@ -95,8 +95,8 @@ func Start(cfg Config) (*Passthrough, error) {
 	return p, nil
 }
 
-func (p *Passthrough) Done() <-chan error { return p.done }
-func (p *Passthrough) Stop()              { p.stop.Store(true) }
+func (p *Passthrough) Done() <-chan struct{} { return p.done }
+func (p *Passthrough) Stop()                 { p.stop.Store(true) }
 
 func (p *Passthrough) Volume() float32 { return math.Float32frombits(p.volBits.Load()) }
 func (p *Passthrough) SetVolume(v float32) {

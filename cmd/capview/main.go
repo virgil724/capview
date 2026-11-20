@@ -77,7 +77,7 @@ func runView(args []string) error {
 	fps := fs.Float64("fps", 60, "target capture frame rate")
 	format := fs.String("format", "auto", "pixel format: auto, NV12, or YUY2")
 	display := fs.String("display", "primary", "target display (e.g. '\\\\.\\DISPLAY2' or 'primary')")
-	fullscreen := fs.Bool("fullscreen", true, "start in borderless fullscreen (best for VRR / Independent Flip)")
+	fullscreen := fs.Bool("fullscreen", false, "start in borderless fullscreen (press F11/F/Alt+Enter to toggle)")
 	vsync := fs.Bool("vsync", false, "wait for display vblank instead of VRR / ALLOW_TEARING")
 	printStats := fs.Bool("stats", true, "print 1-second latency stats to stdout")
 	noAudio := fs.Bool("no-audio", false, "disable WASAPI audio passthrough")
@@ -140,7 +140,7 @@ func runView(args []string) error {
 		PrintStats: *printStats,
 		Freq:       freq,
 		Audio:      audCtrl,
-	}, src.Mailbox, src.Done())
+	}, src.Mailbox, src.Done(), src.Err)
 }
 
 func parseSize(s string) (int, int, error) {

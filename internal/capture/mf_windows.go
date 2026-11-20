@@ -224,13 +224,20 @@ func (c FourCCCopy) CopyInto(dst *Frame) {
 // Source is a running Media Foundation video capture.
 type Source struct {
 	stop    atomic.Bool
-	done    chan error
+	done    chan struct{}
+	errMu   sync.Mutex
+	err     error
 	Mode    Mode
 	Mailbox *Mailbox
 }
 
-func (s *Source) Done() <-chan error { return s.done }
-func (s *Source) Stop()              { s.stop.Store(true) }
+func (s *Source) Done() <-chan struct{} { return s.done }
+func (s *Source) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.err
+}
+func (s *Source) Stop() { s.stop.Store(true) }
 
 // Start opens the capture device and begins publishing frames into s.Mailbox.
 func Start(cfg Config, freq int64) (*Source, error) {
@@ -247,17 +254,20 @@ func Start(cfg Config, freq int64) (*Source, error) {
 		cfg.Format = "auto"
 	}
 	s := &Source{
-		done:    make(chan error, 1),
+		done:    make(chan struct{}),
 		Mailbox: NewMailbox(),
 	}
 	ready := make(chan error, 1)
 	go func() {
 		err := withMF(func() error { return s.run(cfg, freq, ready) })
+		s.errMu.Lock()
+		s.err = err
+		s.errMu.Unlock()
 		select {
 		case ready <- err:
 		default:
 		}
-		s.done <- err
+		close(s.done)
 	}()
 	if err := <-ready; err != nil {
 		return nil, err
