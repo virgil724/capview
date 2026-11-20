@@ -59,6 +59,14 @@ func ListDisplays() ([]Display, error) {
 	return out, nil
 }
 
+// AudioControl lets the viewer window toggle mute and adjust volume live.
+type AudioControl interface {
+	ToggleMute() bool
+	AdjustVolume(delta float32) float32
+	Muted() bool
+	Volume() float32
+}
+
 // Config configures the D3D11 viewer window and swap chain.
 type Config struct {
 	Display    string // "\\.\DISPLAY1" or "primary" (default)
@@ -67,6 +75,7 @@ type Config struct {
 	ModeLabel  string // shown in titlebar & stats
 	PrintStats bool   // print 1-line stats every second to stdout
 	Freq       int64  // QPC frequency
+	Audio      AudioControl
 }
 
 // Run creates the viewer window and renders frames from mailbox until closed
@@ -100,7 +109,17 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
 		useVSync       = cfg.VSync
 		supportsTear   = fac.SupportsTearing()
 		swapChainFlags uint32
+		cursorVisible  = true
+		lastMouseMove  = time.Now()
 	)
+	setCursor := func(show bool) {
+		if cursorVisible != show {
+			win.ShowCursor(show)
+			cursorVisible = show
+		}
+	}
+	defer setCursor(true)
+
 	if supportsTear {
 		swapChainFlags = win.DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
 	}
@@ -118,6 +137,20 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
 		case win.WM_SIZE:
 			needResize = true
 			return 0
+		case win.WM_MOUSEMOVE:
+			lastMouseMove = time.Now()
+			setCursor(true)
+			return 0
+		case win.WM_MOUSEWHEEL:
+			if cfg.Audio != nil {
+				delta := int16(wp >> 16)
+				if delta > 0 {
+					cfg.Audio.AdjustVolume(0.05)
+				} else if delta < 0 {
+					cfg.Audio.AdjustVolume(-0.05)
+				}
+			}
+			return 0
 		case win.WM_KEYDOWN:
 			switch wp {
 			case win.VK_ESCAPE, win.VK_Q:
@@ -128,6 +161,21 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
 				return 0
 			case win.VK_V:
 				toggleVSync = true
+				return 0
+			case win.VK_M:
+				if cfg.Audio != nil {
+					cfg.Audio.ToggleMute()
+				}
+				return 0
+			case win.VK_UP:
+				if cfg.Audio != nil {
+					cfg.Audio.AdjustVolume(0.05)
+				}
+				return 0
+			case win.VK_DOWN:
+				if cfg.Audio != nil {
+					cfg.Audio.AdjustVolume(-0.05)
+				}
 				return 0
 			}
 		case win.WM_SYSKEYDOWN:
@@ -324,8 +372,20 @@ func Run(cfg Config, mailbox *capture.Mailbox, srcDone <-chan error) error {
 			return nil
 
 		case <-statsTicker.C:
+			if borderless && time.Since(lastMouseMove) > 2*time.Second {
+				setCursor(false)
+			} else if !borderless {
+				setCursor(true)
+			}
 			tearingActive := !useVSync && supportsTear
 			line := tracker.Summary().FormatLine(cfg.ModeLabel, tearingActive)
+			if cfg.Audio != nil {
+				if cfg.Audio.Muted() {
+					line += " | vol MUTED"
+				} else {
+					line += fmt.Sprintf(" | vol %d%%", int(cfg.Audio.Volume()*100+0.5))
+				}
+			}
 			win.SetWindowTitle(hwnd, "capview | "+line)
 			if cfg.PrintStats {
 				fmt.Println(line)

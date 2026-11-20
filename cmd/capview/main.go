@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/virgil724/capview/internal/audio"
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/render"
 	"github.com/virgil724/capview/internal/win"
@@ -53,6 +54,19 @@ func runList() error {
 	for _, n := range devs {
 		fmt.Printf("  %s\n", n)
 	}
+
+	inEps, outEps, err := audio.ListEndpoints()
+	if err != nil {
+		return err
+	}
+	fmt.Println("\nWASAPI audio capture devices:")
+	for _, n := range inEps {
+		fmt.Printf("  %s\n", n)
+	}
+	fmt.Println("\nWASAPI audio playback devices:")
+	for _, n := range outEps {
+		fmt.Printf("  %s\n", n)
+	}
 	return nil
 }
 
@@ -66,6 +80,10 @@ func runView(args []string) error {
 	fullscreen := fs.Bool("fullscreen", true, "start in borderless fullscreen (best for VRR / Independent Flip)")
 	vsync := fs.Bool("vsync", false, "wait for display vblank instead of VRR / ALLOW_TEARING")
 	printStats := fs.Bool("stats", true, "print 1-second latency stats to stdout")
+	noAudio := fs.Bool("no-audio", false, "disable WASAPI audio passthrough")
+	audioIn := fs.String("audio-in", "auto", "WASAPI audio capture device name, substring, or 'auto'")
+	audioOut := fs.String("audio-out", "default", "WASAPI audio playback device name, substring, or 'default'")
+	volume := fs.Float64("volume", 1.0, "initial audio volume (0.0 to 1.0)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -91,8 +109,28 @@ func runView(args []string) error {
 		<-src.Done()
 	}()
 
-	fmt.Printf("capturing %q: %s\n", src.Mode.Device, src.Mode)
-	fmt.Println("hotkeys: [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [ESC / Q] quit")
+	var audCtrl render.AudioControl
+	if !*noAudio {
+		aud, err := audio.Start(audio.Config{
+			InputDevice:  *audioIn,
+			OutputDevice: *audioOut,
+			VideoHint:    src.Mode.Device,
+			Volume:       float32(*volume),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: audio passthrough disabled: %v\n", err)
+		} else {
+			defer func() {
+				aud.Stop()
+				<-aud.Done()
+			}()
+			audCtrl = aud
+			fmt.Printf("audio: %q (%d Hz) -> %q (%d Hz)\n", aud.InputName, aud.InputRate, aud.OutputName, aud.OutputRate)
+		}
+	}
+
+	fmt.Printf("video: %q (%s)\n", src.Mode.Device, src.Mode)
+	fmt.Println("hotkeys: [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [M] mute | [Up/Down/Wheel] volume | [ESC / Q] quit")
 
 	return render.Run(render.Config{
 		Display:    *display,
@@ -101,6 +139,7 @@ func runView(args []string) error {
 		ModeLabel:  src.Mode.String(),
 		PrintStats: *printStats,
 		Freq:       freq,
+		Audio:      audCtrl,
 	}, src.Mailbox, src.Done())
 }
 

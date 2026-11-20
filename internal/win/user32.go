@@ -31,6 +31,7 @@ var (
 	procMonitorFromWindow             = modUser32.NewProc("MonitorFromWindow")
 	procGetMonitorInfoW               = modUser32.NewProc("GetMonitorInfoW")
 	procLoadCursorW                   = modUser32.NewProc("LoadCursorW")
+	procShowCursor                    = modUser32.NewProc("ShowCursor")
 	procGetModuleHandleW              = modKernel32.NewProc("GetModuleHandleW")
 	procQueryPerformanceCounter       = modKernel32.NewProc("QueryPerformanceCounter")
 	procQueryPerformanceFrequency     = modKernel32.NewProc("QueryPerformanceFrequency")
@@ -44,11 +45,16 @@ const (
 	WM_CLOSE      = 0x0010
 	WM_KEYDOWN    = 0x0100
 	WM_SYSKEYDOWN = 0x0104
+	WM_MOUSEMOVE  = 0x0200
+	WM_MOUSEWHEEL = 0x020A
 
 	VK_RETURN = 0x0D
 	VK_ESCAPE = 0x1B
+	VK_UP     = 0x26
+	VK_DOWN   = 0x28
 	VK_F11    = 0x7A
 	VK_F      = 0x46
+	VK_M      = 0x4D
 	VK_Q      = 0x51
 	VK_V      = 0x56
 
@@ -204,6 +210,15 @@ func SetBorderless(hwnd uintptr, enable bool, savedRect RECT) {
 }
 
 func DestroyWindow(h uintptr) { procDestroyWindow.Call(h) }
+
+// ShowCursor toggles cursor visibility (Win32 internal counter).
+func ShowCursor(show bool) {
+	if show {
+		procShowCursor.Call(1)
+	} else {
+		procShowCursor.Call(0)
+	}
+}
 
 func DefWindowProc(h uintptr, msg uint32, wp, lp uintptr) uintptr {
 	r, _, _ := procDefWindowProcW.Call(h, uintptr(msg), wp, lp)

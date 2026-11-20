@@ -30,12 +30,14 @@ go build -o capview.exe ./cmd/capview
 
 ### Hotkeys
 
-- `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen
+- `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s in fullscreen)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
+- `M`: Mute / unmute audio
+- `Up` / `Down` / Mouse Wheel: Volume +/- 5%
 - `ESC` / `Q`: Quit
 
 ## Roadmap
 
 - [x] Stage 1: Pure-Go Media Foundation capture + D3D11 flip-model NV12/YUY2 renderer + VRR/tearing + live latency stats
-- [ ] Stage 2: WASAPI low-latency audio passthrough (with clock-drift handling)
-- [ ] Stage 3: Zero-copy MF DXGI device manager (`IMFDXGIDeviceManager`) GPU texture path
+- [x] Stage 2: WASAPI low-latency audio passthrough (event-driven, clock-drift capped ring buffer, sample-rate conversion, volume/mute)
+- [ ] Stage 3: Native right-click menu + saved settings + auto-reconnect on signal change + `windowsgui` double-click build
