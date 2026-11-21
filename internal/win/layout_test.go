@@ -22,6 +22,11 @@ func TestStructLayouts(t *testing.T) {
 		{"MappedSubresource", unsafe.Sizeof(MappedSubresource{}), ptrSize + 8},
 		{"SwapChainDesc1", unsafe.Sizeof(SwapChainDesc1{}), 48},
 		{"FrameStatistics", unsafe.Sizeof(FrameStatistics{}), 32},
+		{"VideoProcessorContentDesc", unsafe.Sizeof(VideoProcessorContentDesc{}), 40},
+		{"VideoProcessorInputViewDesc", unsafe.Sizeof(VideoProcessorInputViewDesc{}), 16},
+		{"VideoProcessorOutputViewDesc", unsafe.Sizeof(VideoProcessorOutputViewDesc{}), 16},
+		{"VideoProcessorStream", unsafe.Sizeof(VideoProcessorStream{}), 24 + 6*ptrSize},
+		{"VideoProcessorColorSpace", unsafe.Sizeof(VideoProcessorColorSpace{}), 4},
 	}
 	for _, tc := range cases {
 		if tc.got != tc.want {

@@ -371,6 +371,7 @@ func runView(args []string) error {
 	display := fs.String("display", cfg.Display, "target display (e.g. '\\\\.\\DISPLAY2' or 'primary')")
 	fullscreen := fs.Bool("fullscreen", cfg.Fullscreen, "start in borderless fullscreen (press F11/F/Alt+Enter to toggle)")
 	vsync := fs.Bool("vsync", cfg.VSync, "wait for display vblank instead of VRR / ALLOW_TEARING")
+	useVP := fs.Bool("vp", true, "use ID3D11VideoProcessor instead of HLSL pixel shaders")
 	printStats := fs.Bool("stats", true, "print 1-second latency stats to stdout")
 	noAudio := fs.Bool("no-audio", cfg.AudioDisabled, "disable WASAPI audio passthrough")
 	audioIn := fs.String("audio-in", cfg.AudioIn, "WASAPI audio capture device name, substring, or 'auto'")
@@ -444,13 +445,14 @@ func runView(args []string) error {
 	}
 
 	finalState, err := render.Run(render.Config{
-		Display:    cfg.Display,
-		Fullscreen: cfg.Fullscreen,
-		VSync:      cfg.VSync,
-		SavedRect:  savedRect,
-		PrintStats: *printStats,
-		Freq:       host.freq,
-		Host:       host,
+		Display:           cfg.Display,
+		Fullscreen:        cfg.Fullscreen,
+		VSync:             cfg.VSync,
+		UseVideoProcessor: *useVP,
+		SavedRect:         savedRect,
+		PrintStats:        *printStats,
+		Freq:              host.freq,
+		Host:              host,
 	}, host.mailbox)
 
 	// Persist user preferences on clean exit.

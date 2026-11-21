@@ -85,13 +85,14 @@ type FinalState struct {
 
 // Config configures the D3D11 viewer window and swap chain.
 type Config struct {
-	Display    string    // "\\.\DISPLAY1" or "primary" (default)
-	Fullscreen bool      // start in borderless fullscreen
-	VSync      bool      // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
-	SavedRect  *win.RECT // optional saved windowed position/size
-	PrintStats bool      // print 1-second latency stats to stdout
-	Freq       int64     // QPC frequency
-	Host       Host
+	Display           string    // "\\.\DISPLAY1" or "primary" (default)
+	Fullscreen        bool      // start in borderless fullscreen
+	VSync             bool      // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
+	UseVideoProcessor bool      // use ID3D11VideoProcessor instead of HLSL pixel shaders
+	SavedRect         *win.RECT // optional saved windowed position/size
+	PrintStats        bool      // print 1-second latency stats to stdout
+	Freq              int64     // QPC frequency
+	Host              Host
 }
 
 // Run creates the viewer window and renders frames from mailbox until closed
@@ -267,60 +268,86 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	}
 	defer sc.Release()
 
-	// Compile shaders.
-	vsCode, err := win.CompileHLSL(fullscreenVS, "main", "vs_5_0")
-	if err != nil {
-		return FinalState{}, err
-	}
-	vs, err := dev.CreateVertexShader(vsCode)
-	if err != nil {
-		return FinalState{}, fmt.Errorf("create VS: %w", err)
-	}
-	defer vs.Release()
-
-	nv12Code, err := win.CompileHLSL(nv12PS, "main", "ps_5_0")
-	if err != nil {
-		return FinalState{}, err
-	}
-	psNV12, err := dev.CreatePixelShader(nv12Code)
-	if err != nil {
-		return FinalState{}, fmt.Errorf("create NV12 PS: %w", err)
-	}
-	defer psNV12.Release()
-
-	yuy2Code, err := win.CompileHLSL(yuy2PS, "main", "ps_5_0")
-	if err != nil {
-		return FinalState{}, err
-	}
-	psYUY2, err := dev.CreatePixelShader(yuy2Code)
-	if err != nil {
-		return FinalState{}, fmt.Errorf("create YUY2 PS: %w", err)
-	}
-	defer psYUY2.Release()
-
-	sampler, err := dev.CreateSamplerState(&win.SamplerDesc{
-		Filter:         win.D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-		AddressU:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
-		AddressV:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
-		AddressW:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
-		ComparisonFunc: win.D3D11_COMPARISON_NEVER,
-		MaxLOD:         3.402823466e+38, // FLT_MAX
-	})
-	if err != nil {
-		return FinalState{}, fmt.Errorf("create sampler: %w", err)
-	}
-	defer sampler.Release()
-
-	// Back-buffer RTV (recreated on resize).
-	rtv, err := makeBackBufferRTV(dev, sc)
-	if err != nil {
-		return FinalState{}, err
-	}
-	defer func() {
-		if rtv != 0 {
-			rtv.Release()
+	// Renderer backend: ID3D11VideoProcessor or HLSL shaders.
+	var (
+		vpProc                  *videoProcessor
+		backBuf                 win.Object
+		vs, psNV12, psYUY2      win.Object
+		sampler                 win.Object
+		rtv                     win.Object
+		renderTag               = "HLSL"
+	)
+	if cfg.UseVideoProcessor {
+		vpProc, err = newVideoProcessor(dev, ctx)
+		if err != nil {
+			return FinalState{}, fmt.Errorf("video processor: %w", err)
 		}
-	}()
+		defer vpProc.Close()
+		backBuf, err = sc.GetBuffer(0)
+		if err != nil {
+			return FinalState{}, fmt.Errorf("back buffer: %w", err)
+		}
+		defer func() {
+			if backBuf != 0 {
+				backBuf.Release()
+			}
+		}()
+		renderTag = "VP"
+	} else {
+		vsCode, err := win.CompileHLSL(fullscreenVS, "main", "vs_5_0")
+		if err != nil {
+			return FinalState{}, err
+		}
+		vs, err = dev.CreateVertexShader(vsCode)
+		if err != nil {
+			return FinalState{}, fmt.Errorf("create VS: %w", err)
+		}
+		defer vs.Release()
+
+		nv12Code, err := win.CompileHLSL(nv12PS, "main", "ps_5_0")
+		if err != nil {
+			return FinalState{}, err
+		}
+		psNV12, err = dev.CreatePixelShader(nv12Code)
+		if err != nil {
+			return FinalState{}, fmt.Errorf("create NV12 PS: %w", err)
+		}
+		defer psNV12.Release()
+
+		yuy2Code, err := win.CompileHLSL(yuy2PS, "main", "ps_5_0")
+		if err != nil {
+			return FinalState{}, err
+		}
+		psYUY2, err = dev.CreatePixelShader(yuy2Code)
+		if err != nil {
+			return FinalState{}, fmt.Errorf("create YUY2 PS: %w", err)
+		}
+		defer psYUY2.Release()
+
+		sampler, err = dev.CreateSamplerState(&win.SamplerDesc{
+			Filter:         win.D3D11_FILTER_MIN_MAG_MIP_LINEAR,
+			AddressU:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
+			AddressV:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
+			AddressW:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
+			ComparisonFunc: win.D3D11_COMPARISON_NEVER,
+			MaxLOD:         3.402823466e+38, // FLT_MAX
+		})
+		if err != nil {
+			return FinalState{}, fmt.Errorf("create sampler: %w", err)
+		}
+		defer sampler.Release()
+
+		// Back-buffer RTV (recreated on resize).
+		rtv, err = makeBackBufferRTV(dev, sc)
+		if err != nil {
+			return FinalState{}, err
+		}
+		defer func() {
+			if rtv != 0 {
+				rtv.Release()
+			}
+		}()
+	}
 
 	// Dynamic video textures (created lazily on first frame or format/size change).
 	var (
@@ -409,6 +436,13 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			if w > 0 && h > 0 && (w != winW || h != winH) {
 				winW, winH = w, h
 				ctx.OMSetRenderTargets(0)
+				if vpProc != nil {
+					vpProc.releaseOutput()
+				}
+				if backBuf != 0 {
+					backBuf.Release()
+					backBuf = 0
+				}
 				if rtv != 0 {
 					rtv.Release()
 					rtv = 0
@@ -416,9 +450,16 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				if err := sc.ResizeBuffers(2, uint32(winW), uint32(winH), win.DXGI_FORMAT_B8G8R8A8_UNORM, swapChainFlags); err != nil {
 					return FinalState{}, fmt.Errorf("resize buffers: %w", err)
 				}
-				rtv, err = makeBackBufferRTV(dev, sc)
-				if err != nil {
-					return FinalState{}, err
+				if vpProc != nil {
+					backBuf, err = sc.GetBuffer(0)
+					if err != nil {
+						return FinalState{}, fmt.Errorf("back buffer: %w", err)
+					}
+				} else {
+					rtv, err = makeBackBufferRTV(dev, sc)
+					if err != nil {
+						return FinalState{}, err
+					}
 				}
 			}
 		}
@@ -431,7 +472,7 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				setCursor(true)
 			}
 			tearingActive := !useVSync && supportsTear
-			line := tracker.Summary().FormatLine(getModeLabel(), tearingActive)
+			line := tracker.Summary().FormatLine(getModeLabel()+" ["+renderTag+"]", tearingActive)
 			if a := getAudio(); a != nil {
 				if a.Muted() {
 					line += " | vol MUTED"
@@ -461,51 +502,63 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				lastDrop = d
 			}
 
-			// Lazily create/recreate dynamic video textures.
-			if f.Width != texW || f.Height != texH || f.FourCC != texFmt {
-				releaseVideo()
-				var err error
-				tex0, srv0, tex1, srv1, err = createVideoTextures(dev, f.FourCC, f.Width, f.Height)
+			if vpProc != nil {
+				err := vpProc.uploadAndBlit(f, winW, winH, backBuf)
+				f.Release()
 				if err != nil {
 					return FinalState{}, err
 				}
-				texW, texH, texFmt = f.Width, f.Height, f.FourCC
-			}
-
-			// Upload CPU frame -> GPU dynamic texture(s).
-			if f.FourCC == "NV12" {
-				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width, f.Height); err != nil {
-					return FinalState{}, err
-				}
-				if err := uploadPlane(ctx, tex1, f.Plane1, f.Stride1, f.Width, f.Height/2); err != nil {
-					return FinalState{}, err
-				}
 			} else {
-				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width*2, f.Height); err != nil {
-					return FinalState{}, err
+				// Lazily create/recreate dynamic video textures.
+				if f.Width != texW || f.Height != texH || f.FourCC != texFmt {
+					releaseVideo()
+					var err error
+					tex0, srv0, tex1, srv1, err = createVideoTextures(dev, f.FourCC, f.Width, f.Height)
+					if err != nil {
+						f.Release()
+						return FinalState{}, err
+					}
+					texW, texH, texFmt = f.Width, f.Height, f.FourCC
 				}
-			}
-			f.Release() // hand the capture buffer back to Media Foundation
 
-			// Draw full-screen triangle with aspect-preserving viewport.
-			ctx.OMSetRenderTargets(rtv)
-			ctx.ClearRenderTargetView(rtv, &black)
-			vp := FitViewport(winW, winH, f.Width, f.Height)
-			ctx.RSSetViewports(&win.Viewport{
-				TopLeftX: vp.X, TopLeftY: vp.Y, Width: vp.W, Height: vp.H,
-				MinDepth: 0, MaxDepth: 1,
-			})
-			ctx.IASetPrimitiveTopology(win.D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-			ctx.VSSetShader(vs)
-			if f.FourCC == "NV12" {
-				ctx.PSSetShader(psNV12)
-				ctx.PSSetShaderResources(0, []win.Object{srv0, srv1})
-				ctx.PSSetSamplers(0, []win.Object{sampler})
-			} else {
-				ctx.PSSetShader(psYUY2)
-				ctx.PSSetShaderResources(0, []win.Object{srv0})
+				// Upload CPU frame -> GPU dynamic texture(s).
+				if f.FourCC == "NV12" {
+					if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width, f.Height); err != nil {
+						f.Release()
+						return FinalState{}, err
+					}
+					if err := uploadPlane(ctx, tex1, f.Plane1, f.Stride1, f.Width, f.Height/2); err != nil {
+						f.Release()
+						return FinalState{}, err
+					}
+				} else {
+					if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width*2, f.Height); err != nil {
+						f.Release()
+						return FinalState{}, err
+					}
+				}
+				f.Release() // hand the capture buffer back to Media Foundation
+
+				// Draw full-screen triangle with aspect-preserving viewport.
+				ctx.OMSetRenderTargets(rtv)
+				ctx.ClearRenderTargetView(rtv, &black)
+				vp := FitViewport(winW, winH, f.Width, f.Height)
+				ctx.RSSetViewports(&win.Viewport{
+					TopLeftX: vp.X, TopLeftY: vp.Y, Width: vp.W, Height: vp.H,
+					MinDepth: 0, MaxDepth: 1,
+				})
+				ctx.IASetPrimitiveTopology(win.D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+				ctx.VSSetShader(vs)
+				if f.FourCC == "NV12" {
+					ctx.PSSetShader(psNV12)
+					ctx.PSSetShaderResources(0, []win.Object{srv0, srv1})
+					ctx.PSSetSamplers(0, []win.Object{sampler})
+				} else {
+					ctx.PSSetShader(psYUY2)
+					ctx.PSSetShaderResources(0, []win.Object{srv0})
+				}
+				ctx.Draw(3, 0)
 			}
-			ctx.Draw(3, 0)
 
 			// Present immediately (VRR / tearing) or wait for vsync.
 			var pErr error

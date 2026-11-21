@@ -23,6 +23,7 @@ const (
 	vtContextIASetPrimitiveTopology = 24
 	vtContextOMSetRenderTargets     = 33
 	vtContextRSSetViewports         = 44
+	vtContextCopyResource           = 47
 	vtContextClearRenderTargetView  = 50
 	vtContextFlush                  = 111
 )
@@ -35,11 +36,13 @@ const (
 
 	D3D11_USAGE_DEFAULT = 0
 	D3D11_USAGE_DYNAMIC = 2
+	D3D11_USAGE_STAGING = 3
 
 	D3D11_BIND_SHADER_RESOURCE = 0x8
 
 	D3D11_CPU_ACCESS_WRITE = 0x10000
 
+	D3D11_MAP_WRITE         = 2
 	D3D11_MAP_WRITE_DISCARD = 4
 
 	D3D11_SRV_DIMENSION_TEXTURE2D = 4
@@ -234,6 +237,11 @@ func (c Context) ClearRenderTargetView(view Object, rgba *[4]float32) {
 // Draw issues a non-indexed draw call.
 func (c Context) Draw(vertexCount, startVertex uint32) {
 	c.call(vtContextDraw, uintptr(vertexCount), uintptr(startVertex))
+}
+
+// CopyResource copies the entire contents of src to dst on the GPU.
+func (c Context) CopyResource(dst, src Object) {
+	c.call(vtContextCopyResource, uintptr(dst), uintptr(src))
 }
 
 // Flush submits queued commands to the GPU immediately.
