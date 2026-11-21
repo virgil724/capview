@@ -210,7 +210,8 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
 				mode := m
 				cur := h.vid.Mode.Width == mode.Width &&
 					h.vid.Mode.Height == mode.Height &&
-					math.Abs(h.vid.Mode.FPS-mode.FPS) < 0.5
+					math.Abs(h.vid.Mode.FPS-mode.FPS) < 0.5 &&
+					h.vid.Mode.FourCC == mode.FourCC
 				modeItems = append(modeItems, win.MenuItem{
 					ID:      addAction(func() (bool, bool, bool) { h.switchVideoMode(mode); return false, false, false }),
 					Label:   fmt.Sprintf("%dx%d @ %.0f fps (%s)", mode.Width, mode.Height, math.Round(mode.FPS), mode.FourCC),

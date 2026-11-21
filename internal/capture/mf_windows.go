@@ -126,7 +126,10 @@ func ListModes(device string) ([]Mode, error) {
 		}
 		defer rd.Release()
 
-		type key struct{ w, h, fps int }
+		type key struct {
+			w, h, fps int
+			fourcc    string
+		}
 		seen := make(map[key]Mode)
 		for i := uint32(0); ; i++ {
 			t, err := rd.NativeMediaType(win.MF_SOURCE_READER_FIRST_VIDEO_STREAM, i)
@@ -151,8 +154,8 @@ func ListModes(device string) ([]Mode, error) {
 			if d := fr & 0xffffffff; d != 0 {
 				m.FPS = float64(fr>>32) / float64(d)
 			}
-			k := key{m.Width, m.Height, int(math.Round(m.FPS))}
-			if prev, ok := seen[k]; !ok || (prev.FourCC != "NV12" && m.FourCC == "NV12") {
+			k := key{m.Width, m.Height, int(math.Round(m.FPS)), m.FourCC}
+			if _, ok := seen[k]; !ok {
 				seen[k] = m
 			}
 		}
@@ -166,7 +169,10 @@ func ListModes(device string) ([]Mode, error) {
 			if modes[i].Height != modes[j].Height {
 				return modes[i].Height > modes[j].Height
 			}
-			return modes[i].FPS > modes[j].FPS
+			if math.Abs(modes[i].FPS-modes[j].FPS) > 0.5 {
+				return modes[i].FPS > modes[j].FPS
+			}
+			return modes[i].FourCC < modes[j].FourCC // NV12 before YUY2
 		})
 		return nil
 	})
