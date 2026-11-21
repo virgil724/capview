@@ -15,8 +15,10 @@ func TestCompileShaders(t *testing.T) {
 		target string
 	}{
 		{"fullscreenVS", fullscreenVS, "vs_5_0"},
-		{"nv12PS", nv12PS, "ps_5_0"},
+		{"planarPS", planarPS, "ps_5_0"},
 		{"yuy2PS", yuy2PS, "ps_5_0"},
+		{"rgbPS", rgbPS, "ps_5_0"},
+		{"rgb24PS", rgb24PS, "ps_5_0"},
 	}
 	for _, tc := range cases {
 		bc, err := win.CompileHLSL(tc.src, "main", tc.target)

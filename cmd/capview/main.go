@@ -367,7 +367,8 @@ func runView(args []string) error {
 	device := fs.String("device", cfg.Device, "Media Foundation video device name, substring, or 'auto'")
 	size := fs.String("size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), "capture resolution WxH")
 	fps := fs.Float64("fps", cfg.FPS, "target capture frame rate")
-	format := fs.String("format", cfg.Format, "pixel format: auto, NV12, or YUY2")
+	format := fs.String("format", cfg.Format, "pixel format: auto (NV12, YUY2, P010, RGB32, RGB24 in that order), or one of them")
+	hdr := fs.String("hdr", cfg.HDR, "HDR10 (P010) output: auto (HDR10 when Windows HDR is on, else tone mapped to SDR) or off (always tone map)")
 	display := fs.String("display", cfg.Display, "target display (e.g. '\\\\.\\DISPLAY2' or 'primary')")
 	fullscreen := fs.Bool("fullscreen", cfg.Fullscreen, "start in borderless fullscreen (press F11/F/Alt+Enter to toggle)")
 	vsync := fs.Bool("vsync", cfg.VSync, "wait for display vblank instead of VRR / ALLOW_TEARING")
@@ -399,6 +400,14 @@ func runView(args []string) error {
 	}
 	if setFlags["format"] {
 		cfg.Format = *format
+	}
+	if setFlags["hdr"] {
+		switch strings.ToLower(*hdr) {
+		case "auto", "off":
+			cfg.HDR = strings.ToLower(*hdr)
+		default:
+			return fmt.Errorf("-hdr must be auto or off, got %q", *hdr)
+		}
 	}
 	if setFlags["display"] {
 		cfg.Display = *display
@@ -449,6 +458,7 @@ func runView(args []string) error {
 		Fullscreen:        cfg.Fullscreen,
 		VSync:             cfg.VSync,
 		UseVideoProcessor: *useVP,
+		HDR:               cfg.HDR,
 		SavedRect:         savedRect,
 		PrintStats:        *printStats,
 		Freq:              host.freq,

@@ -39,6 +39,32 @@ var (
 	MF_LOW_LATENCY                    = guid(0x9c27891a, 0xed7a, 0x40e1, 0x88, 0xe8, 0xb2, 0x27, 0x27, 0xa0, 0x24, 0xee)
 	MF_READWRITE_DISABLE_CONVERTERS   = guid(0x98d5b065, 0x1374, 0x4847, 0x8d, 0x5d, 0x31, 0x52, 0x0f, 0xee, 0x71, 0x56)
 	MFSampleExtension_DeviceTimestamp = guid(0x8f3e35e7, 0x2dcd, 0x4887, 0x86, 0x22, 0x2a, 0x58, 0xba, 0xa6, 0x52, 0xb0)
+
+	// Colour description and layout of a video media type (mfapi.h).
+	MF_MT_DEFAULT_STRIDE      = guid(0x644b4e48, 0x1e02, 0x4516, 0xb0, 0xeb, 0xc0, 0x1c, 0xa9, 0xd4, 0x9a, 0xc6)
+	MF_MT_TRANSFER_FUNCTION   = guid(0x5fb0fce9, 0xbe5c, 0x4935, 0xa8, 0x11, 0xec, 0x83, 0x8f, 0x8e, 0xed, 0x93)
+	MF_MT_VIDEO_PRIMARIES     = guid(0xdbfbe4d7, 0x0740, 0x4ee0, 0x81, 0x92, 0x85, 0x0a, 0xb0, 0xe2, 0x19, 0x35)
+	MF_MT_YUV_MATRIX          = guid(0x3e23d450, 0x2c75, 0x4d25, 0xa0, 0x0e, 0xb9, 0x16, 0x70, 0xd1, 0x23, 0x27)
+	MF_MT_VIDEO_NOMINAL_RANGE = guid(0xc21b8ee5, 0xb956, 0x4071, 0x8d, 0xaf, 0x32, 0x5e, 0xdf, 0x5c, 0xab, 0x11)
+)
+
+// MF colour enum values (mfobjects.h) used by capture.
+const (
+	MFVideoTransFunc_709  = 5
+	MFVideoTransFunc_sRGB = 7
+	MFVideoTransFunc_2084 = 15
+	MFVideoTransFunc_HLG  = 16
+
+	MFVideoPrimaries_BT709  = 2
+	MFVideoPrimaries_BT2020 = 9
+
+	MFVideoTransferMatrix_BT709     = 1
+	MFVideoTransferMatrix_BT601     = 2
+	MFVideoTransferMatrix_BT2020_10 = 4
+	MFVideoTransferMatrix_BT2020_12 = 5
+
+	MFNominalRange_0_255  = 1
+	MFNominalRange_16_235 = 2
 )
 
 // FourCC returns the FourCC of an MFVideoFormat GUID ("" if it is not one).
@@ -55,8 +81,24 @@ func FourCC(g GUID) string {
 	return string(b)
 }
 
+// SubtypeName names an MFVideoFormat subtype: its FourCC ("NV12", "YUY2",
+// "P010", ...), or "RGB24" / "RGB32" for the D3DFORMAT-based RGB subtypes.
+// It returns "" for anything else.
+func SubtypeName(g GUID) string {
+	if g.Data2 == 0 && g.Data3 == 0x0010 && g.Data4 == [8]byte{0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71} {
+		switch g.Data1 {
+		case 20: // D3DFMT_R8G8B8
+			return "RGB24"
+		case 22: // D3DFMT_X8R8G8B8
+			return "RGB32"
+		}
+	}
+	return FourCC(g)
+}
+
 // vtable indices.
 const (
+	vtAttrGetUINT32                   = 7
 	vtAttrGetUINT64                   = 8
 	vtAttrGetGUID                     = 10
 	vtAttrGetAllocatedString          = 13
@@ -131,6 +173,12 @@ func (a Attributes) GetGUID(key *GUID) (GUID, error) {
 func (a Attributes) GetUINT64(key *GUID) (uint64, error) {
 	var v uint64
 	err := hr(a.call(vtAttrGetUINT64, uintptr(unsafe.Pointer(key)), uintptr(unsafe.Pointer(&v))))
+	return v, err
+}
+
+func (a Attributes) GetUINT32(key *GUID) (uint32, error) {
+	var v uint32
+	err := hr(a.call(vtAttrGetUINT32, uintptr(unsafe.Pointer(key)), uintptr(unsafe.Pointer(&v))))
 	return v, err
 }
 
@@ -224,19 +272,34 @@ func SampleBuffer(sample Attributes) (Object, error) {
 
 // LockBuffer locks a media buffer and returns its raw bytes and row pitch.
 // When pitch == 0, the caller uses the format's tightly-packed stride.
-func LockBuffer(buf Object) (data []byte, pitch int, unlock func(), err error) {
+// For a bottom-up image (IMF2DBuffer reports a negative pitch) data starts at
+// the lowest address, which holds the bottom row, pitch is positive and
+// bottomUp is true; rows (the image height) locates that bottom row. The plain
+// IMFMediaBuffer path cannot tell: bottomUp is false and the caller decides
+// from MF_MT_DEFAULT_STRIDE.
+func LockBuffer(buf Object, rows int) (data []byte, pitch int, bottomUp bool, unlock func(), err error) {
 	if b2, e := buf.QueryInterface(&IID_IMF2DBuffer); e == nil {
 		var scan0 *byte
 		var p int32
-		if e := hr(b2.call(vt2DLock2D, uintptr(unsafe.Pointer(&scan0)), uintptr(unsafe.Pointer(&p)))); e == nil && p > 0 {
-			return unsafe.Slice(scan0, 1<<30), int(p), func() { b2.call(vt2DUnlock2D); b2.Release() }, nil
+		if e := hr(b2.call(vt2DLock2D, uintptr(unsafe.Pointer(&scan0)), uintptr(unsafe.Pointer(&p)))); e == nil {
+			unlock2D := func() { b2.call(vt2DUnlock2D); b2.Release() }
+			if p > 0 {
+				return unsafe.Slice(scan0, 1<<30), int(p), false, unlock2D, nil
+			}
+			if p < 0 && rows > 0 {
+				// scan0 is the top row at the highest address; rows go down in memory.
+				base := unsafe.Add(unsafe.Pointer(scan0), int(p)*(rows-1))
+				return unsafe.Slice((*byte)(base), int(-p)*rows), int(-p), true, unlock2D, nil
+			}
+			unlock2D()
+		} else {
+			b2.Release()
 		}
-		b2.Release()
 	}
 	var ptr *byte
 	var max, cur uint32
 	if err := hr(buf.call(vtBufferLock, uintptr(unsafe.Pointer(&ptr)), uintptr(unsafe.Pointer(&max)), uintptr(unsafe.Pointer(&cur)))); err != nil {
-		return nil, 0, nil, err
+		return nil, 0, false, nil, err
 	}
-	return unsafe.Slice(ptr, cur), 0, func() { buf.call(vtBufferUnlock) }, nil
+	return unsafe.Slice(ptr, cur), 0, false, func() { buf.call(vtBufferUnlock) }, nil
 }

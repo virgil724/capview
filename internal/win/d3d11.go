@@ -6,6 +6,7 @@ import "unsafe"
 
 // vtable indices (verified against mingw-w64 d3d11.h).
 const (
+	vtDeviceCreateBuffer             = 3
 	vtDeviceCreateTexture2D          = 5
 	vtDeviceCreateShaderResourceView = 7
 	vtDeviceCreateRenderTargetView   = 9
@@ -20,6 +21,7 @@ const (
 	vtContextDraw                   = 13
 	vtContextMap                    = 14
 	vtContextUnmap                  = 15
+	vtContextPSSetConstantBuffers   = 16
 	vtContextIASetPrimitiveTopology = 24
 	vtContextOMSetRenderTargets     = 33
 	vtContextRSSetViewports         = 44
@@ -32,16 +34,23 @@ const (
 const (
 	D3D_DRIVER_TYPE_UNKNOWN  = 0
 	D3D_DRIVER_TYPE_HARDWARE = 1
+	D3D_DRIVER_TYPE_WARP     = 5
 	D3D11_SDK_VERSION        = 7
+
+	D3D11_CREATE_DEVICE_VIDEO_SUPPORT = 0x800
 
 	D3D11_USAGE_DEFAULT = 0
 	D3D11_USAGE_DYNAMIC = 2
 	D3D11_USAGE_STAGING = 3
 
+	D3D11_BIND_CONSTANT_BUFFER = 0x4
 	D3D11_BIND_SHADER_RESOURCE = 0x8
+	D3D11_BIND_RENDER_TARGET   = 0x20
 
 	D3D11_CPU_ACCESS_WRITE = 0x10000
+	D3D11_CPU_ACCESS_READ  = 0x20000
 
+	D3D11_MAP_READ          = 1
 	D3D11_MAP_WRITE         = 2
 	D3D11_MAP_WRITE_DISCARD = 4
 
@@ -67,6 +76,16 @@ type Texture2DDesc struct {
 	BindFlags      uint32
 	CPUAccessFlags uint32
 	MiscFlags      uint32
+}
+
+// BufferDesc is D3D11_BUFFER_DESC.
+type BufferDesc struct {
+	ByteWidth           uint32
+	Usage               uint32
+	BindFlags           uint32
+	CPUAccessFlags      uint32
+	MiscFlags           uint32
+	StructureByteStride uint32
 }
 
 // ShaderResourceViewDesc is D3D11_SHADER_RESOURCE_VIEW_DESC for Texture2D.
@@ -128,6 +147,28 @@ func CreateDevice(adapter Object) (Device, Context, error) {
 		return Device{}, Context{}, err
 	}
 	return Device{dev}, Context{ctx}, nil
+}
+
+// CreateDeviceWARP creates a D3D11 device on the WARP software rasterizer
+// (for tests), with video support when available.
+func CreateDeviceWARP() (Device, Context, error) {
+	var err error
+	for _, flags := range []uintptr{D3D11_CREATE_DEVICE_VIDEO_SUPPORT, 0} {
+		var dev, ctx Object
+		r, _, _ := procD3D11CreateDevice.Call(0, D3D_DRIVER_TYPE_WARP, 0, flags, 0, 0,
+			D3D11_SDK_VERSION, uintptr(unsafe.Pointer(&dev)), 0, uintptr(unsafe.Pointer(&ctx)))
+		if err = hr(r); err == nil {
+			return Device{dev}, Context{ctx}, nil
+		}
+	}
+	return Device{}, Context{}, err
+}
+
+// CreateBuffer creates a buffer with no initial data.
+func (d Device) CreateBuffer(desc *BufferDesc) (Object, error) {
+	var b Object
+	err := hr(d.call(vtDeviceCreateBuffer, uintptr(unsafe.Pointer(desc)), 0, uintptr(unsafe.Pointer(&b))))
+	return b, err
 }
 
 // CreateTexture2D creates a 2D texture.
@@ -205,6 +246,14 @@ func (c Context) PSSetShaderResources(startSlot uint32, srvs []Object) {
 		return
 	}
 	c.call(vtContextPSSetShaderResources, uintptr(startSlot), uintptr(len(srvs)), uintptr(unsafe.Pointer(&srvs[0])))
+}
+
+// PSSetConstantBuffers binds constant buffers starting at slot startSlot.
+func (c Context) PSSetConstantBuffers(startSlot uint32, bufs []Object) {
+	if len(bufs) == 0 {
+		return
+	}
+	c.call(vtContextPSSetConstantBuffers, uintptr(startSlot), uintptr(len(bufs)), uintptr(unsafe.Pointer(&bufs[0])))
 }
 
 // PSSetSamplers binds samplers starting at slot startSlot.

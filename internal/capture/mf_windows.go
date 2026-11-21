@@ -1,6 +1,7 @@
 //go:build windows
 
-// Package capture reads full-colour video frames (NV12 or YUY2) in-process via
+// Package capture reads full-colour video frames (NV12, YUY2, P010, RGB32 or
+// RGB24) in-process via
 // Windows Media Foundation (IMFSourceReader) with zero frame queuing.
 package capture
 
@@ -24,7 +25,7 @@ type Config struct {
 	Width         int     // requested width (default 1920)
 	Height        int     // requested height (default 1080)
 	FPS           float64 // requested frame rate (default 60)
-	Format        string  // "auto" (NV12 preferred, then YUY2), "NV12", or "YUY2"
+	Format        string  // "auto" (NV12, YUY2, P010, RGB32, RGB24 in that order) or one of them
 	AutoReconnect bool    // automatically retry if signal drops or device resets
 	Mailbox       *Mailbox
 }
@@ -35,21 +36,36 @@ type Mode struct {
 	FourCC        string
 	Width, Height int
 	FPS           float64
+	Color         ColorInfo
+	BottomUp      bool // buffers without IMF2DBuffer store the bottom row first
+	pitch         int  // row pitch of buffers that report none
 }
 
 func (m Mode) String() string {
-	return fmt.Sprintf("%s %dx%d@%.2f", m.FourCC, m.Width, m.Height, m.FPS)
+	s := fmt.Sprintf("%s %dx%d@%.2f", m.FourCC, m.Width, m.Height, m.FPS)
+	switch m.Color.Transfer {
+	case TransferPQ:
+		s += " HDR10"
+	case TransferHLG:
+		s += " HLG"
+	}
+	return s
 }
 
 // Frame holds one full-colour video frame ready for GPU upload, its planes
 // pointing into the locked capture buffer (call Release when done).
-// For NV12: Plane0 is Y (Height rows, stride = Stride0), Plane1 is interleaved
-// UV (Height/2 rows, stride = Stride1).
-// For YUY2: Plane0 is packed YUY2 (Height rows of Width*2 bytes, stride = Stride0).
+// For NV12 / P010: Plane0 is Y (Height rows, stride = Stride0), Plane1 is
+// interleaved UV (Height/2 rows, stride = Stride1); P010 samples are 16-bit
+// little-endian with the 10 bits at the top.
+// For YUY2 / RGB32 / RGB24: Plane0 is packed (Height rows of Width*2, *4 (B,G,R,X)
+// or *3 (B,G,R) bytes, stride = Stride0). When BottomUp is set, row 0 of the
+// planes is the bottom row of the picture.
 type Frame struct {
 	FourCC    string
 	Width     int
 	Height    int
+	Color     ColorInfo
+	BottomUp  bool
 	Plane0    []byte
 	Stride0   int
 	Plane1    []byte
@@ -58,8 +74,6 @@ type Frame struct {
 	DeviceQPC int64
 	release   func()
 }
-
-var supportedFormats = map[string]bool{"NV12": true, "YUY2": true}
 
 func withMF(f func() error) error {
 	runtime.LockOSThread()
@@ -94,8 +108,8 @@ func ListDevices() ([]string, error) {
 	return names, err
 }
 
-// ListModes returns deduplicated supported NV12/YUY2 modes of device, sorted by
-// resolution and frame rate descending.
+// ListModes returns deduplicated supported modes of device, sorted by
+// resolution and frame rate descending, then by format preference.
 func ListModes(device string) ([]Mode, error) {
 	var modes []Mode
 	err := withMF(func() error {
@@ -143,8 +157,8 @@ func ListModes(device string) ([]Mode, error) {
 			fr, _ := t.GetUINT64(&win.MF_MT_FRAME_RATE)
 			t.Release()
 
-			cc := win.FourCC(sub)
-			if !supportedFormats[cc] {
+			cc := win.SubtypeName(sub)
+			if formatRank(cc) < 0 {
 				continue
 			}
 			m := Mode{
@@ -174,7 +188,7 @@ func ListModes(device string) ([]Mode, error) {
 			if math.Abs(modes[i].FPS-modes[j].FPS) > 0.5 {
 				return modes[i].FPS > modes[j].FPS
 			}
-			return modes[i].FourCC < modes[j].FourCC // NV12 before YUY2
+			return formatRank(modes[i].FourCC) < formatRank(modes[j].FourCC)
 		})
 		return nil
 	})
@@ -259,21 +273,44 @@ type lockedBuffer struct {
 	FourCC    string
 	Width     int
 	Height    int
+	Color     ColorInfo
+	BottomUp  bool
 	Data      []byte
-	Pitch     int
+	Pitch     int // 0 = the format's packed pitch
 	ArriveQPC int64
 	DeviceQPC int64
 }
 
+// bytesPerPixel of the first plane (luma for NV12 / P010), 0 if unsupported.
+func bytesPerPixel(fourcc string) int {
+	switch fourcc {
+	case "NV12":
+		return 1
+	case "YUY2", "P010":
+		return 2
+	case "RGB24":
+		return 3
+	case "RGB32":
+		return 4
+	}
+	return 0
+}
+
 // view makes a Frame whose planes alias the locked buffer, keeping its row
 // pitch (the renderer uploads row by row). release is called when the frame
-// is dropped or consumed. ok is false if the buffer is too small.
+// is dropped or consumed. ok is false if the buffer is too small or the
+// format unsupported.
 func (c lockedBuffer) view(release func()) (Frame, bool) {
-	f := Frame{FourCC: c.FourCC, Width: c.Width, Height: c.Height,
+	bpp := bytesPerPixel(c.FourCC)
+	if bpp == 0 {
+		return Frame{}, false
+	}
+	f := Frame{FourCC: c.FourCC, Width: c.Width, Height: c.Height, Color: c.Color, BottomUp: c.BottomUp,
 		ArriveQPC: c.ArriveQPC, DeviceQPC: c.DeviceQPC, release: release}
-	if c.FourCC == "NV12" {
-		pitch := max(c.Pitch, c.Width)
-		ySize, uvSize := pitch*c.Height, pitch*(c.Height/2)
+	pitch := max(c.Pitch, c.Width*bpp)
+	ySize := pitch * c.Height
+	if c.FourCC == "NV12" || c.FourCC == "P010" {
+		uvSize := pitch * (c.Height / 2)
 		if len(c.Data) < ySize+uvSize {
 			return Frame{}, false
 		}
@@ -281,12 +318,10 @@ func (c lockedBuffer) view(release func()) (Frame, bool) {
 		f.Plane1, f.Stride1 = c.Data[ySize:ySize+uvSize:ySize+uvSize], pitch
 		return f, true
 	}
-	pitch := max(c.Pitch, c.Width*2) // YUY2
-	size := pitch * c.Height
-	if len(c.Data) < size {
+	if len(c.Data) < ySize {
 		return Frame{}, false
 	}
-	f.Plane0, f.Stride0 = c.Data[:size:size], pitch
+	f.Plane0, f.Stride0 = c.Data[:ySize:ySize], pitch
 	return f, true
 }
 
@@ -417,6 +452,10 @@ func (s *Source) run(cfg Config, freq int64, ready chan<- error) error {
 	if err != nil {
 		return err
 	}
+	mc := readMediaColor(t)
+	mode.Color = colorInfo(mode.FourCC, mc)
+	mode.BottomUp = defaultBottomUp(mode.FourCC, mc)
+	mode.pitch = defaultPitch(mode.FourCC, mode.Width, mc)
 	mode.Device = chosenName
 	s.Mode = mode
 	rd.SetStreamSelection(win.MF_SOURCE_READER_ALL_STREAMS, false)
@@ -455,7 +494,7 @@ func (s *Source) run(cfg Config, freq int64, ready chan<- error) error {
 			sample.Release()
 			continue
 		}
-		data, pitch, unlock, err := win.LockBuffer(buf)
+		data, pitch, bottomUp, unlock, err := win.LockBuffer(buf, mode.Height)
 		if err != nil {
 			buf.Release()
 			sample.Release()
@@ -465,10 +504,15 @@ func (s *Source) run(cfg Config, freq int64, ready chan<- error) error {
 		// stays held (so its buffer is not recycled) until the frame is
 		// dropped or uploaded.
 		release := func() { unlock(); buf.Release(); sample.Release() }
+		if pitch == 0 { // plain IMFMediaBuffer: layout comes from the media type
+			pitch, bottomUp = mode.pitch, mode.BottomUp
+		}
 		f, ok := lockedBuffer{
 			FourCC:    mode.FourCC,
 			Width:     mode.Width,
 			Height:    mode.Height,
+			Color:     mode.Color,
+			BottomUp:  bottomUp,
 			Data:      data,
 			Pitch:     pitch,
 			ArriveQPC: arrive,
@@ -552,25 +596,22 @@ func hnsToQPC(hns, freq int64) int64 {
 func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 	want := strings.ToUpper(cfg.Format)
 	rank := func(cc string) int {
+		if formatRank(cc) < 0 {
+			return -1
+		}
 		if want != "" && want != "AUTO" {
 			if cc == want {
 				return 0
 			}
 			return -1
 		}
-		switch cc {
-		case "NV12":
-			return 0
-		case "YUY2":
-			return 1
-		}
-		return -1
+		return formatRank(cc)
 	}
 	var best win.Attributes
 	var bestMode Mode
 	bestRank, bestDiff := 99, math.Inf(1)
 
-	// Fallback: highest FPS, then highest resolution, preferring NV12 over YUY2.
+	// Fallback: highest FPS, then highest resolution, then format preference.
 	var fb win.Attributes
 	var fbMode Mode
 	fbRank := 99
@@ -584,12 +625,12 @@ func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 		sub, _ := t.GetGUID(&win.MF_MT_SUBTYPE)
 		fs, _ := t.GetUINT64(&win.MF_MT_FRAME_SIZE)
 		fr, _ := t.GetUINT64(&win.MF_MT_FRAME_RATE)
-		m := Mode{FourCC: win.FourCC(sub), Width: int(fs >> 32), Height: int(fs & 0xffffffff)}
+		m := Mode{FourCC: win.SubtypeName(sub), Width: int(fs >> 32), Height: int(fs & 0xffffffff)}
 		if d := fr & 0xffffffff; d != 0 {
 			m.FPS = float64(fr>>32) / float64(d)
 		}
 		r := rank(m.FourCC)
-		if r < 0 || !supportedFormats[m.FourCC] {
+		if r < 0 {
 			t.Release()
 			continue
 		}
@@ -630,5 +671,5 @@ func pickType(rd win.SourceReader, cfg Config) (win.Attributes, Mode, error) {
 	if fb.Object != 0 {
 		return fb, fbMode, nil
 	}
-	return best, Mode{}, fmt.Errorf("no usable NV12/YUY2 mode (format %s); device offers %v", cfg.Format, seen)
+	return best, Mode{}, fmt.Errorf("no usable %v mode (format %s); device offers %v", formatOrder, cfg.Format, seen)
 }

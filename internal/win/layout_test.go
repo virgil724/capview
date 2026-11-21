@@ -27,6 +27,10 @@ func TestStructLayouts(t *testing.T) {
 		{"VideoProcessorOutputViewDesc", unsafe.Sizeof(VideoProcessorOutputViewDesc{}), 16},
 		{"VideoProcessorStream", unsafe.Sizeof(VideoProcessorStream{}), 24 + 6*ptrSize},
 		{"VideoProcessorColorSpace", unsafe.Sizeof(VideoProcessorColorSpace{}), 4},
+		{"BufferDesc", unsafe.Sizeof(BufferDesc{}), 24},
+		{"OutputDesc1", unsafe.Sizeof(OutputDesc1{}), 152}, // 148 + padding to 8
+		{"OutputDesc1.BitsPerColor offset", unsafe.Offsetof(OutputDesc1{}.BitsPerColor), 96},
+		{"OutputDesc1.ColorSpace offset", unsafe.Offsetof(OutputDesc1{}.ColorSpace), 100},
 	}
 	for _, tc := range cases {
 		if tc.got != tc.want {

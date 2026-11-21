@@ -8,6 +8,10 @@ import "unsafe"
 var (
 	IID_ID3D11VideoDevice  = guid(0x10ec4d5b, 0x975a, 0x4689, 0xb9, 0xe4, 0xd0, 0xaa, 0xc3, 0x0f, 0xe3, 0x33)
 	IID_ID3D11VideoContext = guid(0x61f21c45, 0x3c0e, 0x4a74, 0x9c, 0xea, 0x67, 0x10, 0x0d, 0x9a, 0xd5, 0xe4)
+
+	// d3d11_1.h
+	IID_ID3D11VideoContext1             = guid(0xa7f026da, 0xa5f8, 0x4487, 0xa5, 0x64, 0x15, 0xe3, 0x43, 0x57, 0x65, 0x1e)
+	IID_ID3D11VideoProcessorEnumerator1 = guid(0x465217f2, 0x5568, 0x43cf, 0xb5, 0xb9, 0xf6, 0x1d, 0x54, 0x53, 0x1c, 0xa1)
 )
 
 // vtable indices (verified against Windows SDK 10.0.26100.0 d3d11.h).
@@ -17,15 +21,21 @@ const (
 	vtVideoDeviceCreateVideoProcessorOutputView = 9
 	vtVideoDeviceCreateVideoProcessorEnumerator = 10
 
-	vtVideoContextSetOutputTargetRect          = 13
-	vtVideoContextSetOutputBackgroundColor     = 14
-	vtVideoContextSetOutputColorSpace          = 15
-	vtVideoContextSetStreamFrameFormat         = 27
-	vtVideoContextSetStreamColorSpace          = 28
-	vtVideoContextSetStreamSourceRect          = 30
-	vtVideoContextSetStreamDestRect            = 31
-	vtVideoContextSetStreamAutoProcessingMode  = 37
-	vtVideoContextVideoProcessorBlt            = 53
+	vtVideoContextSetOutputTargetRect         = 13
+	vtVideoContextSetOutputBackgroundColor    = 14
+	vtVideoContextSetOutputColorSpace         = 15
+	vtVideoContextSetStreamFrameFormat        = 27
+	vtVideoContextSetStreamColorSpace         = 28
+	vtVideoContextSetStreamSourceRect         = 30
+	vtVideoContextSetStreamDestRect           = 31
+	vtVideoContextSetStreamAutoProcessingMode = 37
+	vtVideoContextVideoProcessorBlt           = 53
+
+	// ID3D11VideoContext1 / ID3D11VideoProcessorEnumerator(1), d3d11_1.h.
+	vtVideoContext1SetOutputColorSpace1 = 70
+	vtVideoContext1SetStreamColorSpace1 = 74
+	vtVPEnumCheckVideoProcessorFormat   = 8
+	vtVPEnum1CheckFormatConversion      = 13
 )
 
 // D3D11 Video constants.
@@ -38,6 +48,9 @@ const (
 
 	D3D11_VPIV_DIMENSION_TEXTURE2D = 1
 	D3D11_VPOV_DIMENSION_TEXTURE2D = 1
+
+	D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT  = 0x1
+	D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT = 0x2
 )
 
 // Rational is DXGI_RATIONAL.
@@ -76,34 +89,37 @@ type VideoProcessorOutputViewDesc struct {
 
 // VideoProcessorStream is D3D11_VIDEO_PROCESSOR_STREAM.
 type VideoProcessorStream struct {
-	Enable                int32
-	OutputIndex           uint32
-	InputFrameOrField     uint32
-	PastFrames            uint32
-	FutureFrames          uint32
-	PastSurfaces          uintptr
-	InputSurface          Object
-	FutureSurfaces        uintptr
-	PastSurfacesRight     uintptr
-	InputSurfaceRight     Object
-	FutureSurfacesRight   uintptr
+	Enable              int32
+	OutputIndex         uint32
+	InputFrameOrField   uint32
+	PastFrames          uint32
+	FutureFrames        uint32
+	PastSurfaces        uintptr
+	InputSurface        Object
+	FutureSurfaces      uintptr
+	PastSurfacesRight   uintptr
+	InputSurfaceRight   Object
+	FutureSurfacesRight uintptr
 }
 
 // VideoProcessorColorSpace is D3D11_VIDEO_PROCESSOR_COLOR_SPACE (32-bit bitfield).
 //
 // Bit layout:
-//   bit 0:    Usage (0 = playback, 1 = video processing)
-//   bit 1:    RGB_Range (0 = full 0-255, 1 = studio 16-235)
-//   bit 2:    YCbCr_Matrix (0 = BT.601, 1 = BT.709)
-//   bit 3:    YCbCr_xvYCC (0 = conventional, 1 = extended)
-//   bits 4-5: Nominal_Range (0 = undefined, 1 = 16-235, 2 = 0-255)
+//
+//	bit 0:    Usage (0 = playback, 1 = video processing)
+//	bit 1:    RGB_Range (0 = full 0-255, 1 = studio 16-235)
+//	bit 2:    YCbCr_Matrix (0 = BT.601, 1 = BT.709)
+//	bit 3:    YCbCr_xvYCC (0 = conventional, 1 = extended)
+//	bits 4-5: Nominal_Range (0 = undefined, 1 = 16-235, 2 = 0-255)
 type VideoProcessorColorSpace struct {
 	Flags uint32
 }
 
-// VideoDevice is ID3D11VideoDevice; VideoContext is ID3D11VideoContext.
+// VideoDevice is ID3D11VideoDevice; VideoContext is ID3D11VideoContext;
+// VideoContext1 is ID3D11VideoContext1 (DXGI colour spaces, HDR).
 type VideoDevice struct{ Object }
 type VideoContext struct{ Object }
+type VideoContext1 struct{ Object }
 
 // VideoDevice queries ID3D11VideoDevice from ID3D11Device.
 func (d Device) VideoDevice() (VideoDevice, error) {
@@ -115,6 +131,47 @@ func (d Device) VideoDevice() (VideoDevice, error) {
 func (c Context) VideoContext() (VideoContext, error) {
 	o, err := c.QueryInterface(&IID_ID3D11VideoContext)
 	return VideoContext{o}, err
+}
+
+// VideoContext1 queries ID3D11VideoContext1 from ID3D11DeviceContext.
+func (c Context) VideoContext1() (VideoContext1, error) {
+	o, err := c.QueryInterface(&IID_ID3D11VideoContext1)
+	return VideoContext1{o}, err
+}
+
+// SetStreamColorSpace1 sets an input stream's DXGI colour space.
+func (vc VideoContext1) SetStreamColorSpace1(vp Object, stream, colorSpace uint32) {
+	vc.call(vtVideoContext1SetStreamColorSpace1, uintptr(vp), uintptr(stream), uintptr(colorSpace))
+}
+
+// SetOutputColorSpace1 sets the output's DXGI colour space.
+func (vc VideoContext1) SetOutputColorSpace1(vp Object, colorSpace uint32) {
+	vc.call(vtVideoContext1SetOutputColorSpace1, uintptr(vp), uintptr(colorSpace))
+}
+
+// VideoProcessorFormatSupport returns D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT
+// flags for format (ID3D11VideoProcessorEnumerator::CheckVideoProcessorFormat).
+func VideoProcessorFormatSupport(enum Object, format uint32) (uint32, error) {
+	var flags uint32
+	err := hr(enum.call(vtVPEnumCheckVideoProcessorFormat, uintptr(format), uintptr(unsafe.Pointer(&flags))))
+	return flags, err
+}
+
+// VideoProcessorConversionSupported reports whether the video processor can
+// convert inFormat/inCS to outFormat/outCS
+// (ID3D11VideoProcessorEnumerator1::CheckVideoProcessorFormatConversion).
+func VideoProcessorConversionSupported(enum Object, inFormat, inCS, outFormat, outCS uint32) (bool, error) {
+	e1, err := enum.QueryInterface(&IID_ID3D11VideoProcessorEnumerator1)
+	if err != nil {
+		return false, err
+	}
+	defer e1.Release()
+	var ok int32
+	if err := hr(e1.call(vtVPEnum1CheckFormatConversion, uintptr(inFormat), uintptr(inCS),
+		uintptr(outFormat), uintptr(outCS), uintptr(unsafe.Pointer(&ok)))); err != nil {
+		return false, err
+	}
+	return ok != 0, nil
 }
 
 func (vd VideoDevice) CreateVideoProcessorEnumerator(desc *VideoProcessorContentDesc) (Object, error) {

@@ -14,6 +14,7 @@ type Config struct {
 	Height        int     `json:"height"`
 	FPS           float64 `json:"fps"`
 	Format        string  `json:"format"`
+	HDR           string  `json:"hdr"` // "auto" or "off"
 	AudioIn       string  `json:"audio_in"`
 	AudioOut      string  `json:"audio_out"`
 	AudioDisabled bool    `json:"audio_disabled"`
@@ -36,6 +37,7 @@ func Default() Config {
 		Height:   1080,
 		FPS:      60,
 		Format:   "auto",
+		HDR:      "auto",
 		AudioIn:  "auto",
 		AudioOut: "default",
 		Volume:   1.0,
@@ -76,6 +78,9 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Format == "" {
 		cfg.Format = "auto"
+	}
+	if cfg.HDR == "" {
+		cfg.HDR = "auto"
 	}
 	if cfg.AudioIn == "" {
 		cfg.AudioIn = "auto"

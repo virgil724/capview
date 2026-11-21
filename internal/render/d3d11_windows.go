@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"time"
-	"unsafe"
 
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/stats"
@@ -89,6 +88,7 @@ type Config struct {
 	Fullscreen        bool      // start in borderless fullscreen
 	VSync             bool      // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
 	UseVideoProcessor bool      // use ID3D11VideoProcessor instead of HLSL pixel shaders
+	HDR               string    // "auto" (default): HDR10 frames go out as HDR10 when Windows HDR is on; "off": always tone map to SDR
 	SavedRect         *win.RECT // optional saved windowed position/size
 	PrintStats        bool      // print 1-second latency stats to stdout
 	Freq              int64     // QPC frequency
@@ -268,113 +268,73 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	}
 	defer sc.Release()
 
-	// Renderer backend: ID3D11VideoProcessor or HLSL shaders.
+	// Renderer backend: ID3D11VideoProcessor or HLSL shaders. The shader
+	// renderer always exists: the video processor uses it for RGB24 and for
+	// tone mapping when the driver cannot.
+	sh, err := newShaderRenderer(dev, ctx)
+	if err != nil {
+		return FinalState{}, err
+	}
+	defer sh.Close()
 	var (
-		vpProc                  *videoProcessor
-		backBuf                 win.Object
-		vs, psNV12, psYUY2      win.Object
-		sampler                 win.Object
-		rtv                     win.Object
-		renderTag               = "HLSL"
+		vpProc    *videoProcessor
+		backBuf   win.Object // video processor output (VP backend)
+		rtv       win.Object // shader output (HLSL backend)
+		renderTag = "HLSL"
 	)
 	if cfg.UseVideoProcessor {
-		vpProc, err = newVideoProcessor(dev, ctx)
+		vpProc, err = newVideoProcessor(dev, ctx, sh)
 		if err != nil {
 			return FinalState{}, fmt.Errorf("video processor: %w", err)
 		}
 		defer vpProc.Close()
-		backBuf, err = sc.GetBuffer(0)
-		if err != nil {
-			return FinalState{}, fmt.Errorf("back buffer: %w", err)
-		}
-		defer func() {
-			if backBuf != 0 {
-				backBuf.Release()
-			}
-		}()
 		renderTag = "VP"
-	} else {
-		vsCode, err := win.CompileHLSL(fullscreenVS, "main", "vs_5_0")
-		if err != nil {
-			return FinalState{}, err
-		}
-		vs, err = dev.CreateVertexShader(vsCode)
-		if err != nil {
-			return FinalState{}, fmt.Errorf("create VS: %w", err)
-		}
-		defer vs.Release()
-
-		nv12Code, err := win.CompileHLSL(nv12PS, "main", "ps_5_0")
-		if err != nil {
-			return FinalState{}, err
-		}
-		psNV12, err = dev.CreatePixelShader(nv12Code)
-		if err != nil {
-			return FinalState{}, fmt.Errorf("create NV12 PS: %w", err)
-		}
-		defer psNV12.Release()
-
-		yuy2Code, err := win.CompileHLSL(yuy2PS, "main", "ps_5_0")
-		if err != nil {
-			return FinalState{}, err
-		}
-		psYUY2, err = dev.CreatePixelShader(yuy2Code)
-		if err != nil {
-			return FinalState{}, fmt.Errorf("create YUY2 PS: %w", err)
-		}
-		defer psYUY2.Release()
-
-		sampler, err = dev.CreateSamplerState(&win.SamplerDesc{
-			Filter:         win.D3D11_FILTER_MIN_MAG_MIP_LINEAR,
-			AddressU:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
-			AddressV:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
-			AddressW:       win.D3D11_TEXTURE_ADDRESS_CLAMP,
-			ComparisonFunc: win.D3D11_COMPARISON_NEVER,
-			MaxLOD:         3.402823466e+38, // FLT_MAX
-		})
-		if err != nil {
-			return FinalState{}, fmt.Errorf("create sampler: %w", err)
-		}
-		defer sampler.Release()
-
-		// Back-buffer RTV (recreated on resize).
-		rtv, err = makeBackBufferRTV(dev, sc)
-		if err != nil {
-			return FinalState{}, err
-		}
-		defer func() {
-			if rtv != 0 {
-				rtv.Release()
+	}
+	acquireBuffers := func() error {
+		var err error
+		if vpProc != nil {
+			backBuf, err = sc.GetBuffer(0)
+			if err != nil {
+				return fmt.Errorf("back buffer: %w", err)
 			}
-		}()
+			return nil
+		}
+		rtv, err = makeBackBufferRTV(dev, sc)
+		return err
 	}
+	releaseBuffers := func() {
+		ctx.OMSetRenderTargets(0)
+		if vpProc != nil {
+			vpProc.releaseOutput()
+		}
+		release(&backBuf, &rtv)
+	}
+	if err := acquireBuffers(); err != nil {
+		return FinalState{}, err
+	}
+	defer releaseBuffers()
 
-	// Dynamic video textures (created lazily on first frame or format/size change).
+	// HDR10 output: the back buffer switches to R10G10B10A2 in G2084 / P2020
+	// while an HDR10 frame is shown on a display Windows drives in HDR.
 	var (
-		texW, texH int
-		texFmt     string
-		tex0, tex1 win.Object
-		srv0, srv1 win.Object
+		hdrActive  bool
+		displayHDR = displayIsHDR(fac, hwnd)
 	)
-	releaseVideo := func() {
-		if srv0 != 0 {
-			srv0.Release()
-			srv0 = 0
+	resetBuffers := func(w, h int, hdr bool) error {
+		releaseBuffers()
+		format, cs := uint32(win.DXGI_FORMAT_B8G8R8A8_UNORM), uint32(win.DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+		if hdr {
+			format, cs = win.DXGI_FORMAT_R10G10B10A2_UNORM, win.DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
 		}
-		if srv1 != 0 {
-			srv1.Release()
-			srv1 = 0
+		if err := sc.ResizeBuffers(2, uint32(w), uint32(h), format, swapChainFlags); err != nil {
+			return fmt.Errorf("resize buffers: %w", err)
 		}
-		if tex0 != 0 {
-			tex0.Release()
-			tex0 = 0
+		if err := sc.SetColorSpace1(cs); err != nil {
+			return fmt.Errorf("swap chain colour space: %w", err)
 		}
-		if tex1 != 0 {
-			tex1.Release()
-			tex1 = 0
-		}
+		hdrActive = hdr
+		return acquireBuffers()
 	}
-	defer releaseVideo()
 
 	// PresentCount -> arriveQPC ring table for GetFrameStatistics matching.
 	const pcRing = 256
@@ -384,6 +344,7 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		lastDrop uint64
 		black    = [4]float32{0, 0, 0, 1}
 		tracker  = stats.New(120, cfg.Freq)
+		colorTag string
 	)
 
 	statsTicker := time.NewTicker(time.Second)
@@ -435,31 +396,8 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			w, h := win.GetClientSize(hwnd)
 			if w > 0 && h > 0 && (w != winW || h != winH) {
 				winW, winH = w, h
-				ctx.OMSetRenderTargets(0)
-				if vpProc != nil {
-					vpProc.releaseOutput()
-				}
-				if backBuf != 0 {
-					backBuf.Release()
-					backBuf = 0
-				}
-				if rtv != 0 {
-					rtv.Release()
-					rtv = 0
-				}
-				if err := sc.ResizeBuffers(2, uint32(winW), uint32(winH), win.DXGI_FORMAT_B8G8R8A8_UNORM, swapChainFlags); err != nil {
-					return FinalState{}, fmt.Errorf("resize buffers: %w", err)
-				}
-				if vpProc != nil {
-					backBuf, err = sc.GetBuffer(0)
-					if err != nil {
-						return FinalState{}, fmt.Errorf("back buffer: %w", err)
-					}
-				} else {
-					rtv, err = makeBackBufferRTV(dev, sc)
-					if err != nil {
-						return FinalState{}, err
-					}
+				if err := resetBuffers(winW, winH, hdrActive); err != nil {
+					return FinalState{}, err
 				}
 			}
 		}
@@ -471,8 +409,9 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			} else if !borderless {
 				setCursor(true)
 			}
+			displayHDR = displayIsHDR(fac, hwnd) // follows Windows HDR toggles and monitor moves
 			tearingActive := !useVSync && supportsTear
-			line := tracker.Summary().FormatLine(getModeLabel()+" ["+renderTag+"]", tearingActive)
+			line := tracker.Summary().FormatLine(getModeLabel()+" ["+renderTag+colorTag+"]", tearingActive)
 			if a := getAudio(); a != nil {
 				if a.Muted() {
 					line += " | vol MUTED"
@@ -502,62 +441,40 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				lastDrop = d
 			}
 
+			wantHDR := f.Color.Transfer == capture.TransferPQ && displayHDR && !strings.EqualFold(cfg.HDR, "off")
+			if wantHDR != hdrActive {
+				if err := resetBuffers(winW, winH, wantHDR); err != nil {
+					f.Release()
+					return FinalState{}, err
+				}
+			}
+			colorTag = ""
+			switch {
+			case f.Color.HDR() && hdrActive:
+				colorTag = " HDR->HDR"
+			case f.Color.HDR():
+				colorTag = " HDR->SDR"
+			}
+
 			if vpProc != nil {
-				err := vpProc.uploadAndBlit(f, winW, winH, backBuf)
+				err := vpProc.uploadAndBlit(f, winW, winH, backBuf, hdrActive)
 				f.Release()
 				if err != nil {
 					return FinalState{}, err
 				}
+				renderTag = vpProc.Tag()
 			} else {
-				// Lazily create/recreate dynamic video textures.
-				if f.Width != texW || f.Height != texH || f.FourCC != texFmt {
-					releaseVideo()
-					var err error
-					tex0, srv0, tex1, srv1, err = createVideoTextures(dev, f.FourCC, f.Width, f.Height)
-					if err != nil {
-						f.Release()
-						return FinalState{}, err
-					}
-					texW, texH, texFmt = f.Width, f.Height, f.FourCC
-				}
-
-				// Upload CPU frame -> GPU dynamic texture(s).
-				if f.FourCC == "NV12" {
-					if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width, f.Height); err != nil {
-						f.Release()
-						return FinalState{}, err
-					}
-					if err := uploadPlane(ctx, tex1, f.Plane1, f.Stride1, f.Width, f.Height/2); err != nil {
-						f.Release()
-						return FinalState{}, err
-					}
-				} else {
-					if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width*2, f.Height); err != nil {
-						f.Release()
-						return FinalState{}, err
-					}
-				}
+				err := sh.upload(f)
 				f.Release() // hand the capture buffer back to Media Foundation
-
-				// Draw full-screen triangle with aspect-preserving viewport.
+				if err != nil {
+					return FinalState{}, err
+				}
+				// Full-screen triangle in an aspect-preserving viewport.
 				ctx.OMSetRenderTargets(rtv)
 				ctx.ClearRenderTargetView(rtv, &black)
-				vp := FitViewport(winW, winH, f.Width, f.Height)
-				ctx.RSSetViewports(&win.Viewport{
-					TopLeftX: vp.X, TopLeftY: vp.Y, Width: vp.W, Height: vp.H,
-					MinDepth: 0, MaxDepth: 1,
-				})
-				ctx.IASetPrimitiveTopology(win.D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
-				ctx.VSSetShader(vs)
-				if f.FourCC == "NV12" {
-					ctx.PSSetShader(psNV12)
-					ctx.PSSetShaderResources(0, []win.Object{srv0, srv1})
-					ctx.PSSetSamplers(0, []win.Object{sampler})
-				} else {
-					ctx.PSSetShader(psYUY2)
-					ctx.PSSetShaderResources(0, []win.Object{srv0})
+				if err := sh.drawFrame(rtv, FitViewport(winW, winH, f.Width, f.Height), colorParams(f.FourCC, f.Color, hdrActive)); err != nil {
+					return FinalState{}, err
 				}
-				ctx.Draw(3, 0)
 			}
 
 			// Present immediately (VRR / tearing) or wait for vsync.
@@ -627,70 +544,35 @@ func makeBackBufferRTV(dev win.Device, sc win.SwapChain) (win.Object, error) {
 	return rtv, nil
 }
 
-func createVideoTextures(dev win.Device, fourcc string, w, h int) (tex0, srv0, tex1, srv1 win.Object, err error) {
-	mk := func(tw, th int, format uint32) (win.Object, win.Object, error) {
-		tex, err := dev.CreateTexture2D(&win.Texture2DDesc{
-			Width:          uint32(tw),
-			Height:         uint32(th),
-			MipLevels:      1,
-			ArraySize:      1,
-			Format:         format,
-			SampleCount:    1,
-			Usage:          win.D3D11_USAGE_DYNAMIC,
-			BindFlags:      win.D3D11_BIND_SHADER_RESOURCE,
-			CPUAccessFlags: win.D3D11_CPU_ACCESS_WRITE,
-		})
+// displayIsHDR reports whether the monitor showing most of hwnd is driven in
+// HDR (Windows "Use HDR" on): its output colour space is G2084 / P2020.
+func displayIsHDR(fac win.Factory, hwnd uintptr) bool {
+	r := win.GetWindowRect(hwnd)
+	cx, cy := (r.Left+r.Right)/2, (r.Top+r.Bottom)/2
+	for i := uint32(0); ; i++ {
+		ad, err := fac.EnumAdapters1(i)
 		if err != nil {
-			return 0, 0, fmt.Errorf("create texture %dx%d fmt=%d: %w", tw, th, format, err)
+			return false
 		}
-		srv, err := dev.CreateShaderResourceView(tex, &win.ShaderResourceViewDesc{
-			Format:          format,
-			ViewDimension:   win.D3D11_SRV_DIMENSION_TEXTURE2D,
-			MostDetailedMip: 0,
-			MipLevels:       1,
-		})
-		if err != nil {
-			tex.Release()
-			return 0, 0, fmt.Errorf("create SRV: %w", err)
+		for j := uint32(0); ; j++ {
+			o, err := win.EnumOutputs(ad, j)
+			if err != nil {
+				break
+			}
+			d, err := win.OutputGetDesc(o)
+			if err == nil && d.AttachedToDesktop != 0 {
+				dc := d.DesktopCoordinates
+				if cx >= dc.Left && cx < dc.Right && cy >= dc.Top && cy < dc.Bottom {
+					cs, err := win.OutputColorSpace(o)
+					o.Release()
+					ad.Release()
+					return err == nil && cs == win.DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+				}
+			}
+			o.Release()
 		}
-		return tex, srv, nil
+		ad.Release()
 	}
-
-	if fourcc == "NV12" {
-		tex0, srv0, err = mk(w, h, win.DXGI_FORMAT_R8_UNORM)
-		if err != nil {
-			return 0, 0, 0, 0, err
-		}
-		tex1, srv1, err = mk(w/2, h/2, win.DXGI_FORMAT_R8G8_UNORM)
-		if err != nil {
-			srv0.Release()
-			tex0.Release()
-			return 0, 0, 0, 0, err
-		}
-		return tex0, srv0, tex1, srv1, nil
-	}
-
-	// YUY2 packed as RGBA8 (width/2 x height).
-	tex0, srv0, err = mk(w/2, h, win.DXGI_FORMAT_R8G8B8A8_UNORM)
-	return tex0, srv0, 0, 0, err
-}
-
-func uploadPlane(ctx win.Context, tex win.Object, src []byte, srcStride, rowBytes, rows int) error {
-	m, err := ctx.Map(tex, win.D3D11_MAP_WRITE_DISCARD)
-	if err != nil {
-		return fmt.Errorf("map texture: %w", err)
-	}
-	dstPitch := int(m.RowPitch)
-	dst := unsafe.Slice(*(**byte)(unsafe.Pointer(&m.Data)), dstPitch*rows)
-	if dstPitch == srcStride && srcStride == rowBytes {
-		copy(dst[:rowBytes*rows], src[:rowBytes*rows])
-	} else {
-		for y := 0; y < rows; y++ {
-			copy(dst[y*dstPitch:y*dstPitch+rowBytes], src[y*srcStride:y*srcStride+rowBytes])
-		}
-	}
-	ctx.Unmap(tex)
-	return nil
 }
 
 func resolveDisplayRect(fac win.Factory, want string) (win.RECT, error) {

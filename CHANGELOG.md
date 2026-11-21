@@ -2,6 +2,17 @@
 
 All notable changes to `capview` are documented in this file.
 
+## [Unreleased]
+
+### Added
+- `P010` (10-bit, HDR10), `RGB32` and `RGB24` capture, on both the video processor and the HLSL renderer. `-format auto` still prefers `NV12`.
+- HDR10 output: an HDR10 frame on a display Windows drives in HDR switches the swap chain to `R10G10B10A2` / `G2084 P2020`; otherwise it is tone mapped to SDR. New `-hdr auto|off` (saved in the config).
+- Colour from the media type (matrix, range, transfer function) with capture-card defaults; SDR BT.2020 is gamut mapped to BT.709; bottom-up RGB buffers are flipped.
+- GPU pixel tests on WARP and the hardware GPU for every format, output and renderer.
+
+### Fixed
+- `README.md`: the GC553 `1080p120` "~17% dropped frames" was a 144 Hz input, not a USB 3.0 limit; with a true 120 Hz input there are no drops (`p50 19.5 ms`). Added `1440p60` (`38.2 ms`).
+
 ## [0.1.1] - 2026-11-21
 
 ### Performance
