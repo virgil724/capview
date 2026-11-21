@@ -19,7 +19,7 @@ func TestVideoProcessorBlt(t *testing.T) {
 
 	vp, err := newVideoProcessor(dev, ctx)
 	if err != nil {
-		t.Fatalf("newVideoProcessor: %v", err)
+		t.Skipf("adapter does not support ID3D11VideoDevice (e.g. WARP/CI): %v", err)
 	}
 	defer vp.Close()
 
