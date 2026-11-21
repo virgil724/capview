@@ -41,6 +41,31 @@ Tested on Windows 11 with **AVerMedia Live Gamer Ultra (GC553)** capturing `NV12
 
 > **Note on physical limit**: At 60 Hz, a single HDMI frame takes `16.67 ms` to scan out. USB capture cards must receive a full frame before handing it to Windows (`18.1 ms` on GC553 via Media Foundation), so `~22–25 ms` to the center of a 165 Hz monitor is near the physical floor for USB 60 Hz capture. For zero-added latency when playing locally, use the capture card's HDMI passthrough output directly to a monitor.
 
+### Uncompressed Capture Bandwidth & USB Limits
+
+Why most USB capture cards default to `NV12` (4:2:0) and why `1080p120` can drop frames on USB 3.0 (5 Gbps):
+
+- **USB 3.0 (5 Gbps)** effective payload ceiling: **~400 MB/s** (e.g. AVerMedia GC553)
+- **USB 3.2 Gen2 (10 Gbps)** effective payload ceiling: **~950 MB/s** (e.g. GC553G2, Elgato 4K X)
+- **USB 3.2 Gen2x2 (20 Gbps)** effective payload ceiling: **~1,900 MB/s**
+- **PCIe 3.0 x4** effective payload ceiling: **~3,200 MB/s**
+
+| Resolution @ FPS | `NV12` / `I420` (4:2:0, 1.5 B/px) | `YUY2` (4:2:2, 2.0 B/px) | `RGB24` / `P010` HDR (3.0 B/px) | Recommended Link (for `NV12`) |
+| :--- | :---: | :---: | :---: | :--- |
+| **1080p @ 60** | **187 MB/s** (1.49 Gbps) | 249 MB/s (1.99 Gbps) | 373 MB/s (2.99 Gbps) | USB 3.0 (5 Gbps) — plenty of headroom |
+| **1080p @ 120** | **373 MB/s** (2.99 Gbps) | 498 MB/s (3.98 Gbps) | 746 MB/s (5.97 Gbps) | USB 10 Gbps *(USB 3.0 saturates)* |
+| **1080p @ 144** | **448 MB/s** (3.58 Gbps) | 597 MB/s (4.78 Gbps) | 896 MB/s (7.17 Gbps) | USB 10 Gbps |
+| **1440p @ 60** | **332 MB/s** (2.65 Gbps) | 442 MB/s (3.54 Gbps) | 664 MB/s (5.31 Gbps) | USB 3.0 (5 Gbps) — tight (~83%), fits in 16.67 ms |
+| **1440p @ 120** | **664 MB/s** (5.31 Gbps) | 885 MB/s (7.08 Gbps) | 1,327 MB/s (10.6 Gbps) | USB 10 Gbps (`NV12`); 20 Gbps / PCIe (`RGB`/`HDR`) |
+| **1440p @ 144** | **796 MB/s** (6.37 Gbps) | 1,062 MB/s (8.49 Gbps) | 1,593 MB/s (12.7 Gbps) | USB 10 Gbps (`NV12` tight); 20 Gbps / PCIe (`YUY2`+) |
+| **4K @ 30** | **373 MB/s** (2.99 Gbps) | 498 MB/s (3.98 Gbps) | 746 MB/s (5.97 Gbps) | USB 3.0 (5 Gbps) — tight (~93%) |
+| **4K @ 60** | **746 MB/s** (5.97 Gbps) | 995 MB/s (7.96 Gbps) | 1,493 MB/s (11.9 Gbps) | USB 10 Gbps (`NV12` only; `YUY2`/`HDR` needs 20G/PCIe) |
+| **4K @ 120** | **1,493 MB/s** (11.9 Gbps) | 1,991 MB/s (15.9 Gbps) | 2,986 MB/s (23.9 Gbps) | USB 20 Gbps / PCIe 3.0 x4 |
+
+> **Real-world verification on GC553 (USB 3.0, 5 Gbps)**:
+> - `1080p60 NV12` (`187 MB/s`): `p50 = 18.1 ms`, `p10–p90 = 0.2 ms`, **0 dropped frames**.
+> - `1080p120 NV12` (`373 MB/s`, ~93% of USB 3.0 ceiling): hits `min = 10.7 ms`, but USB transfer takes `8.1 ms` per `8.33 ms` frame, pushing `p50` back up to **`18.7 ms`** (`p10–p90 = 5.6 ms`) with **~17% dropped frames**. A 10 Gbps USB 3.2 Gen2 (or PCIe) card is needed for sustained ~10 ms `1080p120` capture.
+
 ## Usage
 
 ```powershell
