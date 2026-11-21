@@ -485,6 +485,7 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 					return FinalState{}, err
 				}
 			}
+			f.Release() // hand the capture buffer back to Media Foundation
 
 			// Draw full-screen triangle with aspect-preserving viewport.
 			ctx.OMSetRenderTargets(rtv)

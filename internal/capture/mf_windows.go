@@ -41,10 +41,11 @@ func (m Mode) String() string {
 	return fmt.Sprintf("%s %dx%d@%.2f", m.FourCC, m.Width, m.Height, m.FPS)
 }
 
-// Frame holds one full-colour video frame ready for GPU upload.
-// For NV12: Plane0 is Y (Width x Height, stride = Stride0), Plane1 is interleaved
-// UV (Width x Height/2 bytes, stride = Stride1).
-// For YUY2: Plane0 is packed YUY2 (Width*2 x Height bytes, stride = Stride0).
+// Frame holds one full-colour video frame ready for GPU upload, its planes
+// pointing into the locked capture buffer (call Release when done).
+// For NV12: Plane0 is Y (Height rows, stride = Stride0), Plane1 is interleaved
+// UV (Height/2 rows, stride = Stride1).
+// For YUY2: Plane0 is packed YUY2 (Height rows of Width*2 bytes, stride = Stride0).
 type Frame struct {
 	FourCC    string
 	Width     int
@@ -55,6 +56,7 @@ type Frame struct {
 	Stride1   int
 	ArriveQPC int64
 	DeviceQPC int64
+	release   func()
 }
 
 var supportedFormats = map[string]bool{"NV12": true, "YUY2": true}
@@ -180,12 +182,14 @@ func ListModes(device string) ([]Mode, error) {
 }
 
 // Mailbox holds the single most recent frame (drop-oldest on overwrite) so
-// capture and render never build up a queue.
+// capture and render never build up a queue. Frames point straight into the
+// locked Media Foundation buffer (no intermediate copy); a dropped or
+// consumed frame unlocks and releases it.
 type Mailbox struct {
 	mu      sync.Mutex
 	hasNew  bool
-	front   Frame // owned by producer while writing, swapped on publish
-	back    Frame // owned by consumer while uploading
+	pending Frame // latest published frame, not yet taken
+	taken   Frame // frame handed to the consumer by the last Take
 	dropped atomic.Uint64
 	notify  chan struct{}
 }
@@ -201,26 +205,37 @@ func (m *Mailbox) Notify() <-chan struct{} { return m.notify }
 // Dropped returns the number of frames overwritten before the renderer took them.
 func (m *Mailbox) Dropped() uint64 { return m.dropped.Load() }
 
-// Take swaps and returns a pointer to the latest frame, or nil if none is ready.
-// The returned Frame remains valid until the next call to Take.
+// Take returns the latest frame, or nil if none is ready. The frame stays
+// valid until the consumer calls its Release, or until the next Take.
 func (m *Mailbox) Take() *Frame {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	if !m.hasNew {
-		m.mu.Unlock()
 		return nil
 	}
-	m.front, m.back = m.back, m.front
+	m.taken.Release()
+	m.taken, m.pending = m.pending, Frame{}
 	m.hasNew = false
-	m.mu.Unlock()
-	return &m.back
+	return &m.taken
 }
 
-func (m *Mailbox) publish(src FourCCCopy) {
+// Discard releases the pending frame (capture stopping).
+func (m *Mailbox) Discard() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.hasNew {
+		m.pending.Release()
+		m.pending, m.hasNew = Frame{}, false
+	}
+}
+
+func (m *Mailbox) publish(f Frame) {
 	m.mu.Lock()
 	if m.hasNew {
 		m.dropped.Add(1)
+		m.pending.Release()
 	}
-	src.CopyInto(&m.front)
+	m.pending = f
 	m.hasNew = true
 	m.mu.Unlock()
 	select {
@@ -229,8 +244,18 @@ func (m *Mailbox) publish(src FourCCCopy) {
 	}
 }
 
-// FourCCCopy copies a locked MF sample buffer into a reusable Frame.
-type FourCCCopy struct {
+// Release unlocks and releases the capture buffer behind the frame. Safe to
+// call more than once; the planes must not be used afterwards.
+func (f *Frame) Release() {
+	if f.release != nil {
+		f.release()
+		f.release = nil
+	}
+	f.Plane0, f.Plane1 = nil, nil
+}
+
+// lockedBuffer describes a locked MF sample buffer.
+type lockedBuffer struct {
 	FourCC    string
 	Width     int
 	Height    int
@@ -240,76 +265,29 @@ type FourCCCopy struct {
 	DeviceQPC int64
 }
 
-func (c FourCCCopy) CopyInto(dst *Frame) {
-	dst.FourCC = c.FourCC
-	dst.Width = c.Width
-	dst.Height = c.Height
-	dst.ArriveQPC = c.ArriveQPC
-	dst.DeviceQPC = c.DeviceQPC
-
+// view makes a Frame whose planes alias the locked buffer, keeping its row
+// pitch (the renderer uploads row by row). release is called when the frame
+// is dropped or consumed. ok is false if the buffer is too small.
+func (c lockedBuffer) view(release func()) (Frame, bool) {
+	f := Frame{FourCC: c.FourCC, Width: c.Width, Height: c.Height,
+		ArriveQPC: c.ArriveQPC, DeviceQPC: c.DeviceQPC, release: release}
 	if c.FourCC == "NV12" {
-		srcPitch := c.Pitch
-		if srcPitch == 0 {
-			srcPitch = c.Width
+		pitch := max(c.Pitch, c.Width)
+		ySize, uvSize := pitch*c.Height, pitch*(c.Height/2)
+		if len(c.Data) < ySize+uvSize {
+			return Frame{}, false
 		}
-		yBytes := c.Width * c.Height
-		uvHeight := c.Height / 2
-		uvBytes := c.Width * uvHeight
-		if cap(dst.Plane0) < yBytes {
-			dst.Plane0 = make([]byte, yBytes)
-		} else {
-			dst.Plane0 = dst.Plane0[:yBytes]
-		}
-		if cap(dst.Plane1) < uvBytes {
-			dst.Plane1 = make([]byte, uvBytes)
-		} else {
-			dst.Plane1 = dst.Plane1[:uvBytes]
-		}
-		dst.Stride0 = c.Width
-		dst.Stride1 = c.Width
-
-		// Copy Y plane (tightly packed).
-		if srcPitch == c.Width {
-			copy(dst.Plane0, c.Data[:yBytes])
-		} else {
-			for y := 0; y < c.Height; y++ {
-				copy(dst.Plane0[y*c.Width:(y+1)*c.Width], c.Data[y*srcPitch:y*srcPitch+c.Width])
-			}
-		}
-		// Copy interleaved UV plane starting immediately after Y rows.
-		uvOff := srcPitch * c.Height
-		if srcPitch == c.Width {
-			copy(dst.Plane1, c.Data[uvOff:uvOff+uvBytes])
-		} else {
-			for y := 0; y < uvHeight; y++ {
-				copy(dst.Plane1[y*c.Width:(y+1)*c.Width], c.Data[uvOff+y*srcPitch:uvOff+y*srcPitch+c.Width])
-			}
-		}
-		return
+		f.Plane0, f.Stride0 = c.Data[:ySize:ySize], pitch
+		f.Plane1, f.Stride1 = c.Data[ySize:ySize+uvSize:ySize+uvSize], pitch
+		return f, true
 	}
-
-	// YUY2: 2 bytes per pixel.
-	rowBytes := c.Width * 2
-	srcPitch := c.Pitch
-	if srcPitch == 0 {
-		srcPitch = rowBytes
+	pitch := max(c.Pitch, c.Width*2) // YUY2
+	size := pitch * c.Height
+	if len(c.Data) < size {
+		return Frame{}, false
 	}
-	total := rowBytes * c.Height
-	if cap(dst.Plane0) < total {
-		dst.Plane0 = make([]byte, total)
-	} else {
-		dst.Plane0 = dst.Plane0[:total]
-	}
-	dst.Stride0 = rowBytes
-	dst.Plane1 = nil
-	dst.Stride1 = 0
-	if srcPitch == rowBytes {
-		copy(dst.Plane0, c.Data[:total])
-	} else {
-		for y := 0; y < c.Height; y++ {
-			copy(dst.Plane0[y*rowBytes:(y+1)*rowBytes], c.Data[y*srcPitch:y*srcPitch+rowBytes])
-		}
-	}
+	f.Plane0, f.Stride0 = c.Data[:size:size], pitch
+	return f, true
 }
 
 // Source is a running Media Foundation video capture.
@@ -403,6 +381,7 @@ func Start(cfg Config, freq int64) (*Source, error) {
 }
 
 func (s *Source) run(cfg Config, freq int64, ready chan<- error) error {
+	defer s.Mailbox.Discard() // before MFShutdown, release a frame nobody took
 	devs, err := win.EnumVideoCaptureDevices()
 	if err != nil {
 		return err
@@ -471,22 +450,35 @@ func (s *Source) run(cfg Config, freq int64, ready chan<- error) error {
 		if v, err := sample.GetUINT64(&win.MFSampleExtension_DeviceTimestamp); err == nil {
 			devTS = int64(v)
 		}
-		if buf, err := win.SampleBuffer(sample); err == nil {
-			if data, pitch, unlock, err := win.LockBuffer(buf); err == nil {
-				s.Mailbox.publish(FourCCCopy{
-					FourCC:    mode.FourCC,
-					Width:     mode.Width,
-					Height:    mode.Height,
-					Data:      data,
-					Pitch:     pitch,
-					ArriveQPC: arrive,
-					DeviceQPC: hnsToQPC(devTS, freq),
-				})
-				unlock()
-			}
-			buf.Release()
+		buf, err := win.SampleBuffer(sample)
+		if err != nil {
+			sample.Release()
+			continue
 		}
-		sample.Release()
+		data, pitch, unlock, err := win.LockBuffer(buf)
+		if err != nil {
+			buf.Release()
+			sample.Release()
+			continue
+		}
+		// The renderer uploads straight from the locked buffer; the sample
+		// stays held (so its buffer is not recycled) until the frame is
+		// dropped or uploaded.
+		release := func() { unlock(); buf.Release(); sample.Release() }
+		f, ok := lockedBuffer{
+			FourCC:    mode.FourCC,
+			Width:     mode.Width,
+			Height:    mode.Height,
+			Data:      data,
+			Pitch:     pitch,
+			ArriveQPC: arrive,
+			DeviceQPC: hnsToQPC(devTS, freq),
+		}.view(release)
+		if !ok {
+			release()
+			continue
+		}
+		s.Mailbox.publish(f)
 	}
 	return nil
 }
