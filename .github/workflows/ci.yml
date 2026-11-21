@@ -40,13 +40,22 @@ jobs:
           go build -ldflags="-s -w -H=windowsgui" -o dist/capview-windows-arm64.exe ./cmd/capview
           go build -ldflags="-s -w" -o dist/capview-cli-windows-arm64.exe ./cmd/capview
 
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii dist\SHA256SUMS.txt
+
       - uses: actions/upload-artifact@v4
         with:
           name: capview-windows
-          path: dist/*.exe
+          path: dist/*
 
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.exe
+          generate_release_notes: true
+          files: dist/*

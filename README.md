@@ -33,6 +33,7 @@ Tested on Windows 11 with **AVerMedia Live Gamer Ultra (GC553)** capturing `NV12
 | :--- | :---: | :---: | :--- | :--- |
 | **`capview` (`F11` VRR)** | **2.5 MB single `.exe`** | **~22.9 ms** *(measured)* | None (MF + 0.8 ms iFlip/VRR) | Zero setup, auto-pairs audio, brand-agnostic |
 | **`capview` (Windowed)** | **2.5 MB single `.exe`** | **~37–38 ms** *(measured)* | DWM composition (~14–15 ms) | Convenient while multitasking |
+| **Veyra 2.2.0 (Fullscreen, no FG)** | ~713 MB portable | **~24.0 ms** *(measured)* | ~1.9 ms D3D12 + iFlip | Native DirectShow + D3D12; great if you also want AI SR / Frame Gen (~37 ms with 2x FG) |
 | **OBS Studio Preview** | ~300 MB installer | **~45–55 ms** *(estimated)* | 60 fps compositor wait (0–16.7 ms) + DWM preview queue | Great for streaming/recording; overkill for playing |
 | **OBS Virtual Camera → ffmpeg** | ~300 MB + ffmpeg | **~63+ ms** *(measured to app)* | Compositor + virtual-cam queue + DirectShow/ffmpeg | Measured `63 ms` before display |
 | **VLC / PotPlayer** | ~50–150 MB | **~60–150 ms** *(typical)* | DirectShow input buffering + player sync queue | Not designed for live console gameplay |
