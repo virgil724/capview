@@ -10,6 +10,32 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet & Test
+        run: |
+          go vet ./...
+          go test -v ./...
+
+      - name: Build linux/amd64 and linux/arm64
+        run: |
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/capview-linux-amd64 ./cmd/capview
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/capview-linux-arm64 ./cmd/capview
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capview-linux
+          path: dist/*
+
   build:
     runs-on: windows-latest
     steps:
@@ -17,7 +43,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Vet & Test
         run: |
