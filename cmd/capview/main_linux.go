@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -169,9 +170,7 @@ func runList() error {
 	for _, d := range devs {
 		fmt.Println(" ", d)
 		if ms, err := v4l2.ListModes(d); err == nil {
-			for _, m := range ms {
-				fmt.Printf("      %s %dx%d@%g\n", m.FourCC, m.Width, m.Height, m.FPS)
-			}
+			printModes(ms)
 		}
 	}
 	ins, outs, err := audio.ListEndpoints()
@@ -187,6 +186,34 @@ func runList() error {
 		fmt.Println(" ", s)
 	}
 	return nil
+}
+
+// printModes prints one line per format: each size with its top frame rate.
+func printModes(ms []v4l2.Mode) {
+	var order []string
+	sizes := map[string][]string{}
+	best := map[string]float64{}
+	for _, m := range ms {
+		key := fmt.Sprintf("%dx%d", m.Width, m.Height)
+		fk := m.FourCC + " " + key
+		if _, ok := best[fk]; !ok {
+			if _, seen := sizes[m.FourCC]; !seen {
+				order = append(order, m.FourCC)
+			}
+			sizes[m.FourCC] = append(sizes[m.FourCC], key)
+		}
+		if m.FPS > best[fk] {
+			best[fk] = m.FPS
+		}
+	}
+	for _, f := range order {
+		var parts []string
+		for _, key := range sizes[f] {
+			fps := math.Round(best[f+" "+key]*100) / 100
+			parts = append(parts, key+"@"+strconv.FormatFloat(fps, 'f', -1, 64))
+		}
+		fmt.Printf("      %-5s %s\n", f, strings.Join(parts, "  "))
+	}
 }
 
 func parseSize(s string) (int, int, error) {
