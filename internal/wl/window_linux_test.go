@@ -35,6 +35,7 @@ func TestWindowSmoke(t *testing.T) {
 	w.SetFullscreen(true)
 	for i := 0; i < 60; i++ {
 		for _, ev := range w.Pump() {
+			n++
 			t.Logf("after SetFullscreen: %+v", ev)
 		}
 		time.Sleep(8 * time.Millisecond)

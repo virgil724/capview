@@ -4,37 +4,12 @@ package audio
 
 import (
 	"fmt"
-	"math"
 	"runtime"
 	"strings"
-	"sync/atomic"
 
 	"github.com/virgil724/capview/internal/win"
 	"golang.org/x/sys/windows"
 )
-
-// Config configures WASAPI audio passthrough.
-type Config struct {
-	InputDevice  string // capture endpoint name, substring, or "auto"
-	OutputDevice string // playback endpoint name, substring, or "default"
-	VideoHint    string // video capture device name to help match the same card
-	Volume       float32
-}
-
-// Passthrough streams audio from a capture endpoint directly to a playback
-// endpoint using event-driven WASAPI shared mode.
-type Passthrough struct {
-	InputName  string
-	OutputName string
-	InputRate  int
-	OutputRate int
-
-	ring    *Ring
-	volBits atomic.Uint32 // float32 bits [0..1]
-	muted   atomic.Bool
-	stop    atomic.Bool
-	done    chan struct{}
-}
 
 // ListEndpoints returns active audio capture and playback endpoint names.
 func ListEndpoints() (inputs, outputs []string, err error) {
@@ -93,43 +68,6 @@ func Start(cfg Config) (*Passthrough, error) {
 		return nil, err
 	}
 	return p, nil
-}
-
-func (p *Passthrough) Done() <-chan struct{} { return p.done }
-func (p *Passthrough) Stop()                 { p.stop.Store(true) }
-
-func (p *Passthrough) Volume() float32 { return math.Float32frombits(p.volBits.Load()) }
-func (p *Passthrough) SetVolume(v float32) {
-	if v < 0 {
-		v = 0
-	}
-	if v > 1 {
-		v = 1
-	}
-	p.volBits.Store(math.Float32bits(v))
-}
-
-func (p *Passthrough) AdjustVolume(delta float32) float32 {
-	v := p.Volume() + delta
-	p.SetVolume(v)
-	return p.Volume()
-}
-
-func (p *Passthrough) Muted() bool { return p.muted.Load() }
-func (p *Passthrough) ToggleMute() bool {
-	for {
-		cur := p.muted.Load()
-		if p.muted.CompareAndSwap(cur, !cur) {
-			return !cur
-		}
-	}
-}
-
-func (p *Passthrough) gain() float32 {
-	if p.muted.Load() {
-		return 0
-	}
-	return p.Volume()
 }
 
 func (p *Passthrough) run(cfg Config, ready chan<- error) error {
