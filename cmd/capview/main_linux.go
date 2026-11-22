@@ -26,16 +26,18 @@ func main() {
 	fullscreen := fs.Bool("fullscreen", true, "start fullscreen (F11/F/Alt+Enter toggles)")
 	vsync := fs.Bool("vsync", false, "FIFO present instead of IMMEDIATE/MAILBOX + tearing hint")
 	stats := fs.Bool("stats", true, "print 1-second latency stats")
+	direct := fs.Bool("direct", false, "render straight to a display with VK_KHR_display (no compositor; run from a text VT)")
+	display := fs.String("display", "", "with -direct: connector/display name substring (e.g. HDMI-A-1); default first")
 	duration := fs.Duration("duration", 0, "exit after this long (0 = until closed)")
 	_ = fs.Parse(os.Args[1:])
 
-	if err := run(*source, *device, *size, *fps, *format, *fullscreen, *vsync, *stats, *duration); err != nil {
+	if err := run(*source, *device, *size, *fps, *format, *fullscreen, *vsync, *stats, *duration, *direct, *display); err != nil {
 		fmt.Fprintln(os.Stderr, "capview:", err)
 		os.Exit(1)
 	}
 }
 
-func run(source, device, size string, fps float64, format string, fullscreen, vsync, stats bool, duration time.Duration) error {
+func run(source, device, size string, fps float64, format string, fullscreen, vsync, stats bool, duration time.Duration, direct bool, display string) error {
 	w, h, err := parseSize(size)
 	if err != nil {
 		return err
@@ -64,6 +66,8 @@ func run(source, device, size string, fps float64, format string, fullscreen, vs
 		PrintStats: stats,
 		Freq:       clock.Freq(),
 		Duration:   duration,
+		Direct:     direct,
+		Display:    display,
 	}, mb)
 	return err
 }

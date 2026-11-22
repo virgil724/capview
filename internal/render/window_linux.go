@@ -21,6 +21,9 @@ type waylandWindow struct {
 }
 
 func newViewerWindow(cfg Config, title string) (viewerWindow, error) {
+	if cfg.Direct {
+		return newDisplayWindow(cfg)
+	}
 	w, err := wl.Open(title, "capview", cfg.Fullscreen, !cfg.VSync)
 	if err != nil {
 		return nil, fmt.Errorf("wayland: %w", err)

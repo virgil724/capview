@@ -148,6 +148,7 @@ func (g *Global) CreateInstance(appName string, apiVersion uint32, exts []string
 type InstanceFuncs struct {
 	g    *Global
 	Inst Instance
+	disp displayFuncs
 
 	destroyInstance                         uintptr
 	enumeratePhysicalDevices                uintptr

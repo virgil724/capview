@@ -51,5 +51,8 @@ type Config struct {
 	PrintStats bool          // print 1-second latency stats to stdout
 	Freq       int64         // clock frequency (internal/clock)
 	Duration   time.Duration // optional auto-exit duration (0 = run until closed)
-	Host       Host
+	// Direct renders straight to a display (Linux VK_KHR_display, no
+	// compositor); Display then selects the connector (e.g. "HDMI-A-1").
+	Direct bool
+	Host   Host
 }
