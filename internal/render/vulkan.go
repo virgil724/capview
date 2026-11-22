@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows || linux
 
 package render
 
@@ -12,10 +12,10 @@ import (
 	"unsafe"
 
 	"github.com/virgil724/capview/internal/capture"
+	"github.com/virgil724/capview/internal/clock"
 	"github.com/virgil724/capview/internal/render/vkshaders"
 	"github.com/virgil724/capview/internal/stats"
 	"github.com/virgil724/capview/internal/vk"
-	"github.com/virgil724/capview/internal/win"
 )
 
 const vkNumSlots = 3
@@ -111,7 +111,7 @@ func startPresentWaiter(dev *vk.DeviceFuncs, sc vk.SwapchainKHR, useV2 bool, fre
 					continue
 				}
 				if res == vk.SUCCESS {
-					doneQPC := win.QPC()
+					doneQPC := clock.Now()
 					if doneQPC >= req.arriveQPC && w.freq > 0 {
 						ms := float64(doneQPC-req.arriveQPC) * 1000.0 / float64(w.freq)
 						if ms >= 0 && ms < 1000 {
@@ -338,43 +338,6 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	win.SetDPIAware()
-	restoreAwake := win.KeepAwake()
-	defer restoreAwake()
-
-	targetRect, err := resolveDisplayRect(win.Factory{}, cfg.Display)
-	if err != nil {
-		return FinalState{}, err
-	}
-
-	var (
-		quit          bool
-		needResize    bool
-		toggleFS      bool
-		toggleVSync   bool
-		openMenu      bool
-		borderless    = cfg.Fullscreen
-		savedWinRect  = defaultWindowRect(targetRect)
-		useVSync      = cfg.VSync
-		cursorVisible = true
-		lastMouseMove = time.Now()
-	)
-	if cfg.SavedRect != nil && cfg.SavedRect.Right-cfg.SavedRect.Left >= 320 && cfg.SavedRect.Bottom-cfg.SavedRect.Top >= 180 {
-		savedWinRect = *cfg.SavedRect
-	}
-	setCursor := func(show bool) {
-		if cursorVisible != show {
-			win.ShowCursor(show)
-			cursorVisible = show
-		}
-	}
-	defer setCursor(true)
-
-	initRect := savedWinRect
-	if borderless {
-		initRect = targetRect
-	}
-
 	getAudio := func() AudioControl {
 		if cfg.Host != nil {
 			return cfg.Host.Audio()
@@ -388,89 +351,69 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		return ""
 	}
 
-	wndProc := win.NewWndProc(func(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr {
-		switch msg {
-		case win.WM_CLOSE, win.WM_DESTROY:
-			quit = true
-			return 0
-		case win.WM_SIZE:
-			needResize = true
-			return 0
-		case win.WM_MOUSEMOVE:
-			lastMouseMove = time.Now()
-			setCursor(true)
-			return 0
-		case win.WM_RBUTTONUP:
-			lastMouseMove = time.Now()
-			setCursor(true)
-			openMenu = true
-			return 0
-		case win.WM_MOUSEWHEEL:
-			if a := getAudio(); a != nil {
-				delta := int16(wp >> 16)
-				if delta > 0 {
-					a.AdjustVolume(0.05)
-				} else if delta < 0 {
-					a.AdjustVolume(-0.05)
-				}
-			}
-			return 0
-		case win.WM_KEYDOWN:
-			switch wp {
-			case win.VK_ESCAPE, win.VK_Q:
-				quit = true
-				return 0
-			case win.VK_F11, win.VK_F:
-				toggleFS = true
-				return 0
-			case win.VK_V:
-				toggleVSync = true
-				return 0
-			case win.VK_M:
-				if a := getAudio(); a != nil {
-					a.ToggleMute()
-				}
-				return 0
-			case win.VK_UP:
-				if a := getAudio(); a != nil {
-					a.AdjustVolume(0.05)
-				}
-				return 0
-			case win.VK_DOWN:
-				if a := getAudio(); a != nil {
-					a.AdjustVolume(-0.05)
-				}
-				return 0
-			}
-		case win.WM_SYSKEYDOWN:
-			if wp == win.VK_RETURN {
-				toggleFS = true
-				return 0
-			}
-		}
-		return win.DefWindowProc(hwnd, msg, wp, lp)
-	})
-
-	hwnd, err := win.CreateViewerWindow("capview_vk_wnd", "capview [vk] - "+getModeLabel(), initRect, borderless, wndProc)
+	vw, err := newViewerWindow(cfg, "capview [vk] - "+getModeLabel())
 	if err != nil {
 		return FinalState{}, fmt.Errorf("create window: %w", err)
 	}
-	defer win.DestroyWindow(hwnd)
+	defer vw.Close()
+
+	var (
+		quit          bool
+		needResize    bool
+		toggleFS      bool
+		toggleVSync   bool
+		openMenu      bool
+		useVSync      = cfg.VSync
+		lastMouseMove = time.Now()
+	)
+	handleActions := func(acts []winAction) {
+		for _, act := range acts {
+			switch act {
+			case actQuit:
+				quit = true
+			case actResize:
+				needResize = true
+			case actMouseMove:
+				lastMouseMove = time.Now()
+				vw.SetCursorVisible(true)
+			case actMenu:
+				lastMouseMove = time.Now()
+				vw.SetCursorVisible(true)
+				openMenu = true
+			case actToggleFS:
+				toggleFS = true
+			case actToggleVSync:
+				toggleVSync = true
+			case actMute:
+				if a := getAudio(); a != nil {
+					a.ToggleMute()
+				}
+			case actVolUp:
+				if a := getAudio(); a != nil {
+					a.AdjustVolume(0.05)
+				}
+			case actVolDown:
+				if a := getAudio(); a != nil {
+					a.AdjustVolume(-0.05)
+				}
+			}
+		}
+	}
 
 	g, err := vk.Load()
 	if err != nil {
 		return FinalState{}, err
 	}
 	instVer := g.EnumerateInstanceVersion()
-	inst, hasSurfCaps2, err := createVulkanInstance(g)
+	inst, hasSurfCaps2, err := createVulkanInstance(g, vw.InstanceExtensions())
 	if err != nil {
 		return FinalState{}, err
 	}
 	defer inst.DestroyInstance()
 
-	surf, err := inst.CreateWin32SurfaceKHR(win.ModuleHandle(), hwnd)
+	surf, err := vw.CreateSurface(inst)
 	if err != nil {
-		return FinalState{}, fmt.Errorf("vkCreateWin32SurfaceKHR: %w", err)
+		return FinalState{}, err
 	}
 	defer inst.DestroySurfaceKHR(surf)
 
@@ -498,14 +441,14 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	}
 
 	var (
-		timingMode  vkTimingMode
-		featHead    unsafe.Pointer
-		featPins    []unsafe.Pointer
-		featPT      vk.PhysicalDevicePresentTimingFeaturesEXT
-		featID1     vk.PhysicalDevicePresentIdFeaturesKHR
-		featWait1   vk.PhysicalDevicePresentWaitFeaturesKHR
-		featID2     vk.PhysicalDevicePresentId2FeaturesKHR
-		featWait2   vk.PhysicalDevicePresentWait2FeaturesKHR
+		timingMode vkTimingMode
+		featHead   unsafe.Pointer
+		featPins   []unsafe.Pointer
+		featPT     vk.PhysicalDevicePresentTimingFeaturesEXT
+		featID1    vk.PhysicalDevicePresentIdFeaturesKHR
+		featWait1  vk.PhysicalDevicePresentWaitFeaturesKHR
+		featID2    vk.PhysicalDevicePresentId2FeaturesKHR
+		featWait2  vk.PhysicalDevicePresentWait2FeaturesKHR
 	)
 	if probe.SupportsPresentTiming() && hasCal {
 		timingMode = vkTimingExtPresentTiming
@@ -809,7 +752,7 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	)
 
 	rebuildSwapchain := func() error {
-		w, h := win.GetClientSize(hwnd)
+		w, h := vw.ClientSize()
 		if w <= 0 || h <= 0 {
 			return nil
 		}
@@ -905,7 +848,7 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	}
 
 	for !quit {
-		win.PumpMessages()
+		handleActions(vw.Pump())
 		if quit {
 			break
 		}
@@ -913,8 +856,8 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		if openMenu {
 			openMenu = false
 			if cfg.Host != nil {
-				items := cfg.Host.BuildMenu(borderless, useVSync)
-				if id := win.ShowContextMenu(hwnd, items); id != 0 {
+				items := cfg.Host.BuildMenu(vw.Fullscreen(), useVSync)
+				if id := vw.ShowMenu(items); id != 0 {
 					tFS, tVS, q := cfg.Host.HandleMenu(id)
 					if tFS {
 						toggleFS = true
@@ -932,11 +875,7 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		}
 		if toggleFS {
 			toggleFS = false
-			if !borderless {
-				savedWinRect = win.GetWindowRect(hwnd)
-			}
-			borderless = !borderless
-			win.SetBorderless(hwnd, borderless, savedWinRect)
+			vw.SetFullscreen(!vw.Fullscreen())
 			needResize = true
 		}
 		if toggleVSync {
@@ -946,7 +885,7 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		}
 		if needResize {
 			needResize = false
-			w, h := win.GetClientSize(hwnd)
+			w, h := vw.ClientSize()
 			if w > 0 && h > 0 && (uint32(w) != scBundle.extent.Width || uint32(h) != scBundle.extent.Height) {
 				needRecreate = true
 			}
@@ -963,10 +902,10 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			quit = true
 
 		case <-statsTicker.C:
-			if borderless && time.Since(lastMouseMove) > 2*time.Second {
-				setCursor(false)
-			} else if !borderless {
-				setCursor(true)
+			if vw.Fullscreen() && time.Since(lastMouseMove) > 2*time.Second {
+				vw.SetCursorVisible(false)
+			} else if !vw.Fullscreen() {
+				vw.SetCursorVisible(true)
 			}
 			syncLabel := vk.PresentModeName(scBundle.presentMode)
 			line := tracker.Summary().FormatLineExt(getModeLabel(), syncLabel, displayLbl)
@@ -977,7 +916,7 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 					line += fmt.Sprintf(" | vol %d%%", int(a.Volume()*100+0.5))
 				}
 			}
-			win.SetWindowTitle(hwnd, "capview [vk] | "+line)
+			vw.SetTitle("capview [vk] | " + line)
 			if cfg.PrintStats {
 				fmt.Println(line)
 			}
@@ -1174,9 +1113,9 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				PImageIndices:      unsafe.Pointer(&imgIdxArr[0]),
 			}
 
-			presStartQPC := win.QPC()
+			presStartQPC := clock.Now()
 			presRes := dev.QueuePresentKHR(queue, &pi, extraPins[:nPins]...)
-			presEndQPC := win.QPC()
+			presEndQPC := clock.Now()
 
 			if presRes == vk.ERROR_OUT_OF_DATE_KHR || presRes == vk.SUBOPTIMAL_KHR || presRes == vk.ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT {
 				needRecreate = true
@@ -1205,13 +1144,10 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		}
 	}
 
-	if !borderless {
-		savedWinRect = win.GetWindowRect(hwnd)
-	}
 	return FinalState{
-		Fullscreen: borderless,
+		Fullscreen: vw.Fullscreen(),
 		VSync:      useVSync,
-		WindowRect: savedWinRect,
+		WindowRect: vw.WindowRect(),
 	}, nil
 }
 

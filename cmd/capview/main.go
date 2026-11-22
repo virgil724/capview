@@ -189,7 +189,7 @@ func (h *appHost) Audio() render.AudioControl {
 	return h.aud
 }
 
-func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
+func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -203,11 +203,11 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
 	}
 
 	// 1. Video devices submenu.
-	var vidItems []win.MenuItem
+	var vidItems []render.MenuItem
 	if devs, err := capture.ListDevices(); err == nil {
 		for _, d := range devs {
 			devName := d
-			vidItems = append(vidItems, win.MenuItem{
+			vidItems = append(vidItems, render.MenuItem{
 				ID:      addAction(func() (bool, bool, bool) { h.switchVideoDevice(devName); return false, false, false }),
 				Label:   devName,
 				Checked: h.vid != nil && strings.EqualFold(h.vid.Mode.Device, devName),
@@ -215,11 +215,11 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
 		}
 	}
 	if len(vidItems) == 0 {
-		vidItems = []win.MenuItem{{Label: "(none)", Disabled: true}}
+		vidItems = []render.MenuItem{{Label: "(none)", Disabled: true}}
 	}
 
 	// 2. Resolution / FPS submenu for current device.
-	var modeItems []win.MenuItem
+	var modeItems []render.MenuItem
 	if h.vid != nil {
 		if modes, err := capture.ListModes(h.vid.Mode.Device); err == nil {
 			for _, m := range modes {
@@ -228,7 +228,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
 					h.vid.Mode.Height == mode.Height &&
 					math.Abs(h.vid.Mode.FPS-mode.FPS) < 0.5 &&
 					h.vid.Mode.FourCC == mode.FourCC
-				modeItems = append(modeItems, win.MenuItem{
+				modeItems = append(modeItems, render.MenuItem{
 					ID:      addAction(func() (bool, bool, bool) { h.switchVideoMode(mode); return false, false, false }),
 					Label:   fmt.Sprintf("%dx%d @ %.0f fps (%s)", mode.Width, mode.Height, math.Round(mode.FPS), mode.FourCC),
 					Checked: cur,
@@ -237,40 +237,40 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
 		}
 	}
 	if len(modeItems) == 0 {
-		modeItems = []win.MenuItem{{Label: "(unavailable)", Disabled: true}}
+		modeItems = []render.MenuItem{{Label: "(unavailable)", Disabled: true}}
 	}
 
 	// 3. Audio input & output submenus.
 	inEps, outEps, _ := audio.ListEndpoints()
-	var audInItems []win.MenuItem
-	audInItems = append(audInItems, win.MenuItem{
+	var audInItems []render.MenuItem
+	audInItems = append(audInItems, render.MenuItem{
 		ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn("", true); return false, false, false }),
 		Label:   "Disabled",
 		Checked: h.cfg.AudioDisabled,
 	})
-	audInItems = append(audInItems, win.MenuItem{
+	audInItems = append(audInItems, render.MenuItem{
 		ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn("auto", false); return false, false, false }),
 		Label:   "Auto (match video card)",
 		Checked: !h.cfg.AudioDisabled && strings.EqualFold(h.cfg.AudioIn, "auto"),
 	})
 	for _, ep := range inEps {
 		name := ep
-		audInItems = append(audInItems, win.MenuItem{
+		audInItems = append(audInItems, render.MenuItem{
 			ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn(name, false); return false, false, false }),
 			Label:   name,
 			Checked: !h.cfg.AudioDisabled && h.aud != nil && strings.EqualFold(h.aud.InputName, name),
 		})
 	}
 
-	var audOutItems []win.MenuItem
-	audOutItems = append(audOutItems, win.MenuItem{
+	var audOutItems []render.MenuItem
+	audOutItems = append(audOutItems, render.MenuItem{
 		ID:      addAction(func() (bool, bool, bool) { h.switchAudioOut("default"); return false, false, false }),
 		Label:   "System Default",
 		Checked: strings.EqualFold(h.cfg.AudioOut, "default") || h.cfg.AudioOut == "",
 	})
 	for _, ep := range outEps {
 		name := ep
-		audOutItems = append(audOutItems, win.MenuItem{
+		audOutItems = append(audOutItems, render.MenuItem{
 			ID:      addAction(func() (bool, bool, bool) { h.switchAudioOut(name); return false, false, false }),
 			Label:   name,
 			Checked: !strings.EqualFold(h.cfg.AudioOut, "default") && h.aud != nil && strings.EqualFold(h.aud.OutputName, name),
@@ -279,7 +279,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []win.MenuItem {
 
 	muted := h.aud != nil && h.aud.Muted()
 
-	return []win.MenuItem{
+	return []render.MenuItem{
 		{Label: "Video Device", Submenu: vidItems},
 		{Label: "Resolution / FPS", Submenu: modeItems},
 		{Label: "Audio Input", Submenu: audInItems},
@@ -484,9 +484,9 @@ func runView(args []string) error {
 
 	fmt.Println("hotkeys: [Right-Click] menu | [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [M] mute | [Up/Down/Wheel] volume | [ESC / Q] quit")
 
-	var savedRect *win.RECT
+	var savedRect *render.Rect
 	if cfg.WinW >= 320 && cfg.WinH >= 180 {
-		r := win.RECT{Left: cfg.WinX, Top: cfg.WinY, Right: cfg.WinX + cfg.WinW, Bottom: cfg.WinY + cfg.WinH}
+		r := render.Rect{Left: cfg.WinX, Top: cfg.WinY, Right: cfg.WinX + cfg.WinW, Bottom: cfg.WinY + cfg.WinH}
 		savedRect = &r
 	}
 
