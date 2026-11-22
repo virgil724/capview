@@ -405,7 +405,11 @@ func runVulkan(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		return FinalState{}, err
 	}
 	instVer := g.EnumerateInstanceVersion()
-	inst, hasSurfCaps2, err := createVulkanInstance(g, vw.InstanceExtensions())
+	var optExts []string
+	if o, ok := vw.(interface{ OptionalInstanceExtensions() []string }); ok {
+		optExts = o.OptionalInstanceExtensions()
+	}
+	inst, hasSurfCaps2, err := createVulkanInstance(g, vw.InstanceExtensions(), optExts...)
 	if err != nil {
 		return FinalState{}, err
 	}

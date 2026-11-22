@@ -75,6 +75,7 @@ type displayFuncs struct {
 	createDisplayPlaneSurfaceKHR          uintptr
 	acquireDrmDisplayEXT                  uintptr
 	releaseDisplayEXT                     uintptr
+	getDrmDisplayEXT                      uintptr
 }
 
 func (f *InstanceFuncs) displayProcs() (*displayFuncs, error) {
@@ -87,6 +88,7 @@ func (f *InstanceFuncs) displayProcs() (*displayFuncs, error) {
 		d.createDisplayPlaneSurfaceKHR = f.g.procAddr(f.Inst, "vkCreateDisplayPlaneSurfaceKHR")
 		d.acquireDrmDisplayEXT = f.g.procAddr(f.Inst, "vkAcquireDrmDisplayEXT")
 		d.releaseDisplayEXT = f.g.procAddr(f.Inst, "vkReleaseDisplayEXT")
+		d.getDrmDisplayEXT = f.g.procAddr(f.Inst, "vkGetDrmDisplayEXT")
 		d.loaded = true
 	}
 	if d.getPhysicalDeviceDisplayPropertiesKHR == 0 || d.createDisplayPlaneSurfaceKHR == 0 {
@@ -235,4 +237,23 @@ func (f *InstanceFuncs) AcquireDrmDisplayEXT(pd PhysicalDevice, drmFD int32, dis
 		return res
 	}
 	return nil
+}
+
+// GetDrmDisplayEXT returns the VkDisplayKHR for DRM connector connectorID on
+// the device behind drmFD (an open /dev/dri/cardN). Needs
+// VK_EXT_acquire_drm_display.
+func (f *InstanceFuncs) GetDrmDisplayEXT(pd PhysicalDevice, drmFD int32, connectorID uint32) (DisplayKHR, error) {
+	d, err := f.displayProcs()
+	if err != nil {
+		return 0, err
+	}
+	if d.getDrmDisplayEXT == 0 {
+		return 0, fmt.Errorf("vkGetDrmDisplayEXT not available (enable %s)", EXT_ACQUIRE_DRM_DISPLAY)
+	}
+	var disp DisplayKHR
+	r, _, _ := call(d.getDrmDisplayEXT, uintptr(pd), uintptr(drmFD), uintptr(connectorID), uintptr(unsafe.Pointer(&disp)))
+	if res := Result(int32(r)); res != SUCCESS {
+		return 0, res
+	}
+	return disp, nil
 }

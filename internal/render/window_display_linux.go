@@ -3,6 +3,8 @@ package render
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
@@ -51,6 +53,69 @@ func isTerminal(fd int) bool {
 
 func (w *displayWindow) InstanceExtensions() []string { return []string{vk.EXT_DISPLAY} }
 
+// OptionalInstanceExtensions enables connector-name lookup
+// (vkGetDrmDisplayEXT) when the driver has it.
+func (w *displayWindow) OptionalInstanceExtensions() []string {
+	return []string{vk.EXT_DIRECT_MODE_DISPLAY, vk.EXT_ACQUIRE_DRM_DISPLAY}
+}
+
+// drmConnector is a connected DRM connector from sysfs.
+type drmConnector struct {
+	name string // e.g. "eDP-1", "HDMI-A-1"
+	card string // e.g. "/dev/dri/card1"
+	id   uint32 // KMS connector object ID
+}
+
+// drmConnectors lists connected connectors and their KMS IDs from
+// /sys/class/drm/cardN-<connector>/{status,connector_id}.
+func drmConnectors() []drmConnector {
+	matches, _ := filepath.Glob("/sys/class/drm/card*-*")
+	var out []drmConnector
+	for _, dir := range matches {
+		base := filepath.Base(dir) // card1-HDMI-A-1
+		card, name, ok := strings.Cut(base, "-")
+		if !ok {
+			continue
+		}
+		if st, err := os.ReadFile(filepath.Join(dir, "status")); err != nil || strings.TrimSpace(string(st)) != "connected" {
+			continue
+		}
+		idb, err := os.ReadFile(filepath.Join(dir, "connector_id"))
+		if err != nil {
+			continue
+		}
+		id, err := strconv.ParseUint(strings.TrimSpace(string(idb)), 10, 32)
+		if err != nil {
+			continue
+		}
+		out = append(out, drmConnector{name: name, card: "/dev/dri/" + card, id: uint32(id)})
+	}
+	return out
+}
+
+// displayByConnector resolves a connector name (e.g. "HDMI-A-1") to a
+// VkDisplayKHR through vkGetDrmDisplayEXT.
+func displayByConnector(inst *vk.InstanceFuncs, pd vk.PhysicalDevice, want string) (vk.DisplayKHR, string, bool) {
+	for _, c := range drmConnectors() {
+		if !strings.EqualFold(c.name, want) {
+			continue
+		}
+		fd, err := unix.Open(c.card, unix.O_RDWR|unix.O_CLOEXEC, 0)
+		if err != nil {
+			fd, err = unix.Open(c.card, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		}
+		if err != nil {
+			continue
+		}
+		disp, err := inst.GetDrmDisplayEXT(pd, int32(fd), c.id)
+		unix.Close(fd)
+		if err == nil && disp != 0 {
+			return disp, c.name, true
+		}
+	}
+	return 0, "", false
+}
+
 // CreateSurface picks the display (by name), its best mode (largest area,
 // then highest refresh) and a plane that can show on it.
 func (w *displayWindow) CreateSurface(inst *vk.InstanceFuncs) (vk.SurfaceKHR, error) {
@@ -64,11 +129,34 @@ func (w *displayWindow) CreateSurface(inst *vk.InstanceFuncs) (vk.SurfaceKHR, er
 		if err != nil || len(disps) == 0 {
 			continue
 		}
+		// Connector names (eDP-1, HDMI-A-1) map exactly via vkGetDrmDisplayEXT;
+		// otherwise match the driver's display name (the EDID monitor name on
+		// RADV, e.g. "A/Vaux Electronics AVT GC553") as a substring.
+		var byConn vk.DisplayKHR
+		connName := ""
+		if w.want != "" {
+			byConn, connName, _ = displayByConnector(inst, pd, w.want)
+		}
+		conns := drmConnectors()
 		for i := range disps {
 			d := &disps[i]
 			name := d.Name()
-			seen = append(seen, name)
-			if w.want != "" && !strings.Contains(strings.ToLower(name), strings.ToLower(w.want)) {
+			label := name
+			for _, c := range conns {
+				if dd, _, ok := displayByConnector(inst, pd, c.name); ok && dd == d.Display {
+					label = c.name + " (" + name + ")"
+					break
+				}
+			}
+			seen = append(seen, label)
+			switch {
+			case w.want == "":
+			case byConn != 0:
+				if d.Display != byConn {
+					continue
+				}
+				name = connName + " (" + name + ")"
+			case !strings.Contains(strings.ToLower(name), strings.ToLower(w.want)):
 				continue
 			}
 			modes, err := inst.GetDisplayModePropertiesKHR(pd, d.Display)

@@ -67,8 +67,9 @@ func (p *vkDeviceProbe) SupportsPresentWait2() bool {
 }
 
 // createVulkanInstance creates an instance with VK_KHR_surface plus the
-// window system's surface extensions (surfaceExts).
-func createVulkanInstance(g *vk.Global, surfaceExts []string) (*vk.InstanceFuncs, bool, error) {
+// window system's surface extensions (surfaceExts, required) and any of
+// optionalExts the loader supports.
+func createVulkanInstance(g *vk.Global, surfaceExts []string, optionalExts ...string) (*vk.InstanceFuncs, bool, error) {
 	instVer := g.EnumerateInstanceVersion()
 	apiVer := vk.APIVersion(0, 1, 1, 0)
 	if instVer < apiVer {
@@ -86,6 +87,11 @@ func createVulkanInstance(g *vk.Global, surfaceExts []string) (*vk.InstanceFuncs
 	for _, req := range exts {
 		if !avail[req] {
 			return nil, false, fmt.Errorf("required Vulkan instance extension %s not supported", req)
+		}
+	}
+	for _, opt := range optionalExts {
+		if avail[opt] {
+			exts = append(exts, opt)
 		}
 	}
 	hasSurfCaps2 := avail[vk.EXT_GET_SURFACE_CAPABILITIES2]
