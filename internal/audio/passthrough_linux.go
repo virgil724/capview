@@ -87,7 +87,7 @@ func Start(cfg Config) (*Passthrough, error) {
 	p.SetVolume(cfg.Volume)
 
 	pb, err := alsa.OpenPlayback(alsa.PlaybackConfig{
-		Device: alsa.PCMName(out), Rate: linuxRate, Channels: 2, Period: linuxPeriod, FallbackDefault: true,
+		Device: alsa.PCMName(out), Rate: linuxRate, Channels: 2, Period: linuxPeriod, Buffer: 3 * linuxPeriod, FallbackDefault: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("audio output %q: %w", out, err)
@@ -104,6 +104,7 @@ func Start(cfg Config) (*Passthrough, error) {
 		stereo, resampled []float32
 		capPackets        atomic.Uint64
 		capPeak           atomic.Uint32 // float32 bits of max |sample| since last report
+		quietPeak         atomic.Uint32 // same, for the quiet-input warning
 	)
 	capt, err := alsa.Start(alsa.Config{
 		Device: alsa.PCMName(in), Rate: linuxRate, Channels: 2, Period: linuxPeriod, FallbackDefault: true,
@@ -144,6 +145,9 @@ func Start(cfg Config) (*Passthrough, error) {
 		if peak > math.Float32frombits(capPeak.Load()) {
 			capPeak.Store(math.Float32bits(peak))
 		}
+		if peak > math.Float32frombits(quietPeak.Load()) {
+			quietPeak.Store(math.Float32bits(peak))
+		}
 		capPackets.Add(1)
 		p.ring.Write(src)
 	})
@@ -160,6 +164,30 @@ func Start(cfg Config) (*Passthrough, error) {
 	fmt.Fprintf(os.Stderr, "audio: capture %d ch @ %d Hz period %v%s; playback %d ch @ %d Hz period %d frames buffer %d frames%s\n",
 		capt.Channels, capt.Rate, capt.Period, mixerNote(capt.SoftwareMixer), pb.Channels, pb.Rate, pb.PeriodFrames, pb.BufferFrames, mixerNote(pb.SoftwareMixer))
 	var writes, writeErrs atomic.Uint64
+	// Warn once if the input stays very quiet: a passthrough that "doesn't
+	// work" is often just a source at -50 dBFS.
+	go func() {
+		quiet := 0
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-p.done:
+				return
+			case <-t.C:
+			}
+			pk := math.Float32frombits(quietPeak.Swap(0))
+			if pk > 0 && pk < 0.01 { // below -40 dBFS but not digital silence
+				quiet++
+			} else {
+				quiet = 0
+			}
+			if quiet == 5 {
+				fmt.Fprintf(os.Stderr, "capview: audio input %q is very quiet (peak %.0f dBFS for 5 s) - check the source's output volume\n",
+					p.InputName, 20*math.Log10(float64(pk)))
+			}
+		}
+	}()
 	if debug {
 		go func() {
 			t := time.NewTicker(time.Second)

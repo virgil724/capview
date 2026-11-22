@@ -4,5 +4,7 @@ github.com/virgil724/caplat v0.1.2-0.20261122072140-ffd788c7ba27 h1:Phn/j50C6Mwj
 github.com/virgil724/caplat v0.1.2-0.20261122072140-ffd788c7ba27/go.mod h1:Yui3XZj2XYqWhTFvxZ9SlnMkHgrzUd7trE6WAddIqlU=
 github.com/virgil724/caplat v0.1.2-0.20261122082802-3e8965540e3b h1:2kTxF5u9KgpvcVFAHnN4TxiRcmL1/j7YUItTyBMh2t8=
 github.com/virgil724/caplat v0.1.2-0.20261122082802-3e8965540e3b/go.mod h1:Yui3XZj2XYqWhTFvxZ9SlnMkHgrzUd7trE6WAddIqlU=
+github.com/virgil724/caplat v0.1.2-0.20261122093541-9e161f4f605a h1:7yx1MXHosNpQL4jOT1sKXLBqe4ypYLYzMvs9mDV6zcc=
+github.com/virgil724/caplat v0.1.2-0.20261122093541-9e161f4f605a/go.mod h1:Yui3XZj2XYqWhTFvxZ9SlnMkHgrzUd7trE6WAddIqlU=
 golang.org/x/sys v0.41.0 h1:Ivj+2Cp/ylzLiEU89QhWblYnOE9zerudt9Ftecq2C6k=
 golang.org/x/sys v0.41.0/go.mod h1:OgkHotnGiDImocRcuBABYBEXf8A9a87e/uXjp9XT3ks=
