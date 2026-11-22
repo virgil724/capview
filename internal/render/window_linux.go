@@ -112,9 +112,10 @@ func (w *waylandWindow) Fullscreen() bool      { return w.w.Fullscreen() }
 func (w *waylandWindow) SetFullscreen(on bool) { w.w.SetFullscreen(on) }
 func (w *waylandWindow) SetTitle(title string) { w.w.SetTitle(title) }
 
-// SetCursorVisible is not implemented yet on Wayland (needs a cursor theme
-// to restore the pointer); the compositor shows its default cursor.
-func (w *waylandWindow) SetCursorVisible(bool) {}
+// SetCursorVisible hides the pointer (fullscreen idle) when the compositor
+// supports wp_cursor_shape_v1, so it can be restored; otherwise it is left
+// alone.
+func (w *waylandWindow) SetCursorVisible(show bool) { w.w.SetCursorVisible(show) }
 
 // ShowMenu: no native context menu on Wayland yet.
 func (w *waylandWindow) ShowMenu([]MenuItem) uint32 { return 0 }

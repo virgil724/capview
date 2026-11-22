@@ -50,6 +50,7 @@ type Event struct {
 type protocols struct {
 	wmBase, xdgSurface, xdgToplevel, xdgPositioner *iface
 	tearingMgr, tearing                            *iface
+	cursorShapeMgr, cursorShapeDevice              *iface
 }
 
 var (
@@ -81,6 +82,9 @@ func setup(l *lib) error {
 		proto.xdgToplevel = a.allocIface("xdg_toplevel")
 		proto.tearingMgr = a.allocIface("wp_tearing_control_manager_v1")
 		proto.tearing = a.allocIface("wp_tearing_control_v1")
+		proto.cursorShapeMgr = a.allocIface("wp_cursor_shape_manager_v1")
+		proto.cursorShapeDevice = a.allocIface("wp_cursor_shape_device_v1")
+		pointer := core("wl_pointer", l.pointerIface)
 		a.fillIface(proto.wmBase, 3, []message{
 			{"destroy", "", nil},
 			{"create_positioner", "n", []*iface{proto.xdgPositioner}},
@@ -123,6 +127,16 @@ func setup(l *lib) error {
 			{"destroy", "", nil},
 		}, nil)
 
+		a.fillIface(proto.cursorShapeMgr, 1, []message{
+			{"destroy", "", nil},
+			{"get_pointer", "no", []*iface{proto.cursorShapeDevice, pointer}},
+			{"get_tablet_tool_v2", "no", []*iface{proto.cursorShapeDevice, nil}},
+		}, nil)
+		a.fillIface(proto.cursorShapeDevice, 1, []message{
+			{"destroy", "", nil},
+			{"set_shape", "uu", []*iface{nil, nil}},
+		}, nil)
+
 		cb := purego.NewCallback
 		vt := func(fns ...any) uintptr {
 			ps := make([]uintptr, len(fns))
@@ -161,6 +175,11 @@ type Window struct {
 	configured, fullscreen, wantFS, alt, close bool
 	events                                     []Event
 	outputs                                    []output
+	cursorShapeMgr                             uintptr
+	cursorShape                                uintptr
+	enterSerial                                uint32
+	pointerIn                                  bool
+	cursorHidden                               bool
 	targetOut                                  uintptr
 }
 
@@ -290,6 +309,27 @@ func Open(title, appID string, fullscreen bool, outputName string) (*Window, err
 	return w, nil
 }
 
+// CanHideCursor reports whether the cursor can be hidden and restored
+// (needs wp_cursor_shape_v1 to bring the default cursor back).
+func (w *Window) CanHideCursor() bool { return w.cursorShape != 0 }
+
+// SetCursorVisible hides or restores the pointer over the window.
+func (w *Window) SetCursorVisible(show bool) {
+	if w.cursorShape == 0 || w.pointer == 0 || show == !w.cursorHidden {
+		return
+	}
+	w.cursorHidden = !show
+	if !w.pointerIn {
+		return // applied on the next enter
+	}
+	if show {
+		w.send(w.cursorShape, 1, 0, 0, false, uint64(w.enterSerial), 1) // set_shape(default)
+	} else {
+		w.send(w.pointer, 0, 0, 0, false, uint64(w.enterSerial), 0, 0, 0) // set_cursor(NULL)
+	}
+	w.l.displayFlush(w.display)
+}
+
 // Outputs lists the compositor's outputs as "name (description)".
 func (w *Window) Outputs() []string {
 	var out []string
@@ -407,6 +447,8 @@ func onGlobal(data, registry uintptr, name uint32, ifaceName uintptr, version ui
 		o := w.bind(name, &iface{ptr: l.outputIface}, min(version, 4))
 		l.proxyAddListener(o, vtables.output, w.id)
 		w.outputs = append(w.outputs, output{proxy: o})
+	case "wp_cursor_shape_manager_v1":
+		w.cursorShapeMgr = w.bind(name, proto.cursorShapeMgr, 1)
 	case "wp_tearing_control_manager_v1":
 		w.tearingMgr = w.bind(name, proto.tearingMgr, 1)
 	}
@@ -427,6 +469,9 @@ func onSeatCaps(data, seat uintptr, caps uint32) {
 	if caps&1 != 0 && w.pointer == 0 { // WL_SEAT_CAPABILITY_POINTER
 		w.pointer = w.send(seat, 0, w.l.pointerIface, v, false, 0)
 		w.l.proxyAddListener(w.pointer, vtables.pointer, w.id)
+		if w.cursorShapeMgr != 0 {
+			w.cursorShape = w.send(w.cursorShapeMgr, 1, proto.cursorShapeDevice.ptr, 1, false, 0, uint64(w.pointer))
+		}
 	}
 }
 
@@ -454,8 +499,21 @@ func onModifiers(data, kb uintptr, serial, depressed, latched, locked, group uin
 
 func onRepeatInfo(data, kb uintptr, rate, delay int32) {}
 
-func onPtrEnter(data, p uintptr, serial uint32, surface uintptr, x, y int32) {}
-func onPtrLeave(data, p uintptr, serial uint32, surface uintptr)             {}
+func onPtrEnter(data, p uintptr, serial uint32, surface uintptr, x, y int32) {
+	if w := lookup(data); w != nil {
+		w.enterSerial, w.pointerIn = serial, true
+		if w.cursorHidden {
+			w.send(w.pointer, 0, 0, 0, false, uint64(serial), 0, 0, 0) // keep it hidden
+		}
+	}
+}
+
+func onPtrLeave(data, p uintptr, serial uint32, surface uintptr) {
+	if w := lookup(data); w != nil {
+		w.pointerIn = false
+	}
+}
+
 func onPtrMotion(data, p uintptr, time uint32, x, y int32) {
 	if w := lookup(data); w != nil {
 		w.events = append(w.events, Event{Kind: EvMotion})
