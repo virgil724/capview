@@ -232,10 +232,11 @@ func Open(title, appID string, fullscreen, tearing bool) (*Window, error) {
 	if fullscreen {
 		w.send(w.toplevel, 11, 0, 0, false, 0) // set_fullscreen(NULL)
 	}
-	if tearing && w.tearingMgr != 0 {
-		w.tearing = w.send(w.tearingMgr, 1, proto.tearing.ptr, 1, false, 0, uint64(w.surface))
-		w.send(w.tearing, 0, 0, 0, false, 1) // presentation hint: async
-	}
+	// Tearing: do NOT create a wp_tearing_control_v1 here. Mesa's Wayland WSI
+	// creates its own for VK_PRESENT_MODE_IMMEDIATE_KHR (offered only when
+	// the compositor has tearing control), and a second one on the same
+	// surface is a protocol error that disconnects the client.
+	_ = tearing
 	w.send(w.surface, 6, 0, 0, false) // wl_surface.commit (no buffer: request configure)
 	for i := 0; i < 50 && !w.configured; i++ {
 		if l.displayRoundtrip(w.display) < 0 {
@@ -256,8 +257,9 @@ func Open(title, appID string, fullscreen, tearing bool) (*Window, error) {
 func (w *Window) Display() uintptr { return w.display }
 func (w *Window) Surface() uintptr { return w.surface }
 
-// HasTearingControl reports whether the compositor supports tearing control.
-func (w *Window) HasTearingControl() bool { return w.tearing != 0 }
+// HasTearingControl reports whether the compositor advertises
+// wp_tearing_control_manager_v1 (async/tearing page flips for IMMEDIATE).
+func (w *Window) HasTearingControl() bool { return w.tearingMgr != 0 }
 
 // Size is the last configured size (0 if the compositor left it to us).
 func (w *Window) Size() (int, int) { return int(w.width), int(w.height) }

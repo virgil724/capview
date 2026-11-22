@@ -26,7 +26,7 @@ func main() {
 	fullscreen := fs.Bool("fullscreen", true, "start fullscreen (F11/F/Alt+Enter toggles)")
 	vsync := fs.Bool("vsync", false, "FIFO present instead of IMMEDIATE/MAILBOX + tearing hint")
 	stats := fs.Bool("stats", true, "print 1-second latency stats")
-	direct := fs.Bool("direct", false, "render straight to a display with VK_KHR_display (no compositor; run from a text VT)")
+	direct := fs.Bool("direct", false, "EXPERIMENTAL: render straight to a display with VK_KHR_display (no compositor; run from a text VT)")
 	display := fs.String("display", "", "with -direct: connector (eDP-1, HDMI-A-1) or monitor-name substring; default first")
 	duration := fs.Duration("duration", 0, "exit after this long (0 = until closed)")
 	_ = fs.Parse(os.Args[1:])

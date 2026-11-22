@@ -28,6 +28,11 @@ func newViewerWindow(cfg Config, title string) (viewerWindow, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wayland: %w", err)
 	}
+	if w.HasTearingControl() {
+		fmt.Println("wayland: compositor supports tearing control (IMMEDIATE present can tear on arrival)")
+	} else {
+		fmt.Println("wayland: compositor has no tearing control; frames wait for its next repaint (higher latency than fullscreen on Windows)")
+	}
 	return &waylandWindow{w: w}, nil
 }
 
