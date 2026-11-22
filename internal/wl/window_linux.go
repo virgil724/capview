@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -56,7 +57,7 @@ var (
 	proto     protocols
 	protoErr  error
 	vtables   struct {
-		registry, seat, keyboard, pointer, wmBase, xdgSurface, toplevel uintptr
+		registry, seat, keyboard, pointer, wmBase, xdgSurface, toplevel, output uintptr
 	}
 	windowsMu sync.Mutex
 	windows   = map[uintptr]*Window{}
@@ -138,6 +139,10 @@ func setup(l *lib) error {
 		vtables.wmBase = vt(onPing)
 		vtables.xdgSurface = vt(onXdgConfigure)
 		vtables.toplevel = vt(onToplevelConfigure, onToplevelClose)
+		// wl_output v4: geometry, mode, done, scale, name, description.
+		// geometry has 8 args; the callback declares only the first two
+		// (extra C arguments are ignored).
+		vtables.output = vt(onOutputGeometry, onOutputMode, onOutputDone, onOutputScale, onOutputName, onOutputDescription)
 	})
 	return protoErr
 }
@@ -155,6 +160,14 @@ type Window struct {
 	width, height                              int32
 	configured, fullscreen, wantFS, alt, close bool
 	events                                     []Event
+	outputs                                    []output
+	targetOut                                  uintptr
+}
+
+// output is a wl_output global and the name/description it announced.
+type output struct {
+	proxy             uintptr
+	name, description string
 }
 
 func lookup(data uintptr) *Window {
@@ -190,7 +203,12 @@ func (w *Window) bind(name uint32, in *iface, version uint32) uintptr {
 }
 
 // Open connects to the compositor ($WAYLAND_DISPLAY) and maps a toplevel.
-func Open(title, appID string, fullscreen, tearing bool) (*Window, error) {
+//
+// outputName selects the output to go fullscreen on: its wl_output name
+// (e.g. "HDMI-A-1", needs wl_output v4) or a substring of its description;
+// "" lets the compositor choose. Wayland clients cannot pick the position of
+// a non-fullscreen window.
+func Open(title, appID string, fullscreen bool, outputName string) (*Window, error) {
 	l, err := loadLib()
 	if err != nil {
 		return nil, err
@@ -220,7 +238,28 @@ func Open(title, appID string, fullscreen, tearing bool) (*Window, error) {
 		w.Close()
 		return nil, errors.New("compositor lacks wl_compositor or xdg_wm_base")
 	}
-	l.displayRoundtrip(w.display) // seat capabilities -> keyboard/pointer
+	l.displayRoundtrip(w.display) // seat capabilities, output names
+	if outputName != "" {
+		for _, o := range w.outputs {
+			if strings.EqualFold(o.name, outputName) {
+				w.targetOut = o.proxy
+				break
+			}
+		}
+		if w.targetOut == 0 {
+			for _, o := range w.outputs {
+				if strings.Contains(strings.ToLower(o.description), strings.ToLower(outputName)) {
+					w.targetOut = o.proxy
+					break
+				}
+			}
+		}
+		if w.targetOut == 0 {
+			names := w.Outputs()
+			w.Close()
+			return nil, fmt.Errorf("output %q not found (available: %s)", outputName, strings.Join(names, ", "))
+		}
+	}
 
 	w.surface = w.send(w.compositor, 0, l.surfaceIface, l.proxyGetVersion(w.compositor), false, 0)
 	w.xdgSurface = w.send(w.wmBase, 2, proto.xdgSurface.ptr, l.proxyGetVersion(w.wmBase), false, 0, uint64(w.surface))
@@ -230,13 +269,12 @@ func Open(title, appID string, fullscreen, tearing bool) (*Window, error) {
 	w.sendStr(w.toplevel, 2, title)
 	w.sendStr(w.toplevel, 3, appID)
 	if fullscreen {
-		w.send(w.toplevel, 11, 0, 0, false, 0) // set_fullscreen(NULL)
+		w.send(w.toplevel, 11, 0, 0, false, uint64(w.targetOut)) // set_fullscreen(output or NULL)
 	}
 	// Tearing: do NOT create a wp_tearing_control_v1 here. Mesa's Wayland WSI
 	// creates its own for VK_PRESENT_MODE_IMMEDIATE_KHR (offered only when
 	// the compositor has tearing control), and a second one on the same
 	// surface is a protocol error that disconnects the client.
-	_ = tearing
 	w.send(w.surface, 6, 0, 0, false) // wl_surface.commit (no buffer: request configure)
 	for i := 0; i < 50 && !w.configured; i++ {
 		if l.displayRoundtrip(w.display) < 0 {
@@ -250,6 +288,22 @@ func Open(title, appID string, fullscreen, tearing bool) (*Window, error) {
 	}
 	w.events = nil
 	return w, nil
+}
+
+// Outputs lists the compositor's outputs as "name (description)".
+func (w *Window) Outputs() []string {
+	var out []string
+	for _, o := range w.outputs {
+		switch {
+		case o.name != "" && o.description != "":
+			out = append(out, o.name+" ("+o.description+")")
+		case o.name != "":
+			out = append(out, o.name)
+		default:
+			out = append(out, o.description)
+		}
+	}
+	return out
 }
 
 // Display and Surface are the wl_display* / wl_surface* for
@@ -272,7 +326,7 @@ func (w *Window) Fullscreen() bool { return w.fullscreen }
 func (w *Window) SetFullscreen(on bool) {
 	w.wantFS = on
 	if on {
-		w.send(w.toplevel, 11, 0, 0, false, 0)
+		w.send(w.toplevel, 11, 0, 0, false, uint64(w.targetOut))
 	} else {
 		w.send(w.toplevel, 12, 0, 0, false)
 	}
@@ -349,6 +403,10 @@ func onGlobal(data, registry uintptr, name uint32, ifaceName uintptr, version ui
 			w.seat = w.bind(name, &iface{ptr: l.seatIface}, min(version, 5))
 			l.proxyAddListener(w.seat, vtables.seat, w.id)
 		}
+	case "wl_output":
+		o := w.bind(name, &iface{ptr: l.outputIface}, min(version, 4))
+		l.proxyAddListener(o, vtables.output, w.id)
+		w.outputs = append(w.outputs, output{proxy: o})
 	case "wp_tearing_control_manager_v1":
 		w.tearingMgr = w.bind(name, proto.tearingMgr, 1)
 	}
@@ -468,5 +526,35 @@ func onToplevelClose(data, tl uintptr) {
 	if w := lookup(data); w != nil {
 		w.close = true
 		w.events = append(w.events, Event{Kind: EvClose})
+	}
+}
+
+func (w *Window) outputFor(proxy uintptr) *output {
+	for i := range w.outputs {
+		if w.outputs[i].proxy == proxy {
+			return &w.outputs[i]
+		}
+	}
+	return nil
+}
+
+func onOutputGeometry(data, o uintptr)                                         {}
+func onOutputMode(data, o uintptr, flags uint32, width, height, refresh int32) {}
+func onOutputDone(data, o uintptr)                                             {}
+func onOutputScale(data, o uintptr, factor int32)                              {}
+
+func onOutputName(data, o, name uintptr) {
+	if w := lookup(data); w != nil {
+		if out := w.outputFor(o); out != nil {
+			out.name = goString(name)
+		}
+	}
+}
+
+func onOutputDescription(data, o, desc uintptr) {
+	if w := lookup(data); w != nil {
+		if out := w.outputFor(o); out != nil {
+			out.description = goString(desc)
+		}
 	}
 }

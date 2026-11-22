@@ -12,19 +12,20 @@ func TestWindowSmoke(t *testing.T) {
 	if os.Getenv("WAYLAND_DISPLAY") == "" || os.Getenv("CAPVIEW_WL_SMOKE") != "1" {
 		t.Skip("set CAPVIEW_WL_SMOKE=1 in a Wayland session")
 	}
-	w, err := Open("capview wl smoke", "capview", false, true)
+	w, err := Open("capview wl smoke", "capview", false, "")
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer w.Close()
 	width, height := w.Size()
+	t.Logf("outputs: %v", w.Outputs())
 	t.Logf("display=%#x surface=%#x configured size=%dx%d fullscreen=%v tearing=%v keyboard=%v pointer=%v",
 		w.Display(), w.Surface(), width, height, w.Fullscreen(), w.HasTearingControl(), w.keyboard != 0, w.pointer != 0)
 	deadline := time.Now().Add(2 * time.Second)
 	n := 0
 	for time.Now().Before(deadline) {
 		for _, ev := range w.Pump() {
-			n++
+			n++ // counts all events seen during the 2 s window
 			if n <= 20 {
 				t.Logf("event %+v", ev)
 			}

@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/virgil724/capview/internal/vk"
 	"github.com/virgil724/capview/internal/wl"
@@ -24,7 +25,11 @@ func newViewerWindow(cfg Config, title string) (viewerWindow, error) {
 	if cfg.Direct {
 		return newDisplayWindow(cfg)
 	}
-	w, err := wl.Open(title, "capview", cfg.Fullscreen, !cfg.VSync)
+	display := strings.TrimSpace(cfg.Display)
+	if strings.EqualFold(display, "primary") || strings.EqualFold(display, "auto") {
+		display = ""
+	}
+	w, err := wl.Open(title, "capview", cfg.Fullscreen, display)
 	if err != nil {
 		return nil, fmt.Errorf("wayland: %w", err)
 	}
