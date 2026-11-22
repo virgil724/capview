@@ -2,6 +2,20 @@
 
 All notable changes to `capview` are documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Linux build** (pure Go, no cgo; Vulkan and libwayland-client loaded with purego):
+  - Wayland viewer window (xdg-shell fullscreen, keyboard/pointer, `-display` to pick the fullscreen output, idle cursor hiding via `wp_cursor_shape_v1`).
+  - Zero-copy V4L2 capture through [caplat](https://github.com/virgil724/caplat)'s `capture/v4l2` (frames hold their MMAP buffer until rendered).
+  - `-format auto` prefers YUY2 when the device offers it: on an AVerMedia GC553 at 1080p60, YUY2 measured 16.2 ms vblank→arrival vs 35.5 ms for NV12 in most stream starts.
+  - ALSA / PipeWire audio passthrough (5 ms periods, 15 ms playback buffer, bounded ring) with mute/volume hotkeys and a warning for very quiet input.
+  - `capview list` (displays, V4L2 devices and modes, ALSA endpoints).
+  - Experimental `-direct` (VK_KHR_display, no compositor; run from a text VT).
+  - Latency note: compositors without tearing control (e.g. niri) add one repaint (~16–35 ms at 60 Hz); on compositors with tearing control Mesa offers `IMMEDIATE` and capview uses it.
+- **Vulkan renderer on Windows** (`-renderer vulkan`, opt-in; D3D11 stays the default). On an RX 9070 XT it reaches Independent Flip with tearing at +0.26 ms p50 vs D3D11; NVIDIA not yet validated.
+- `-source synthetic` test pattern and `-duration` for repeatable measurements.
+
 ## [0.1.1] - 2026-11-21
 
 ### Performance
