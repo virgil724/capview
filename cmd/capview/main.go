@@ -26,6 +26,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "vkinfo" {
+		if err := render.PrintVulkanInfo(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := runView(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		win.ShowErrorBox("capview", err.Error())
@@ -87,8 +94,8 @@ type appHost struct {
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
 }
 
-func (h *appHost) startVideo() error {
-	src, err := capture.Start(capture.Config{
+func (h *appHost) startVideo(sourceKind string) error {
+	c := capture.Config{
 		Device:        h.cfg.Device,
 		Width:         h.cfg.Width,
 		Height:        h.cfg.Height,
@@ -96,7 +103,16 @@ func (h *appHost) startVideo() error {
 		Format:        h.cfg.Format,
 		AutoReconnect: true,
 		Mailbox:       h.mailbox,
-	}, h.freq)
+	}
+	var (
+		src *capture.Source
+		err error
+	)
+	if sourceKind == "synthetic" {
+		src, err = capture.StartSynthetic(c, h.freq)
+	} else {
+		src, err = capture.Start(c, h.freq)
+	}
 	if err != nil {
 		return err
 	}
@@ -314,10 +330,10 @@ func (h *appHost) switchVideoDevice(dev string) {
 	prev := h.cfg.Device
 	h.stopVideo()
 	h.cfg.Device = dev
-	if err := h.startVideo(); err != nil {
+	if err := h.startVideo("mf"); err != nil {
 		win.ShowErrorBox("capview", fmt.Sprintf("Failed to open %s:\n%v", dev, err))
 		h.cfg.Device = prev
-		_ = h.startVideo()
+		_ = h.startVideo("mf")
 		return
 	}
 	_ = config.Save(h.cfgPath, h.cfg)
@@ -329,10 +345,10 @@ func (h *appHost) switchVideoMode(m capture.Mode) {
 	prevW, prevH, prevFPS, prevFmt := h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format
 	h.stopVideo()
 	h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = m.Width, m.Height, m.FPS, m.FourCC
-	if err := h.startVideo(); err != nil {
+	if err := h.startVideo("mf"); err != nil {
 		win.ShowErrorBox("capview", fmt.Sprintf("Failed to switch to %s:\n%v", m, err))
 		h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = prevW, prevH, prevFPS, prevFmt
-		_ = h.startVideo()
+		_ = h.startVideo("mf")
 		return
 	}
 	_ = config.Save(h.cfgPath, h.cfg)
@@ -376,8 +392,25 @@ func runView(args []string) error {
 	audioIn := fs.String("audio-in", cfg.AudioIn, "WASAPI audio capture device name, substring, or 'auto'")
 	audioOut := fs.String("audio-out", cfg.AudioOut, "WASAPI audio playback device name, substring, or 'default'")
 	volume := fs.Float64("volume", float64(cfg.Volume), "initial audio volume (0.0 to 1.0)")
+	renderer := fs.String("renderer", "d3d11", "render backend: d3d11 or vulkan")
+	source := fs.String("source", "mf", "video source: mf or synthetic")
+	vkInfo := fs.Bool("vkinfo", false, "print Vulkan device/extension/present-mode capabilities and exit")
+	duration := fs.Duration("duration", 0, "optional run duration before clean exit (e.g. 20s)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+
+	if *vkInfo {
+		return render.PrintVulkanInfo(os.Stdout)
+	}
+
+	rend := strings.ToLower(strings.TrimSpace(*renderer))
+	if rend != "d3d11" && rend != "vulkan" {
+		return fmt.Errorf("invalid -renderer %q (expected d3d11 or vulkan)", *renderer)
+	}
+	srcKind := strings.ToLower(strings.TrimSpace(*source))
+	if srcKind != "mf" && srcKind != "synthetic" {
+		return fmt.Errorf("invalid -source %q (expected mf or synthetic)", *source)
 	}
 
 	// Only override saved config fields for flags explicitly provided on CLI.
@@ -421,19 +454,33 @@ func runView(args []string) error {
 		cfg.Volume = float32(*volume)
 	}
 
+	if srcKind == "synthetic" {
+		if !setFlags["size"] {
+			cfg.Width, cfg.Height = 1920, 1080
+		}
+		if !setFlags["fps"] {
+			cfg.FPS = 60
+		}
+		if !setFlags["format"] {
+			cfg.Format = "NV12"
+		}
+	}
+
 	host := &appHost{
 		cfg:     cfg,
 		cfgPath: cfgPath,
 		freq:    win.QPCFrequency(),
 		mailbox: capture.NewMailbox(),
 	}
-	if err := host.startVideo(); err != nil {
+	if err := host.startVideo(srcKind); err != nil {
 		return err
 	}
 	defer host.stopVideo()
 
-	host.startAudio()
-	defer host.stopAudio()
+	if srcKind != "synthetic" {
+		host.startAudio()
+		defer host.stopAudio()
+	}
 
 	fmt.Println("hotkeys: [Right-Click] menu | [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [M] mute | [Up/Down/Wheel] volume | [ESC / Q] quit")
 
@@ -444,33 +491,37 @@ func runView(args []string) error {
 	}
 
 	finalState, err := render.Run(render.Config{
+		Renderer:   rend,
 		Display:    cfg.Display,
 		Fullscreen: cfg.Fullscreen,
 		VSync:      cfg.VSync,
 		SavedRect:  savedRect,
 		PrintStats: *printStats,
 		Freq:       host.freq,
+		Duration:   *duration,
 		Host:       host,
 	}, host.mailbox)
 
-	// Persist user preferences on clean exit.
-	host.mu.Lock()
-	if host.aud != nil {
-		host.cfg.Volume = host.aud.Volume()
-		host.cfg.Muted = host.aud.Muted()
-	}
-	host.cfg.Fullscreen = finalState.Fullscreen
-	host.cfg.VSync = finalState.VSync
-	if w := finalState.WindowRect.Right - finalState.WindowRect.Left; w >= 320 {
-		if h := finalState.WindowRect.Bottom - finalState.WindowRect.Top; h >= 180 {
-			host.cfg.WinX = finalState.WindowRect.Left
-			host.cfg.WinY = finalState.WindowRect.Top
-			host.cfg.WinW = w
-			host.cfg.WinH = h
+	// Persist user preferences on clean exit (skip when running synthetic spike tests).
+	if srcKind != "synthetic" {
+		host.mu.Lock()
+		if host.aud != nil {
+			host.cfg.Volume = host.aud.Volume()
+			host.cfg.Muted = host.aud.Muted()
 		}
+		host.cfg.Fullscreen = finalState.Fullscreen
+		host.cfg.VSync = finalState.VSync
+		if w := finalState.WindowRect.Right - finalState.WindowRect.Left; w >= 320 {
+			if h := finalState.WindowRect.Bottom - finalState.WindowRect.Top; h >= 180 {
+				host.cfg.WinX = finalState.WindowRect.Left
+				host.cfg.WinY = finalState.WindowRect.Top
+				host.cfg.WinW = w
+				host.cfg.WinH = h
+			}
+		}
+		_ = config.Save(cfgPath, host.cfg)
+		host.mu.Unlock()
 	}
-	_ = config.Save(cfgPath, host.cfg)
-	host.mu.Unlock()
 
 	return err
 }

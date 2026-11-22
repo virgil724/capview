@@ -147,6 +147,33 @@ func NewWndProc(proc func(hwnd uintptr, msg uint32, wp, lp uintptr) uintptr) uin
 	return syscall.NewCallback(proc)
 }
 
+// ModuleHandle returns the current executable's HINSTANCE.
+func ModuleHandle() uintptr {
+	h, _, _ := procGetModuleHandleW.Call(0)
+	return h
+}
+
+// CreateHiddenWindow creates an invisible message-only/offscreen window suitable
+// for probing swapchain/surface capabilities without showing UI.
+func CreateHiddenWindow(class string) (uintptr, error) {
+	inst := ModuleHandle()
+	cls, _ := windows.UTF16PtrFromString(class)
+	wc := wndClassEx{
+		WndProc:   NewWndProc(func(h uintptr, msg uint32, wp, lp uintptr) uintptr { return DefWindowProc(h, msg, wp, lp) }),
+		Instance:  inst,
+		ClassName: cls,
+	}
+	wc.Size = uint32(unsafe.Sizeof(wc))
+	procRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
+
+	h, _, err := procCreateWindowExW.Call(0, uintptr(unsafe.Pointer(cls)), uintptr(unsafe.Pointer(cls)),
+		uintptr(WS_OVERLAPPEDWINDOW), 0, 0, 64, 64, 0, 0, inst, 0)
+	if h == 0 {
+		return 0, err
+	}
+	return h, nil
+}
+
 // CreateViewerWindow creates either a borderless fullscreen window covering r
 // or a standard resizable window positioned at r.
 func CreateViewerWindow(class, title string, r RECT, borderless bool, wndProc uintptr) (uintptr, error) {

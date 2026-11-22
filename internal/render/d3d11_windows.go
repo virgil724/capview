@@ -83,20 +83,25 @@ type FinalState struct {
 	WindowRect win.RECT
 }
 
-// Config configures the D3D11 viewer window and swap chain.
+// Config configures the viewer window and swap chain.
 type Config struct {
-	Display    string    // "\\.\DISPLAY1" or "primary" (default)
-	Fullscreen bool      // start in borderless fullscreen
-	VSync      bool      // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
-	SavedRect  *win.RECT // optional saved windowed position/size
-	PrintStats bool      // print 1-second latency stats to stdout
-	Freq       int64     // QPC frequency
+	Renderer   string        // "d3d11" (default) or "vulkan"
+	Display    string        // "\\.\DISPLAY1" or "primary" (default)
+	Fullscreen bool          // start in borderless fullscreen
+	VSync      bool          // true: Present(1,0); false: Present(0, ALLOW_TEARING) for VRR/lowest latency
+	SavedRect  *win.RECT     // optional saved windowed position/size
+	PrintStats bool          // print 1-second latency stats to stdout
+	Freq       int64         // QPC frequency
+	Duration   time.Duration // optional auto-exit duration (0 = run until closed)
 	Host       Host
 }
 
 // Run creates the viewer window and renders frames from mailbox until closed
 // (ESC, Q, or window close).
 func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
+	if strings.EqualFold(cfg.Renderer, "vulkan") {
+		return runVulkan(cfg, mailbox)
+	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
@@ -363,6 +368,12 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 	defer statsTicker.Stop()
 	pumpTicker := time.NewTicker(8 * time.Millisecond)
 	defer pumpTicker.Stop()
+	var stopCh <-chan time.Time
+	if cfg.Duration > 0 {
+		t := time.NewTimer(cfg.Duration)
+		defer t.Stop()
+		stopCh = t.C
+	}
 
 	for !quit {
 		win.PumpMessages()
@@ -443,6 +454,9 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			if cfg.PrintStats {
 				fmt.Println(line)
 			}
+
+		case <-stopCh:
+			quit = true
 
 		case <-pumpTicker.C:
 			// Keep Win32 message loop responsive even when no frames arrive.
