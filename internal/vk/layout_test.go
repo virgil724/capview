@@ -1,4 +1,4 @@
-//go:build windows && amd64
+//go:build (windows || linux) && amd64
 
 package vk
 
@@ -35,6 +35,7 @@ func TestStructLayouts(t *testing.T) {
 		{"DeviceQueueCreateInfo", unsafe.Sizeof(DeviceQueueCreateInfo{}), 40},
 		{"DeviceCreateInfo", unsafe.Sizeof(DeviceCreateInfo{}), 72},
 		{"Win32SurfaceCreateInfoKHR", unsafe.Sizeof(Win32SurfaceCreateInfoKHR{}), 40},
+		{"WaylandSurfaceCreateInfoKHR", unsafe.Sizeof(WaylandSurfaceCreateInfoKHR{}), 40},
 		{"SurfaceFormatKHR", unsafe.Sizeof(SurfaceFormatKHR{}), 8},
 		{"SurfaceCapabilitiesKHR", unsafe.Sizeof(SurfaceCapabilitiesKHR{}), 52},
 		{"PhysicalDeviceSurfaceInfo2KHR", unsafe.Sizeof(PhysicalDeviceSurfaceInfo2KHR{}), 24},

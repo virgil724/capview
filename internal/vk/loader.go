@@ -1,17 +1,12 @@
-//go:build windows
+//go:build windows || linux
 
 package vk
 
 import (
 	"fmt"
 	"runtime"
-	"syscall"
 	"unsafe"
-
-	"golang.org/x/sys/windows"
 )
-
-var modVulkan = windows.NewLazySystemDLL("vulkan-1.dll")
 
 // CString allocates a NUL-terminated ASCII byte slice for Vulkan strings.
 func CString(s string) []byte {
@@ -54,18 +49,15 @@ type Global struct {
 	createInstance                       uintptr
 }
 
-// Load loads vulkan-1.dll and resolves global Vulkan entrypoints.
+// Load opens the system Vulkan loader (vulkan-1.dll / libvulkan.so.1) and
+// resolves global Vulkan entrypoints.
 func Load() (*Global, error) {
-	if err := modVulkan.Load(); err != nil {
-		return nil, fmt.Errorf("load vulkan-1.dll: %w", err)
+	gipa, err := openLoader()
+	if err != nil {
+		return nil, err
 	}
-	p := modVulkan.NewProc("vkGetInstanceProcAddr")
-	if err := p.Find(); err != nil {
-		return nil, fmt.Errorf("find vkGetInstanceProcAddr: %w", err)
-	}
-	g := &Global{getInstanceProcAddr: p.Addr()}
+	g := &Global{getInstanceProcAddr: gipa}
 	g.enumerateInstanceVersion = g.procAddr(0, "vkEnumerateInstanceVersion") // optional in 1.0
-	var err error
 	if g.enumerateInstanceExtensionProperties, err = g.reqProc(0, "vkEnumerateInstanceExtensionProperties"); err != nil {
 		return nil, err
 	}
@@ -80,7 +72,7 @@ func (g *Global) procAddr(inst Instance, name string) uintptr {
 	var p runtime.Pinner
 	p.Pin(&cs[0])
 	defer p.Unpin()
-	r, _, _ := syscall.SyscallN(g.getInstanceProcAddr, uintptr(inst), uintptr(unsafe.Pointer(&cs[0])))
+	r, _, _ := call(g.getInstanceProcAddr, uintptr(inst), uintptr(unsafe.Pointer(&cs[0])))
 	return r
 }
 
@@ -97,7 +89,7 @@ func (g *Global) EnumerateInstanceVersion() uint32 {
 		return APIVersion(0, 1, 0, 0)
 	}
 	var v uint32
-	r, _, _ := syscall.SyscallN(g.enumerateInstanceVersion, uintptr(unsafe.Pointer(&v)))
+	r, _, _ := call(g.enumerateInstanceVersion, uintptr(unsafe.Pointer(&v)))
 	if Result(int32(r)) != SUCCESS {
 		return APIVersion(0, 1, 0, 0)
 	}
@@ -106,7 +98,7 @@ func (g *Global) EnumerateInstanceVersion() uint32 {
 
 func (g *Global) EnumerateInstanceExtensionProperties() ([]ExtensionProperties, error) {
 	var count uint32
-	r, _, _ := syscall.SyscallN(g.enumerateInstanceExtensionProperties, 0, uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(g.enumerateInstanceExtensionProperties, 0, uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -114,7 +106,7 @@ func (g *Global) EnumerateInstanceExtensionProperties() ([]ExtensionProperties, 
 		return nil, nil
 	}
 	props := make([]ExtensionProperties, count)
-	r, _, _ = syscall.SyscallN(g.enumerateInstanceExtensionProperties, 0, uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&props[0])))
+	r, _, _ = call(g.enumerateInstanceExtensionProperties, 0, uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&props[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -145,7 +137,7 @@ func (g *Global) CreateInstance(appName string, apiVersion uint32, exts []string
 	p.Pin(&ci)
 
 	var inst Instance
-	r, _, _ := syscall.SyscallN(g.createInstance, uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&inst)))
+	r, _, _ := call(g.createInstance, uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&inst)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -170,8 +162,10 @@ type InstanceFuncs struct {
 	getPhysicalDeviceSurfaceCapabilitiesKHR uintptr
 	getPhysicalDeviceSurfaceFormatsKHR      uintptr
 	getPhysicalDeviceSurfacePresentModesKHR uintptr
-	createWin32SurfaceKHR                   uintptr
-	getPhysicalDeviceWin32PresentationKHR   uintptr
+	// Platform surface entrypoints (optional; resolved per OS).
+	createWin32SurfaceKHR                 uintptr
+	getPhysicalDeviceWin32PresentationKHR uintptr
+	createWaylandSurfaceKHR               uintptr
 
 	// Optional entrypoints.
 	pfnGetPhysicalDeviceFeatures2                   uintptr
@@ -199,8 +193,6 @@ func (g *Global) LoadInstance(inst Instance) (*InstanceFuncs, error) {
 		{&f.getPhysicalDeviceSurfaceCapabilitiesKHR, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"},
 		{&f.getPhysicalDeviceSurfaceFormatsKHR, "vkGetPhysicalDeviceSurfaceFormatsKHR"},
 		{&f.getPhysicalDeviceSurfacePresentModesKHR, "vkGetPhysicalDeviceSurfacePresentModesKHR"},
-		{&f.createWin32SurfaceKHR, "vkCreateWin32SurfaceKHR"},
-		{&f.getPhysicalDeviceWin32PresentationKHR, "vkGetPhysicalDeviceWin32PresentationSupportKHR"},
 	} {
 		addr := g.procAddr(inst, entry.name)
 		if addr == 0 {
@@ -208,6 +200,9 @@ func (g *Global) LoadInstance(inst Instance) (*InstanceFuncs, error) {
 		}
 		*entry.dst = addr
 	}
+	f.createWin32SurfaceKHR = g.procAddr(inst, "vkCreateWin32SurfaceKHR")
+	f.getPhysicalDeviceWin32PresentationKHR = g.procAddr(inst, "vkGetPhysicalDeviceWin32PresentationSupportKHR")
+	f.createWaylandSurfaceKHR = g.procAddr(inst, "vkCreateWaylandSurfaceKHR")
 	f.pfnGetPhysicalDeviceFeatures2 = g.procAddr(inst, "vkGetPhysicalDeviceFeatures2")
 	if f.pfnGetPhysicalDeviceFeatures2 == 0 {
 		f.pfnGetPhysicalDeviceFeatures2 = g.procAddr(inst, "vkGetPhysicalDeviceFeatures2KHR")
@@ -231,14 +226,14 @@ func (f *InstanceFuncs) HasCalibratedTimeDomainsEXT() bool {
 
 func (f *InstanceFuncs) DestroyInstance() {
 	if f.Inst != 0 {
-		syscall.SyscallN(f.destroyInstance, uintptr(f.Inst), 0)
+		call(f.destroyInstance, uintptr(f.Inst), 0)
 		f.Inst = 0
 	}
 }
 
 func (f *InstanceFuncs) EnumeratePhysicalDevices() ([]PhysicalDevice, error) {
 	var count uint32
-	r, _, _ := syscall.SyscallN(f.enumeratePhysicalDevices, uintptr(f.Inst), uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(f.enumeratePhysicalDevices, uintptr(f.Inst), uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -246,7 +241,7 @@ func (f *InstanceFuncs) EnumeratePhysicalDevices() ([]PhysicalDevice, error) {
 		return nil, nil
 	}
 	devs := make([]PhysicalDevice, count)
-	r, _, _ = syscall.SyscallN(f.enumeratePhysicalDevices, uintptr(f.Inst), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&devs[0])))
+	r, _, _ = call(f.enumeratePhysicalDevices, uintptr(f.Inst), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&devs[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -255,30 +250,30 @@ func (f *InstanceFuncs) EnumeratePhysicalDevices() ([]PhysicalDevice, error) {
 
 func (f *InstanceFuncs) GetPhysicalDeviceProperties(pd PhysicalDevice) PhysicalDeviceProperties {
 	var props PhysicalDeviceProperties
-	syscall.SyscallN(f.getPhysicalDeviceProperties, uintptr(pd), uintptr(unsafe.Pointer(&props)))
+	call(f.getPhysicalDeviceProperties, uintptr(pd), uintptr(unsafe.Pointer(&props)))
 	return props
 }
 
 func (f *InstanceFuncs) GetPhysicalDeviceMemoryProperties(pd PhysicalDevice) PhysicalDeviceMemoryProperties {
 	var props PhysicalDeviceMemoryProperties
-	syscall.SyscallN(f.getPhysicalDeviceMemoryProperties, uintptr(pd), uintptr(unsafe.Pointer(&props)))
+	call(f.getPhysicalDeviceMemoryProperties, uintptr(pd), uintptr(unsafe.Pointer(&props)))
 	return props
 }
 
 func (f *InstanceFuncs) GetPhysicalDeviceQueueFamilyProperties(pd PhysicalDevice) []QueueFamilyProperties {
 	var count uint32
-	syscall.SyscallN(f.getPhysicalDeviceQueueFamilyProperties, uintptr(pd), uintptr(unsafe.Pointer(&count)), 0)
+	call(f.getPhysicalDeviceQueueFamilyProperties, uintptr(pd), uintptr(unsafe.Pointer(&count)), 0)
 	if count == 0 {
 		return nil
 	}
 	q := make([]QueueFamilyProperties, count)
-	syscall.SyscallN(f.getPhysicalDeviceQueueFamilyProperties, uintptr(pd), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&q[0])))
+	call(f.getPhysicalDeviceQueueFamilyProperties, uintptr(pd), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&q[0])))
 	return q[:count]
 }
 
 func (f *InstanceFuncs) EnumerateDeviceExtensionProperties(pd PhysicalDevice) ([]ExtensionProperties, error) {
 	var count uint32
-	r, _, _ := syscall.SyscallN(f.enumerateDeviceExtensionProperties, uintptr(pd), 0, uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(f.enumerateDeviceExtensionProperties, uintptr(pd), 0, uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -286,7 +281,7 @@ func (f *InstanceFuncs) EnumerateDeviceExtensionProperties(pd PhysicalDevice) ([
 		return nil, nil
 	}
 	props := make([]ExtensionProperties, count)
-	r, _, _ = syscall.SyscallN(f.enumerateDeviceExtensionProperties, uintptr(pd), 0, uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&props[0])))
+	r, _, _ = call(f.enumerateDeviceExtensionProperties, uintptr(pd), 0, uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&props[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -305,47 +300,28 @@ func (f *InstanceFuncs) GetPhysicalDeviceFeatures2(pd PhysicalDevice, feats2 *Ph
 		}
 	}
 	defer p.Unpin()
-	syscall.SyscallN(f.pfnGetPhysicalDeviceFeatures2, uintptr(pd), uintptr(unsafe.Pointer(feats2)))
+	call(f.pfnGetPhysicalDeviceFeatures2, uintptr(pd), uintptr(unsafe.Pointer(feats2)))
 	return true
-}
-
-func (f *InstanceFuncs) CreateWin32SurfaceKHR(hinstance, hwnd uintptr) (SurfaceKHR, error) {
-	ci := Win32SurfaceCreateInfoKHR{
-		SType:     STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR,
-		HInstance: hinstance,
-		Hwnd:      hwnd,
-	}
-	var surf SurfaceKHR
-	r, _, _ := syscall.SyscallN(f.createWin32SurfaceKHR, uintptr(f.Inst), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&surf)))
-	if res := Result(int32(r)); res != SUCCESS {
-		return 0, res
-	}
-	return surf, nil
 }
 
 func (f *InstanceFuncs) DestroySurfaceKHR(surf SurfaceKHR) {
 	if surf != 0 {
-		syscall.SyscallN(f.destroySurfaceKHR, uintptr(f.Inst), uintptr(surf), 0)
+		call(f.destroySurfaceKHR, uintptr(f.Inst), uintptr(surf), 0)
 	}
 }
 
 func (f *InstanceFuncs) GetPhysicalDeviceSurfaceSupportKHR(pd PhysicalDevice, qf uint32, surf SurfaceKHR) (bool, error) {
 	var sup Bool32
-	r, _, _ := syscall.SyscallN(f.getPhysicalDeviceSurfaceSupportKHR, uintptr(pd), uintptr(qf), uintptr(surf), uintptr(unsafe.Pointer(&sup)))
+	r, _, _ := call(f.getPhysicalDeviceSurfaceSupportKHR, uintptr(pd), uintptr(qf), uintptr(surf), uintptr(unsafe.Pointer(&sup)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return false, res
 	}
 	return sup != 0, nil
 }
 
-func (f *InstanceFuncs) GetPhysicalDeviceWin32PresentationSupportKHR(pd PhysicalDevice, qf uint32) bool {
-	r, _, _ := syscall.SyscallN(f.getPhysicalDeviceWin32PresentationKHR, uintptr(pd), uintptr(qf))
-	return uint32(r) != 0
-}
-
 func (f *InstanceFuncs) GetPhysicalDeviceSurfaceCapabilitiesKHR(pd PhysicalDevice, surf SurfaceKHR) (SurfaceCapabilitiesKHR, error) {
 	var caps SurfaceCapabilitiesKHR
-	r, _, _ := syscall.SyscallN(f.getPhysicalDeviceSurfaceCapabilitiesKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&caps)))
+	r, _, _ := call(f.getPhysicalDeviceSurfaceCapabilitiesKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&caps)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return caps, res
 	}
@@ -365,7 +341,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceSurfaceCapabilities2KHR(pd PhysicalDevi
 		}
 	}
 	defer p.Unpin()
-	r, _, _ := syscall.SyscallN(f.pfnGetPhysicalDeviceSurfaceCapabilities2KHR, uintptr(pd), uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(caps)))
+	r, _, _ := call(f.pfnGetPhysicalDeviceSurfaceCapabilities2KHR, uintptr(pd), uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(caps)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -374,7 +350,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceSurfaceCapabilities2KHR(pd PhysicalDevi
 
 func (f *InstanceFuncs) GetPhysicalDeviceSurfaceFormatsKHR(pd PhysicalDevice, surf SurfaceKHR) ([]SurfaceFormatKHR, error) {
 	var count uint32
-	r, _, _ := syscall.SyscallN(f.getPhysicalDeviceSurfaceFormatsKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(f.getPhysicalDeviceSurfaceFormatsKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -382,7 +358,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceSurfaceFormatsKHR(pd PhysicalDevice, su
 		return nil, nil
 	}
 	fmts := make([]SurfaceFormatKHR, count)
-	r, _, _ = syscall.SyscallN(f.getPhysicalDeviceSurfaceFormatsKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&fmts[0])))
+	r, _, _ = call(f.getPhysicalDeviceSurfaceFormatsKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&fmts[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -391,7 +367,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceSurfaceFormatsKHR(pd PhysicalDevice, su
 
 func (f *InstanceFuncs) GetPhysicalDeviceSurfacePresentModesKHR(pd PhysicalDevice, surf SurfaceKHR) ([]uint32, error) {
 	var count uint32
-	r, _, _ := syscall.SyscallN(f.getPhysicalDeviceSurfacePresentModesKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(f.getPhysicalDeviceSurfacePresentModesKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -399,7 +375,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceSurfacePresentModesKHR(pd PhysicalDevic
 		return nil, nil
 	}
 	modes := make([]uint32, count)
-	r, _, _ = syscall.SyscallN(f.getPhysicalDeviceSurfacePresentModesKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&modes[0])))
+	r, _, _ = call(f.getPhysicalDeviceSurfacePresentModesKHR, uintptr(pd), uintptr(surf), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&modes[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -415,7 +391,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceCalibrateableTimeDomains(pd PhysicalDev
 		return nil, fmt.Errorf("vkGetPhysicalDeviceCalibrateableTimeDomains not available")
 	}
 	var count uint32
-	r, _, _ := syscall.SyscallN(fn, uintptr(pd), uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(fn, uintptr(pd), uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -423,7 +399,7 @@ func (f *InstanceFuncs) GetPhysicalDeviceCalibrateableTimeDomains(pd PhysicalDev
 		return nil, nil
 	}
 	domains := make([]uint32, count)
-	r, _, _ = syscall.SyscallN(fn, uintptr(pd), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&domains[0])))
+	r, _, _ = call(fn, uintptr(pd), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&domains[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -462,7 +438,7 @@ func (f *InstanceFuncs) CreateDevice(pd PhysicalDevice, qfIndex uint32, exts []s
 	p.Pin(&dci)
 
 	var dev Device
-	r, _, _ := syscall.SyscallN(f.createDevice, uintptr(pd), uintptr(unsafe.Pointer(&dci)), 0, uintptr(unsafe.Pointer(&dev)))
+	r, _, _ := call(f.createDevice, uintptr(pd), uintptr(unsafe.Pointer(&dci)), 0, uintptr(unsafe.Pointer(&dev)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -473,69 +449,69 @@ func (f *InstanceFuncs) CreateDevice(pd PhysicalDevice, qfIndex uint32, exts []s
 type DeviceFuncs struct {
 	Dev Device
 
-	destroyDevice                uintptr
-	getDeviceQueue               uintptr
-	deviceWaitIdle               uintptr
-	queueSubmit                  uintptr
-	createCommandPool            uintptr
-	destroyCommandPool           uintptr
-	allocateCommandBuffers       uintptr
-	resetCommandBuffer           uintptr
-	beginCommandBuffer           uintptr
-	endCommandBuffer             uintptr
-	cmdPipelineBarrier           uintptr
-	cmdCopyBufferToImage         uintptr
-	cmdBeginRenderPass           uintptr
-	cmdEndRenderPass             uintptr
-	cmdBindPipeline              uintptr
-	cmdSetViewport               uintptr
-	cmdSetScissor                uintptr
-	cmdBindDescriptorSets        uintptr
-	cmdDraw                      uintptr
-	createFence                  uintptr
-	destroyFence                 uintptr
-	getFenceStatus               uintptr
-	waitForFences                uintptr
-	resetFences                  uintptr
-	createSemaphore              uintptr
-	destroySemaphore             uintptr
-	createBuffer                 uintptr
-	destroyBuffer                uintptr
-	getBufferMemoryRequirements  uintptr
-	allocateMemory               uintptr
-	freeMemory                   uintptr
-	mapMemory                    uintptr
-	unmapMemory                  uintptr
-	bindBufferMemory             uintptr
-	createImage                  uintptr
-	destroyImage                 uintptr
-	getImageMemoryRequirements   uintptr
-	bindImageMemory              uintptr
-	createImageView              uintptr
-	destroyImageView             uintptr
-	createSampler                uintptr
-	destroySampler               uintptr
-	createShaderModule           uintptr
-	destroyShaderModule          uintptr
-	createDescriptorSetLayout    uintptr
-	destroyDescriptorSetLayout   uintptr
-	createDescriptorPool         uintptr
-	destroyDescriptorPool        uintptr
-	allocateDescriptorSets       uintptr
-	updateDescriptorSets         uintptr
-	createPipelineLayout         uintptr
-	destroyPipelineLayout        uintptr
-	createRenderPass             uintptr
-	destroyRenderPass            uintptr
-	createGraphicsPipelines      uintptr
-	destroyPipeline              uintptr
-	createFramebuffer            uintptr
-	destroyFramebuffer           uintptr
-	createSwapchainKHR           uintptr
-	destroySwapchainKHR          uintptr
-	getSwapchainImagesKHR        uintptr
-	acquireNextImageKHR          uintptr
-	queuePresentKHR              uintptr
+	destroyDevice               uintptr
+	getDeviceQueue              uintptr
+	deviceWaitIdle              uintptr
+	queueSubmit                 uintptr
+	createCommandPool           uintptr
+	destroyCommandPool          uintptr
+	allocateCommandBuffers      uintptr
+	resetCommandBuffer          uintptr
+	beginCommandBuffer          uintptr
+	endCommandBuffer            uintptr
+	cmdPipelineBarrier          uintptr
+	cmdCopyBufferToImage        uintptr
+	cmdBeginRenderPass          uintptr
+	cmdEndRenderPass            uintptr
+	cmdBindPipeline             uintptr
+	cmdSetViewport              uintptr
+	cmdSetScissor               uintptr
+	cmdBindDescriptorSets       uintptr
+	cmdDraw                     uintptr
+	createFence                 uintptr
+	destroyFence                uintptr
+	getFenceStatus              uintptr
+	waitForFences               uintptr
+	resetFences                 uintptr
+	createSemaphore             uintptr
+	destroySemaphore            uintptr
+	createBuffer                uintptr
+	destroyBuffer               uintptr
+	getBufferMemoryRequirements uintptr
+	allocateMemory              uintptr
+	freeMemory                  uintptr
+	mapMemory                   uintptr
+	unmapMemory                 uintptr
+	bindBufferMemory            uintptr
+	createImage                 uintptr
+	destroyImage                uintptr
+	getImageMemoryRequirements  uintptr
+	bindImageMemory             uintptr
+	createImageView             uintptr
+	destroyImageView            uintptr
+	createSampler               uintptr
+	destroySampler              uintptr
+	createShaderModule          uintptr
+	destroyShaderModule         uintptr
+	createDescriptorSetLayout   uintptr
+	destroyDescriptorSetLayout  uintptr
+	createDescriptorPool        uintptr
+	destroyDescriptorPool       uintptr
+	allocateDescriptorSets      uintptr
+	updateDescriptorSets        uintptr
+	createPipelineLayout        uintptr
+	destroyPipelineLayout       uintptr
+	createRenderPass            uintptr
+	destroyRenderPass           uintptr
+	createGraphicsPipelines     uintptr
+	destroyPipeline             uintptr
+	createFramebuffer           uintptr
+	destroyFramebuffer          uintptr
+	createSwapchainKHR          uintptr
+	destroySwapchainKHR         uintptr
+	getSwapchainImagesKHR       uintptr
+	acquireNextImageKHR         uintptr
+	queuePresentKHR             uintptr
 
 	// Optional telemetry / timing / present-wait entrypoints.
 	pfnWaitForPresentKHR                     uintptr
@@ -553,7 +529,7 @@ func (f *InstanceFuncs) devProc(dev Device, name string) uintptr {
 	var p runtime.Pinner
 	p.Pin(&cs[0])
 	defer p.Unpin()
-	r, _, _ := syscall.SyscallN(f.getDeviceProcAddr, uintptr(dev), uintptr(unsafe.Pointer(&cs[0])))
+	r, _, _ := call(f.getDeviceProcAddr, uintptr(dev), uintptr(unsafe.Pointer(&cs[0])))
 	return r
 }
 
@@ -657,19 +633,19 @@ func (d *DeviceFuncs) HasCalibratedTimestampsEXT() bool { return d.pfnGetCalibra
 
 func (d *DeviceFuncs) DestroyDevice() {
 	if d.Dev != 0 {
-		syscall.SyscallN(d.destroyDevice, uintptr(d.Dev), 0)
+		call(d.destroyDevice, uintptr(d.Dev), 0)
 		d.Dev = 0
 	}
 }
 
 func (d *DeviceFuncs) GetDeviceQueue(qfIndex, queueIndex uint32) Queue {
 	var q Queue
-	syscall.SyscallN(d.getDeviceQueue, uintptr(d.Dev), uintptr(qfIndex), uintptr(queueIndex), uintptr(unsafe.Pointer(&q)))
+	call(d.getDeviceQueue, uintptr(d.Dev), uintptr(qfIndex), uintptr(queueIndex), uintptr(unsafe.Pointer(&q)))
 	return q
 }
 
 func (d *DeviceFuncs) DeviceWaitIdle() error {
-	r, _, _ := syscall.SyscallN(d.deviceWaitIdle, uintptr(d.Dev))
+	r, _, _ := call(d.deviceWaitIdle, uintptr(d.Dev))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -693,7 +669,7 @@ func (d *DeviceFuncs) CreateSwapchainKHR(ci *SwapchainCreateInfoKHR, chainPins .
 	defer p.Unpin()
 
 	var sc SwapchainKHR
-	r, _, _ := syscall.SyscallN(d.createSwapchainKHR, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&sc)))
+	r, _, _ := call(d.createSwapchainKHR, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&sc)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -702,13 +678,13 @@ func (d *DeviceFuncs) CreateSwapchainKHR(ci *SwapchainCreateInfoKHR, chainPins .
 
 func (d *DeviceFuncs) DestroySwapchainKHR(sc SwapchainKHR) {
 	if sc != 0 {
-		syscall.SyscallN(d.destroySwapchainKHR, uintptr(d.Dev), uintptr(sc), 0)
+		call(d.destroySwapchainKHR, uintptr(d.Dev), uintptr(sc), 0)
 	}
 }
 
 func (d *DeviceFuncs) GetSwapchainImagesKHR(sc SwapchainKHR) ([]Image, error) {
 	var count uint32
-	r, _, _ := syscall.SyscallN(d.getSwapchainImagesKHR, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&count)), 0)
+	r, _, _ := call(d.getSwapchainImagesKHR, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&count)), 0)
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -716,7 +692,7 @@ func (d *DeviceFuncs) GetSwapchainImagesKHR(sc SwapchainKHR) ([]Image, error) {
 		return nil, nil
 	}
 	imgs := make([]Image, count)
-	r, _, _ = syscall.SyscallN(d.getSwapchainImagesKHR, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&imgs[0])))
+	r, _, _ = call(d.getSwapchainImagesKHR, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&count)), uintptr(unsafe.Pointer(&imgs[0])))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, res
 	}
@@ -725,7 +701,7 @@ func (d *DeviceFuncs) GetSwapchainImagesKHR(sc SwapchainKHR) ([]Image, error) {
 
 func (d *DeviceFuncs) AcquireNextImageKHR(sc SwapchainKHR, timeout uint64, sem Semaphore, fence Fence) (uint32, Result) {
 	var idx uint32
-	r, _, _ := syscall.SyscallN(d.acquireNextImageKHR, uintptr(d.Dev), uintptr(sc), uintptr(timeout), uintptr(sem), uintptr(fence), uintptr(unsafe.Pointer(&idx)))
+	r, _, _ := call(d.acquireNextImageKHR, uintptr(d.Dev), uintptr(sc), uintptr(timeout), uintptr(sem), uintptr(fence), uintptr(unsafe.Pointer(&idx)))
 	return idx, Result(int32(r))
 }
 
@@ -753,7 +729,7 @@ func (d *DeviceFuncs) QueuePresentKHR(q Queue, info *PresentInfoKHR, chainPins .
 		}
 	}
 	defer p.Unpin()
-	r, _, _ := syscall.SyscallN(d.queuePresentKHR, uintptr(q), uintptr(unsafe.Pointer(info)))
+	r, _, _ := call(d.queuePresentKHR, uintptr(q), uintptr(unsafe.Pointer(info)))
 	return Result(int32(r))
 }
 
@@ -764,7 +740,7 @@ func (d *DeviceFuncs) CreateCommandPool(qfIndex uint32, flags Flags) (CommandPoo
 		QueueFamilyIndex: qfIndex,
 	}
 	var pool CommandPool
-	r, _, _ := syscall.SyscallN(d.createCommandPool, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&pool)))
+	r, _, _ := call(d.createCommandPool, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&pool)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -773,7 +749,7 @@ func (d *DeviceFuncs) CreateCommandPool(qfIndex uint32, flags Flags) (CommandPoo
 
 func (d *DeviceFuncs) DestroyCommandPool(pool CommandPool) {
 	if pool != 0 {
-		syscall.SyscallN(d.destroyCommandPool, uintptr(d.Dev), uintptr(pool), 0)
+		call(d.destroyCommandPool, uintptr(d.Dev), uintptr(pool), 0)
 	}
 }
 
@@ -785,7 +761,7 @@ func (d *DeviceFuncs) AllocateCommandBuffers(pool CommandPool, count uint32) ([]
 		CommandBufferCount: count,
 	}
 	out := make([]CommandBuffer, count)
-	r, _, _ := syscall.SyscallN(d.allocateCommandBuffers, uintptr(d.Dev), uintptr(unsafe.Pointer(&ai)), uintptr(unsafe.Pointer(&out[0])))
+	r, _, _ := call(d.allocateCommandBuffers, uintptr(d.Dev), uintptr(unsafe.Pointer(&ai)), uintptr(unsafe.Pointer(&out[0])))
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -793,7 +769,7 @@ func (d *DeviceFuncs) AllocateCommandBuffers(pool CommandPool, count uint32) ([]
 }
 
 func (d *DeviceFuncs) ResetCommandBuffer(cb CommandBuffer, flags Flags) error {
-	r, _, _ := syscall.SyscallN(d.resetCommandBuffer, uintptr(cb), uintptr(flags))
+	r, _, _ := call(d.resetCommandBuffer, uintptr(cb), uintptr(flags))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -805,7 +781,7 @@ func (d *DeviceFuncs) BeginCommandBuffer(cb CommandBuffer, flags Flags) error {
 		SType: STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		Flags: flags,
 	}
-	r, _, _ := syscall.SyscallN(d.beginCommandBuffer, uintptr(cb), uintptr(unsafe.Pointer(&bi)))
+	r, _, _ := call(d.beginCommandBuffer, uintptr(cb), uintptr(unsafe.Pointer(&bi)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -813,7 +789,7 @@ func (d *DeviceFuncs) BeginCommandBuffer(cb CommandBuffer, flags Flags) error {
 }
 
 func (d *DeviceFuncs) EndCommandBuffer(cb CommandBuffer) error {
-	r, _, _ := syscall.SyscallN(d.endCommandBuffer, uintptr(cb))
+	r, _, _ := call(d.endCommandBuffer, uintptr(cb))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -827,7 +803,7 @@ func (d *DeviceFuncs) CmdImageBarrier(cb CommandBuffer, srcStage, dstStage Flags
 	var p runtime.Pinner
 	p.Pin(&barriers[0])
 	defer p.Unpin()
-	syscall.SyscallN(d.cmdPipelineBarrier, uintptr(cb), uintptr(srcStage), uintptr(dstStage), 0,
+	call(d.cmdPipelineBarrier, uintptr(cb), uintptr(srcStage), uintptr(dstStage), 0,
 		0, 0, 0, 0, uintptr(len(barriers)), uintptr(unsafe.Pointer(&barriers[0])))
 }
 
@@ -838,7 +814,7 @@ func (d *DeviceFuncs) CmdCopyBufferToImage(cb CommandBuffer, buf Buffer, img Ima
 	var p runtime.Pinner
 	p.Pin(&regions[0])
 	defer p.Unpin()
-	syscall.SyscallN(d.cmdCopyBufferToImage, uintptr(cb), uintptr(buf), uintptr(img), uintptr(dstLayout), uintptr(len(regions)), uintptr(unsafe.Pointer(&regions[0])))
+	call(d.cmdCopyBufferToImage, uintptr(cb), uintptr(buf), uintptr(img), uintptr(dstLayout), uintptr(len(regions)), uintptr(unsafe.Pointer(&regions[0])))
 }
 
 func (d *DeviceFuncs) CmdBeginRenderPass(cb CommandBuffer, bi *RenderPassBeginInfo) {
@@ -848,23 +824,23 @@ func (d *DeviceFuncs) CmdBeginRenderPass(cb CommandBuffer, bi *RenderPassBeginIn
 		p.Pin(bi.PClearValues)
 	}
 	defer p.Unpin()
-	syscall.SyscallN(d.cmdBeginRenderPass, uintptr(cb), uintptr(unsafe.Pointer(bi)), uintptr(SUBPASS_CONTENTS_INLINE))
+	call(d.cmdBeginRenderPass, uintptr(cb), uintptr(unsafe.Pointer(bi)), uintptr(SUBPASS_CONTENTS_INLINE))
 }
 
 func (d *DeviceFuncs) CmdEndRenderPass(cb CommandBuffer) {
-	syscall.SyscallN(d.cmdEndRenderPass, uintptr(cb))
+	call(d.cmdEndRenderPass, uintptr(cb))
 }
 
 func (d *DeviceFuncs) CmdBindPipeline(cb CommandBuffer, bindPoint uint32, pipe Pipeline) {
-	syscall.SyscallN(d.cmdBindPipeline, uintptr(cb), uintptr(bindPoint), uintptr(pipe))
+	call(d.cmdBindPipeline, uintptr(cb), uintptr(bindPoint), uintptr(pipe))
 }
 
 func (d *DeviceFuncs) CmdSetViewport(cb CommandBuffer, vp *Viewport) {
-	syscall.SyscallN(d.cmdSetViewport, uintptr(cb), 0, 1, uintptr(unsafe.Pointer(vp)))
+	call(d.cmdSetViewport, uintptr(cb), 0, 1, uintptr(unsafe.Pointer(vp)))
 }
 
 func (d *DeviceFuncs) CmdSetScissor(cb CommandBuffer, r *Rect2D) {
-	syscall.SyscallN(d.cmdSetScissor, uintptr(cb), 0, 1, uintptr(unsafe.Pointer(r)))
+	call(d.cmdSetScissor, uintptr(cb), 0, 1, uintptr(unsafe.Pointer(r)))
 }
 
 func (d *DeviceFuncs) CmdBindDescriptorSets(cb CommandBuffer, bindPoint uint32, layout PipelineLayout, sets []DescriptorSet) {
@@ -874,11 +850,11 @@ func (d *DeviceFuncs) CmdBindDescriptorSets(cb CommandBuffer, bindPoint uint32, 
 	var p runtime.Pinner
 	p.Pin(&sets[0])
 	defer p.Unpin()
-	syscall.SyscallN(d.cmdBindDescriptorSets, uintptr(cb), uintptr(bindPoint), uintptr(layout), 0, uintptr(len(sets)), uintptr(unsafe.Pointer(&sets[0])), 0, 0)
+	call(d.cmdBindDescriptorSets, uintptr(cb), uintptr(bindPoint), uintptr(layout), 0, uintptr(len(sets)), uintptr(unsafe.Pointer(&sets[0])), 0, 0)
 }
 
 func (d *DeviceFuncs) CmdDraw(cb CommandBuffer, vertexCount, instanceCount, firstVertex, firstInstance uint32) {
-	syscall.SyscallN(d.cmdDraw, uintptr(cb), uintptr(vertexCount), uintptr(instanceCount), uintptr(firstVertex), uintptr(firstInstance))
+	call(d.cmdDraw, uintptr(cb), uintptr(vertexCount), uintptr(instanceCount), uintptr(firstVertex), uintptr(firstInstance))
 }
 
 func (d *DeviceFuncs) QueueSubmit(q Queue, si *SubmitInfo, fence Fence) error {
@@ -898,7 +874,7 @@ func (d *DeviceFuncs) QueueSubmit(q Queue, si *SubmitInfo, fence Fence) error {
 	}
 	defer p.Unpin()
 
-	r, _, _ := syscall.SyscallN(d.queueSubmit, uintptr(q), 1, uintptr(unsafe.Pointer(si)), uintptr(fence))
+	r, _, _ := call(d.queueSubmit, uintptr(q), 1, uintptr(unsafe.Pointer(si)), uintptr(fence))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -911,7 +887,7 @@ func (d *DeviceFuncs) CreateFence(signaled bool) (Fence, error) {
 		ci.Flags = FENCE_CREATE_SIGNALED_BIT
 	}
 	var f Fence
-	r, _, _ := syscall.SyscallN(d.createFence, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&f)))
+	r, _, _ := call(d.createFence, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&f)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -920,12 +896,12 @@ func (d *DeviceFuncs) CreateFence(signaled bool) (Fence, error) {
 
 func (d *DeviceFuncs) DestroyFence(f Fence) {
 	if f != 0 {
-		syscall.SyscallN(d.destroyFence, uintptr(d.Dev), uintptr(f), 0)
+		call(d.destroyFence, uintptr(d.Dev), uintptr(f), 0)
 	}
 }
 
 func (d *DeviceFuncs) GetFenceStatus(f Fence) Result {
-	r, _, _ := syscall.SyscallN(d.getFenceStatus, uintptr(d.Dev), uintptr(f))
+	r, _, _ := call(d.getFenceStatus, uintptr(d.Dev), uintptr(f))
 	return Result(int32(r))
 }
 
@@ -940,7 +916,7 @@ func (d *DeviceFuncs) WaitForFences(fences []Fence, waitAll bool, timeout uint64
 	if waitAll {
 		all = True
 	}
-	r, _, _ := syscall.SyscallN(d.waitForFences, uintptr(d.Dev), uintptr(len(fences)), uintptr(unsafe.Pointer(&fences[0])), uintptr(all), uintptr(timeout))
+	r, _, _ := call(d.waitForFences, uintptr(d.Dev), uintptr(len(fences)), uintptr(unsafe.Pointer(&fences[0])), uintptr(all), uintptr(timeout))
 	return Result(int32(r))
 }
 
@@ -951,7 +927,7 @@ func (d *DeviceFuncs) ResetFences(fences []Fence) error {
 	var p runtime.Pinner
 	p.Pin(&fences[0])
 	defer p.Unpin()
-	r, _, _ := syscall.SyscallN(d.resetFences, uintptr(d.Dev), uintptr(len(fences)), uintptr(unsafe.Pointer(&fences[0])))
+	r, _, _ := call(d.resetFences, uintptr(d.Dev), uintptr(len(fences)), uintptr(unsafe.Pointer(&fences[0])))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -961,7 +937,7 @@ func (d *DeviceFuncs) ResetFences(fences []Fence) error {
 func (d *DeviceFuncs) CreateSemaphore() (Semaphore, error) {
 	ci := SemaphoreCreateInfo{SType: STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}
 	var s Semaphore
-	r, _, _ := syscall.SyscallN(d.createSemaphore, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&s)))
+	r, _, _ := call(d.createSemaphore, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&s)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -970,7 +946,7 @@ func (d *DeviceFuncs) CreateSemaphore() (Semaphore, error) {
 
 func (d *DeviceFuncs) DestroySemaphore(s Semaphore) {
 	if s != 0 {
-		syscall.SyscallN(d.destroySemaphore, uintptr(d.Dev), uintptr(s), 0)
+		call(d.destroySemaphore, uintptr(d.Dev), uintptr(s), 0)
 	}
 }
 
@@ -982,7 +958,7 @@ func (d *DeviceFuncs) CreateBuffer(size DeviceSize, usage Flags) (Buffer, error)
 		SharingMode: SHARING_MODE_EXCLUSIVE,
 	}
 	var b Buffer
-	r, _, _ := syscall.SyscallN(d.createBuffer, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&b)))
+	r, _, _ := call(d.createBuffer, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&b)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -991,13 +967,13 @@ func (d *DeviceFuncs) CreateBuffer(size DeviceSize, usage Flags) (Buffer, error)
 
 func (d *DeviceFuncs) DestroyBuffer(b Buffer) {
 	if b != 0 {
-		syscall.SyscallN(d.destroyBuffer, uintptr(d.Dev), uintptr(b), 0)
+		call(d.destroyBuffer, uintptr(d.Dev), uintptr(b), 0)
 	}
 }
 
 func (d *DeviceFuncs) GetBufferMemoryRequirements(b Buffer) MemoryRequirements {
 	var mr MemoryRequirements
-	syscall.SyscallN(d.getBufferMemoryRequirements, uintptr(d.Dev), uintptr(b), uintptr(unsafe.Pointer(&mr)))
+	call(d.getBufferMemoryRequirements, uintptr(d.Dev), uintptr(b), uintptr(unsafe.Pointer(&mr)))
 	return mr
 }
 
@@ -1008,7 +984,7 @@ func (d *DeviceFuncs) AllocateMemory(size DeviceSize, memType uint32) (DeviceMem
 		MemoryTypeIndex: memType,
 	}
 	var m DeviceMemory
-	r, _, _ := syscall.SyscallN(d.allocateMemory, uintptr(d.Dev), uintptr(unsafe.Pointer(&ai)), 0, uintptr(unsafe.Pointer(&m)))
+	r, _, _ := call(d.allocateMemory, uintptr(d.Dev), uintptr(unsafe.Pointer(&ai)), 0, uintptr(unsafe.Pointer(&m)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1017,13 +993,13 @@ func (d *DeviceFuncs) AllocateMemory(size DeviceSize, memType uint32) (DeviceMem
 
 func (d *DeviceFuncs) FreeMemory(m DeviceMemory) {
 	if m != 0 {
-		syscall.SyscallN(d.freeMemory, uintptr(d.Dev), uintptr(m), 0)
+		call(d.freeMemory, uintptr(d.Dev), uintptr(m), 0)
 	}
 }
 
 func (d *DeviceFuncs) MapMemory(m DeviceMemory, offset, size DeviceSize) (unsafe.Pointer, error) {
 	var ptr unsafe.Pointer
-	r, _, _ := syscall.SyscallN(d.mapMemory, uintptr(d.Dev), uintptr(m), uintptr(offset), uintptr(size), 0, uintptr(unsafe.Pointer(&ptr)))
+	r, _, _ := call(d.mapMemory, uintptr(d.Dev), uintptr(m), uintptr(offset), uintptr(size), 0, uintptr(unsafe.Pointer(&ptr)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -1032,12 +1008,12 @@ func (d *DeviceFuncs) MapMemory(m DeviceMemory, offset, size DeviceSize) (unsafe
 
 func (d *DeviceFuncs) UnmapMemory(m DeviceMemory) {
 	if m != 0 {
-		syscall.SyscallN(d.unmapMemory, uintptr(d.Dev), uintptr(m))
+		call(d.unmapMemory, uintptr(d.Dev), uintptr(m))
 	}
 }
 
 func (d *DeviceFuncs) BindBufferMemory(b Buffer, m DeviceMemory, offset DeviceSize) error {
-	r, _, _ := syscall.SyscallN(d.bindBufferMemory, uintptr(d.Dev), uintptr(b), uintptr(m), uintptr(offset))
+	r, _, _ := call(d.bindBufferMemory, uintptr(d.Dev), uintptr(b), uintptr(m), uintptr(offset))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -1052,7 +1028,7 @@ func (d *DeviceFuncs) CreateImage(ci *ImageCreateInfo) (Image, error) {
 	}
 	defer p.Unpin()
 	var img Image
-	r, _, _ := syscall.SyscallN(d.createImage, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&img)))
+	r, _, _ := call(d.createImage, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&img)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1061,18 +1037,18 @@ func (d *DeviceFuncs) CreateImage(ci *ImageCreateInfo) (Image, error) {
 
 func (d *DeviceFuncs) DestroyImage(img Image) {
 	if img != 0 {
-		syscall.SyscallN(d.destroyImage, uintptr(d.Dev), uintptr(img), 0)
+		call(d.destroyImage, uintptr(d.Dev), uintptr(img), 0)
 	}
 }
 
 func (d *DeviceFuncs) GetImageMemoryRequirements(img Image) MemoryRequirements {
 	var mr MemoryRequirements
-	syscall.SyscallN(d.getImageMemoryRequirements, uintptr(d.Dev), uintptr(img), uintptr(unsafe.Pointer(&mr)))
+	call(d.getImageMemoryRequirements, uintptr(d.Dev), uintptr(img), uintptr(unsafe.Pointer(&mr)))
 	return mr
 }
 
 func (d *DeviceFuncs) BindImageMemory(img Image, m DeviceMemory, offset DeviceSize) error {
-	r, _, _ := syscall.SyscallN(d.bindImageMemory, uintptr(d.Dev), uintptr(img), uintptr(m), uintptr(offset))
+	r, _, _ := call(d.bindImageMemory, uintptr(d.Dev), uintptr(img), uintptr(m), uintptr(offset))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -1081,7 +1057,7 @@ func (d *DeviceFuncs) BindImageMemory(img Image, m DeviceMemory, offset DeviceSi
 
 func (d *DeviceFuncs) CreateImageView(ci *ImageViewCreateInfo) (ImageView, error) {
 	var iv ImageView
-	r, _, _ := syscall.SyscallN(d.createImageView, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&iv)))
+	r, _, _ := call(d.createImageView, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&iv)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1090,13 +1066,13 @@ func (d *DeviceFuncs) CreateImageView(ci *ImageViewCreateInfo) (ImageView, error
 
 func (d *DeviceFuncs) DestroyImageView(iv ImageView) {
 	if iv != 0 {
-		syscall.SyscallN(d.destroyImageView, uintptr(d.Dev), uintptr(iv), 0)
+		call(d.destroyImageView, uintptr(d.Dev), uintptr(iv), 0)
 	}
 }
 
 func (d *DeviceFuncs) CreateSampler(ci *SamplerCreateInfo) (Sampler, error) {
 	var s Sampler
-	r, _, _ := syscall.SyscallN(d.createSampler, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&s)))
+	r, _, _ := call(d.createSampler, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&s)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1105,7 +1081,7 @@ func (d *DeviceFuncs) CreateSampler(ci *SamplerCreateInfo) (Sampler, error) {
 
 func (d *DeviceFuncs) DestroySampler(s Sampler) {
 	if s != 0 {
-		syscall.SyscallN(d.destroySampler, uintptr(d.Dev), uintptr(s), 0)
+		call(d.destroySampler, uintptr(d.Dev), uintptr(s), 0)
 	}
 }
 
@@ -1124,7 +1100,7 @@ func (d *DeviceFuncs) CreateShaderModule(spv []byte) (ShaderModule, error) {
 	}
 	p.Pin(&ci)
 	var sm ShaderModule
-	r, _, _ := syscall.SyscallN(d.createShaderModule, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&sm)))
+	r, _, _ := call(d.createShaderModule, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&sm)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1133,7 +1109,7 @@ func (d *DeviceFuncs) CreateShaderModule(spv []byte) (ShaderModule, error) {
 
 func (d *DeviceFuncs) DestroyShaderModule(sm ShaderModule) {
 	if sm != 0 {
-		syscall.SyscallN(d.destroyShaderModule, uintptr(d.Dev), uintptr(sm), 0)
+		call(d.destroyShaderModule, uintptr(d.Dev), uintptr(sm), 0)
 	}
 }
 
@@ -1152,7 +1128,7 @@ func (d *DeviceFuncs) CreateDescriptorSetLayout(bindings []DescriptorSetLayoutBi
 	}
 	p.Pin(&ci)
 	var layout DescriptorSetLayout
-	r, _, _ := syscall.SyscallN(d.createDescriptorSetLayout, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&layout)))
+	r, _, _ := call(d.createDescriptorSetLayout, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&layout)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1161,7 +1137,7 @@ func (d *DeviceFuncs) CreateDescriptorSetLayout(bindings []DescriptorSetLayoutBi
 
 func (d *DeviceFuncs) DestroyDescriptorSetLayout(l DescriptorSetLayout) {
 	if l != 0 {
-		syscall.SyscallN(d.destroyDescriptorSetLayout, uintptr(d.Dev), uintptr(l), 0)
+		call(d.destroyDescriptorSetLayout, uintptr(d.Dev), uintptr(l), 0)
 	}
 }
 
@@ -1181,7 +1157,7 @@ func (d *DeviceFuncs) CreateDescriptorPool(maxSets uint32, sizes []DescriptorPoo
 	}
 	p.Pin(&ci)
 	var pool DescriptorPool
-	r, _, _ := syscall.SyscallN(d.createDescriptorPool, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&pool)))
+	r, _, _ := call(d.createDescriptorPool, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&pool)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1190,7 +1166,7 @@ func (d *DeviceFuncs) CreateDescriptorPool(maxSets uint32, sizes []DescriptorPoo
 
 func (d *DeviceFuncs) DestroyDescriptorPool(pool DescriptorPool) {
 	if pool != 0 {
-		syscall.SyscallN(d.destroyDescriptorPool, uintptr(d.Dev), uintptr(pool), 0)
+		call(d.destroyDescriptorPool, uintptr(d.Dev), uintptr(pool), 0)
 	}
 }
 
@@ -1209,7 +1185,7 @@ func (d *DeviceFuncs) AllocateDescriptorSets(pool DescriptorPool, layouts []Desc
 	}
 	p.Pin(&ai)
 	out := make([]DescriptorSet, len(layouts))
-	r, _, _ := syscall.SyscallN(d.allocateDescriptorSets, uintptr(d.Dev), uintptr(unsafe.Pointer(&ai)), uintptr(unsafe.Pointer(&out[0])))
+	r, _, _ := call(d.allocateDescriptorSets, uintptr(d.Dev), uintptr(unsafe.Pointer(&ai)), uintptr(unsafe.Pointer(&out[0])))
 	if res := Result(int32(r)); res != SUCCESS {
 		return nil, res
 	}
@@ -1234,7 +1210,7 @@ func (d *DeviceFuncs) UpdateDescriptorSets(writes []WriteDescriptorSet) {
 		}
 	}
 	defer p.Unpin()
-	syscall.SyscallN(d.updateDescriptorSets, uintptr(d.Dev), uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
+	call(d.updateDescriptorSets, uintptr(d.Dev), uintptr(len(writes)), uintptr(unsafe.Pointer(&writes[0])), 0, 0)
 }
 
 func (d *DeviceFuncs) CreatePipelineLayout(setLayouts []DescriptorSetLayout) (PipelineLayout, error) {
@@ -1252,7 +1228,7 @@ func (d *DeviceFuncs) CreatePipelineLayout(setLayouts []DescriptorSetLayout) (Pi
 	}
 	p.Pin(&ci)
 	var pl PipelineLayout
-	r, _, _ := syscall.SyscallN(d.createPipelineLayout, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&pl)))
+	r, _, _ := call(d.createPipelineLayout, uintptr(d.Dev), uintptr(unsafe.Pointer(&ci)), 0, uintptr(unsafe.Pointer(&pl)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1261,7 +1237,7 @@ func (d *DeviceFuncs) CreatePipelineLayout(setLayouts []DescriptorSetLayout) (Pi
 
 func (d *DeviceFuncs) DestroyPipelineLayout(pl PipelineLayout) {
 	if pl != 0 {
-		syscall.SyscallN(d.destroyPipelineLayout, uintptr(d.Dev), uintptr(pl), 0)
+		call(d.destroyPipelineLayout, uintptr(d.Dev), uintptr(pl), 0)
 	}
 }
 
@@ -1279,7 +1255,7 @@ func (d *DeviceFuncs) CreateRenderPass(ci *RenderPassCreateInfo) (RenderPass, er
 	}
 	defer p.Unpin()
 	var rp RenderPass
-	r, _, _ := syscall.SyscallN(d.createRenderPass, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&rp)))
+	r, _, _ := call(d.createRenderPass, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&rp)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1288,7 +1264,7 @@ func (d *DeviceFuncs) CreateRenderPass(ci *RenderPassCreateInfo) (RenderPass, er
 
 func (d *DeviceFuncs) DestroyRenderPass(rp RenderPass) {
 	if rp != 0 {
-		syscall.SyscallN(d.destroyRenderPass, uintptr(d.Dev), uintptr(rp), 0)
+		call(d.destroyRenderPass, uintptr(d.Dev), uintptr(rp), 0)
 	}
 }
 
@@ -1326,7 +1302,7 @@ func (d *DeviceFuncs) CreateGraphicsPipeline(ci *GraphicsPipelineCreateInfo, ext
 	}
 	defer p.Unpin()
 	var pipe Pipeline
-	r, _, _ := syscall.SyscallN(d.createGraphicsPipelines, uintptr(d.Dev), 0, 1, uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&pipe)))
+	r, _, _ := call(d.createGraphicsPipelines, uintptr(d.Dev), 0, 1, uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&pipe)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1335,7 +1311,7 @@ func (d *DeviceFuncs) CreateGraphicsPipeline(ci *GraphicsPipelineCreateInfo, ext
 
 func (d *DeviceFuncs) DestroyPipeline(pipe Pipeline) {
 	if pipe != 0 {
-		syscall.SyscallN(d.destroyPipeline, uintptr(d.Dev), uintptr(pipe), 0)
+		call(d.destroyPipeline, uintptr(d.Dev), uintptr(pipe), 0)
 	}
 }
 
@@ -1347,7 +1323,7 @@ func (d *DeviceFuncs) CreateFramebuffer(ci *FramebufferCreateInfo) (Framebuffer,
 	}
 	defer p.Unpin()
 	var fb Framebuffer
-	r, _, _ := syscall.SyscallN(d.createFramebuffer, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&fb)))
+	r, _, _ := call(d.createFramebuffer, uintptr(d.Dev), uintptr(unsafe.Pointer(ci)), 0, uintptr(unsafe.Pointer(&fb)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
@@ -1356,7 +1332,7 @@ func (d *DeviceFuncs) CreateFramebuffer(ci *FramebufferCreateInfo) (Framebuffer,
 
 func (d *DeviceFuncs) DestroyFramebuffer(fb Framebuffer) {
 	if fb != 0 {
-		syscall.SyscallN(d.destroyFramebuffer, uintptr(d.Dev), uintptr(fb), 0)
+		call(d.destroyFramebuffer, uintptr(d.Dev), uintptr(fb), 0)
 	}
 }
 
@@ -1364,7 +1340,7 @@ func (d *DeviceFuncs) WaitForPresentKHR(sc SwapchainKHR, presentID, timeoutNS ui
 	if d.pfnWaitForPresentKHR == 0 {
 		return Result(-13)
 	}
-	r, _, _ := syscall.SyscallN(d.pfnWaitForPresentKHR, uintptr(d.Dev), uintptr(sc), uintptr(presentID), uintptr(timeoutNS))
+	r, _, _ := call(d.pfnWaitForPresentKHR, uintptr(d.Dev), uintptr(sc), uintptr(presentID), uintptr(timeoutNS))
 	return Result(int32(r))
 }
 
@@ -1377,7 +1353,7 @@ func (d *DeviceFuncs) WaitForPresent2KHR(sc SwapchainKHR, presentID, timeoutNS u
 		PresentId: presentID,
 		Timeout:   timeoutNS,
 	}
-	r, _, _ := syscall.SyscallN(d.pfnWaitForPresent2KHR, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&info)))
+	r, _, _ := call(d.pfnWaitForPresent2KHR, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&info)))
 	return Result(int32(r))
 }
 
@@ -1385,7 +1361,7 @@ func (d *DeviceFuncs) SetSwapchainPresentTimingQueueSizeEXT(sc SwapchainKHR, siz
 	if d.pfnSetSwapchainPresentTimingQueueSizeEXT == 0 {
 		return fmt.Errorf("vkSetSwapchainPresentTimingQueueSizeEXT not available")
 	}
-	r, _, _ := syscall.SyscallN(d.pfnSetSwapchainPresentTimingQueueSizeEXT, uintptr(d.Dev), uintptr(sc), uintptr(size))
+	r, _, _ := call(d.pfnSetSwapchainPresentTimingQueueSizeEXT, uintptr(d.Dev), uintptr(sc), uintptr(size))
 	if res := Result(int32(r)); res != SUCCESS {
 		return res
 	}
@@ -1398,7 +1374,7 @@ func (d *DeviceFuncs) GetSwapchainTimingPropertiesEXT(sc SwapchainKHR) (Swapchai
 		return props, 0, fmt.Errorf("vkGetSwapchainTimingPropertiesEXT not available")
 	}
 	var counter uint64
-	r, _, _ := syscall.SyscallN(d.pfnGetSwapchainTimingPropertiesEXT, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&counter)))
+	r, _, _ := call(d.pfnGetSwapchainTimingPropertiesEXT, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&counter)))
 	if res := Result(int32(r)); res != SUCCESS && res != NOT_READY {
 		return props, 0, res
 	}
@@ -1411,7 +1387,7 @@ func (d *DeviceFuncs) GetSwapchainTimeDomainPropertiesEXT(sc SwapchainKHR) ([]ui
 	}
 	props := SwapchainTimeDomainPropertiesEXT{SType: STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT}
 	var counter uint64
-	r, _, _ := syscall.SyscallN(d.pfnGetSwapchainTimeDomainPropertiesEXT, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&counter)))
+	r, _, _ := call(d.pfnGetSwapchainTimeDomainPropertiesEXT, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&counter)))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, nil, 0, res
 	}
@@ -1427,7 +1403,7 @@ func (d *DeviceFuncs) GetSwapchainTimeDomainPropertiesEXT(sc SwapchainKHR) ([]ui
 	defer p.Unpin()
 	props.PTimeDomains = unsafe.Pointer(&domains[0])
 	props.PTimeDomainIds = unsafe.Pointer(&ids[0])
-	r, _, _ = syscall.SyscallN(d.pfnGetSwapchainTimeDomainPropertiesEXT, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&counter)))
+	r, _, _ = call(d.pfnGetSwapchainTimeDomainPropertiesEXT, uintptr(d.Dev), uintptr(sc), uintptr(unsafe.Pointer(&props)), uintptr(unsafe.Pointer(&counter)))
 	if res := Result(int32(r)); res != SUCCESS && res != INCOMPLETE {
 		return nil, nil, 0, res
 	}
@@ -1450,7 +1426,7 @@ func (d *DeviceFuncs) GetPastPresentationTimingEXT(info *PastPresentationTimingI
 		}
 	}
 	defer p.Unpin()
-	r, _, _ := syscall.SyscallN(d.pfnGetPastPresentationTimingEXT, uintptr(d.Dev), uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(props)))
+	r, _, _ := call(d.pfnGetPastPresentationTimingEXT, uintptr(d.Dev), uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(props)))
 	return Result(int32(r))
 }
 
@@ -1480,7 +1456,7 @@ func (d *DeviceFuncs) GetCalibratedTimestamps(useKHR bool, infos []CalibratedTim
 	}
 	defer p.Unpin()
 	var maxDev uint64
-	r, _, _ := syscall.SyscallN(fn, uintptr(d.Dev), uintptr(len(infos)), uintptr(unsafe.Pointer(&infos[0])), uintptr(unsafe.Pointer(&timestamps[0])), uintptr(unsafe.Pointer(&maxDev)))
+	r, _, _ := call(fn, uintptr(d.Dev), uintptr(len(infos)), uintptr(unsafe.Pointer(&infos[0])), uintptr(unsafe.Pointer(&timestamps[0])), uintptr(unsafe.Pointer(&maxDev)))
 	if res := Result(int32(r)); res != SUCCESS {
 		return 0, res
 	}
