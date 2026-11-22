@@ -1,5 +1,3 @@
-//go:build windows
-
 package capture
 
 import (
@@ -9,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/virgil724/capview/internal/win"
+	"github.com/virgil724/capview/internal/clock"
 )
 
 // StartSynthetic starts a lightweight test pattern generator that publishes
@@ -39,7 +37,7 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 		return nil, fmt.Errorf("unsupported synthetic format %q (expected NV12 or YUY2)", cfg.Format)
 	}
 	if freq <= 0 {
-		freq = win.QPCFrequency()
+		freq = clock.Freq()
 	}
 	mb := cfg.Mailbox
 	if mb == nil {
@@ -83,13 +81,13 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 			mb.Discard()
 			close(s.done)
 		})
-		startQPC := win.QPC()
+		startQPC := clock.Now()
 		var frameIdx uint64
 		const tickerW = 16
 		for !s.stop.Load() {
 			nextQPC := startQPC + int64(float64(frameIdx+1)*float64(freq)/fps)
 			for !s.stop.Load() {
-				now := win.QPC()
+				now := clock.Now()
 				remTicks := nextQPC - now
 				if remTicks <= 0 {
 					break
@@ -127,7 +125,7 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 						uvPlane[off+x] = 128
 					}
 				}
-				now := win.QPC()
+				now := clock.Now()
 				f = Frame{
 					FourCC:    "NV12",
 					Width:     w,
@@ -151,7 +149,7 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 						buf[off+x*2+3] = 128
 					}
 				}
-				now := win.QPC()
+				now := clock.Now()
 				f = Frame{
 					FourCC:    "YUY2",
 					Width:     w,

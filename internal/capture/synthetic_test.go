@@ -1,12 +1,10 @@
-//go:build windows
-
 package capture
 
 import (
 	"testing"
 	"time"
 
-	"github.com/virgil724/capview/internal/win"
+	"github.com/virgil724/capview/internal/clock"
 )
 
 func TestStartSyntheticNV12(t *testing.T) {
@@ -17,7 +15,7 @@ func TestStartSyntheticNV12(t *testing.T) {
 		FPS:     120,
 		Format:  "NV12",
 		Mailbox: mb,
-	}, win.QPCFrequency())
+	}, clock.Freq())
 	if err != nil {
 		t.Fatalf("StartSynthetic: %v", err)
 	}
