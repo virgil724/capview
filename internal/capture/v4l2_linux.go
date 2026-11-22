@@ -80,7 +80,7 @@ func Start(cfg Config, freq int64) (*Source, error) {
 		cfg.Mailbox.publish(fr)
 	}
 	src, err := v4l2.Start(v4l2.Config{
-		Device: device, Width: cfg.Width, Height: cfg.Height, FPS: cfg.FPS, Format: format, Buffers: 6,
+		Device: device, Width: cfg.Width, Height: cfg.Height, FPS: cfg.FPS, Format: format, Buffers: 6, SkipLuma: true,
 	}, clock.Now, freq, onFrame)
 	if err != nil {
 		return nil, err
