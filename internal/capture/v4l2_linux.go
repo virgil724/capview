@@ -39,16 +39,6 @@ func Start(cfg Config, freq int64) (*Source, error) {
 	if cfg.FPS <= 0 {
 		cfg.FPS = 60
 	}
-	format := strings.ToUpper(strings.TrimSpace(cfg.Format))
-	switch format {
-	case "", "AUTO":
-		format = "NV12"
-	case "YUY2":
-		format = "YUYV"
-	}
-	if format != "NV12" && format != "YUYV" {
-		return nil, fmt.Errorf("capture: format %q not supported (NV12 or YUY2)", cfg.Format)
-	}
 	device := cfg.Device
 	if device == "" || strings.EqualFold(device, "auto") {
 		devs, err := v4l2.ListDevices()
@@ -59,6 +49,17 @@ func Start(cfg Config, freq int64) (*Source, error) {
 			return nil, fmt.Errorf("capture: no V4L2 capture devices")
 		}
 		device = devs[0]
+	}
+	format := strings.ToUpper(strings.TrimSpace(cfg.Format))
+	switch format {
+	case "", "AUTO":
+		modes, _ := v4l2.ListModes(device)
+		format = pickAutoFormat(modes, cfg.Width, cfg.Height, cfg.FPS)
+	case "YUY2":
+		format = "YUYV"
+	}
+	if format != "NV12" && format != "YUYV" {
+		return nil, fmt.Errorf("capture: format %q not supported (auto, NV12 or YUY2)", cfg.Format)
 	}
 
 	s := &Source{done: make(chan struct{}), Mailbox: cfg.Mailbox}

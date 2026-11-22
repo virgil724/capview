@@ -22,7 +22,7 @@ func main() {
 	device := fs.String("device", "auto", "V4L2 device: /dev/videoN, its name, or auto")
 	size := fs.String("size", "1920x1080", "capture resolution WxH")
 	fps := fs.Float64("fps", 60, "frame rate")
-	format := fs.String("format", "NV12", "pixel format: NV12 or YUY2")
+	format := fs.String("format", "auto", "pixel format: auto (YUY2 when the device offers it at this size/rate, else NV12), NV12 or YUY2")
 	fullscreen := fs.Bool("fullscreen", true, "start fullscreen (F11/F/Alt+Enter toggles)")
 	vsync := fs.Bool("vsync", false, "FIFO present instead of IMMEDIATE/MAILBOX + tearing hint")
 	stats := fs.Bool("stats", true, "print 1-second latency stats")
