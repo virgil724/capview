@@ -14,10 +14,12 @@ import (
 )
 
 // Linux entry point (work in progress): Wayland + Vulkan viewer. Sources so
-// far: synthetic test pattern. V4L2 capture and ALSA audio come next.
+// V4L2 capture (zero-copy via caplat/capture/v4l2) or a synthetic test
+// pattern. ALSA audio comes next.
 func main() {
 	fs := flag.NewFlagSet("capview", flag.ExitOnError)
-	source := fs.String("source", "synthetic", "video source: synthetic (v4l2 not wired yet)")
+	source := fs.String("source", "v4l2", "video source: v4l2 or synthetic")
+	device := fs.String("device", "auto", "V4L2 device: /dev/videoN, its name, or auto")
 	size := fs.String("size", "1920x1080", "capture resolution WxH")
 	fps := fs.Float64("fps", 60, "frame rate")
 	format := fs.String("format", "NV12", "pixel format: NV12 or YUY2")
@@ -27,23 +29,25 @@ func main() {
 	duration := fs.Duration("duration", 0, "exit after this long (0 = until closed)")
 	_ = fs.Parse(os.Args[1:])
 
-	if err := run(*source, *size, *fps, *format, *fullscreen, *vsync, *stats, *duration); err != nil {
+	if err := run(*source, *device, *size, *fps, *format, *fullscreen, *vsync, *stats, *duration); err != nil {
 		fmt.Fprintln(os.Stderr, "capview:", err)
 		os.Exit(1)
 	}
 }
 
-func run(source, size string, fps float64, format string, fullscreen, vsync, stats bool, duration time.Duration) error {
+func run(source, device, size string, fps float64, format string, fullscreen, vsync, stats bool, duration time.Duration) error {
 	w, h, err := parseSize(size)
 	if err != nil {
 		return err
 	}
 	mb := capture.NewMailbox()
-	cfg := capture.Config{Width: w, Height: h, FPS: fps, Format: format, Mailbox: mb}
+	cfg := capture.Config{Device: device, Width: w, Height: h, FPS: fps, Format: format, Mailbox: mb}
 	var src *capture.Source
 	switch strings.ToLower(source) {
 	case "synthetic":
 		src, err = capture.StartSynthetic(cfg, clock.Freq())
+	case "v4l2":
+		src, err = capture.Start(cfg, clock.Freq())
 	default:
 		return fmt.Errorf("source %q not supported on Linux yet", source)
 	}
