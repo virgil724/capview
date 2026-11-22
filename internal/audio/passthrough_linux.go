@@ -2,7 +2,10 @@ package audio
 
 import (
 	"fmt"
+	"math"
+	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/virgil724/caplat/capture/alsa"
@@ -97,7 +100,11 @@ func Start(cfg Config) (*Passthrough, error) {
 	// (same as the WASAPI path).
 	p.ring = NewRing(pb.Rate*100/1000, pb.Rate*15/1000, pb.Rate*35/1000)
 
-	var stereo, resampled []float32
+	var (
+		stereo, resampled []float32
+		capPackets        atomic.Uint64
+		capPeak           atomic.Uint32 // float32 bits of max |sample| since last report
+	)
 	capt, err := alsa.Start(alsa.Config{
 		Device: alsa.PCMName(in), Rate: linuxRate, Channels: 2, Period: linuxPeriod, FallbackDefault: true,
 	}, clock.Now, clock.Freq(), func(pk alsa.Packet) {
@@ -125,6 +132,19 @@ func Start(cfg Config) (*Passthrough, error) {
 			resampled = ResampleLinear(src, p.InputRate, p.OutputRate, resampled)
 			src = resampled
 		}
+		peak := float32(0)
+		for _, v := range src {
+			if v < 0 {
+				v = -v
+			}
+			if v > peak {
+				peak = v
+			}
+		}
+		if peak > math.Float32frombits(capPeak.Load()) {
+			capPeak.Store(math.Float32bits(peak))
+		}
+		capPackets.Add(1)
 		p.ring.Write(src)
 	})
 	if err != nil {
@@ -136,6 +156,31 @@ func Start(cfg Config) (*Passthrough, error) {
 		p.InputName = capt.ActualDevice
 	}
 
+	debug := os.Getenv("CAPVIEW_AUDIO_DEBUG") != ""
+	fmt.Fprintf(os.Stderr, "audio: capture %d ch @ %d Hz period %v%s; playback %d ch @ %d Hz period %d frames buffer %d frames%s\n",
+		capt.Channels, capt.Rate, capt.Period, mixerNote(capt.SoftwareMixer), pb.Channels, pb.Rate, pb.PeriodFrames, pb.BufferFrames, mixerNote(pb.SoftwareMixer))
+	var writes, writeErrs atomic.Uint64
+	if debug {
+		go func() {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-p.done:
+					return
+				case <-t.C:
+					avail, over, under := p.ring.Stats()
+					pk := math.Float32frombits(capPeak.Swap(0))
+					db := -120.0
+					if pk > 0 {
+						db = 20 * math.Log10(float64(pk))
+					}
+					fmt.Fprintf(os.Stderr, "audio debug: capture packets %d peak %.1f dBFS | ring avail %d over %d under %d | playback writes %d errors %d | gain %.2f\n",
+						capPackets.Load(), db, avail, over, under, writes.Load(), writeErrs.Load(), p.gain())
+				}
+			}
+		}()
+	}
 	go func() {
 		defer close(p.done)
 		defer pb.Close()
@@ -149,20 +194,32 @@ func Start(cfg Config) (*Passthrough, error) {
 		_, _ = pb.WriteFrames(make([]float32, frames*2*2))
 		for !p.stop.Load() {
 			select {
-			case <-capt.Done():
+			case err := <-capt.Done():
+				fmt.Fprintf(os.Stderr, "capview: audio capture stopped: %v\n", err)
 				return
 			default:
 			}
 			if ok, err := pb.Wait(20); err != nil {
+				fmt.Fprintf(os.Stderr, "capview: audio playback wait failed: %v\n", err)
 				return
 			} else if !ok {
 				continue
 			}
 			p.ring.Read(buf, p.gain())
 			if _, err := pb.WriteFrames(buf); err != nil {
+				writeErrs.Add(1)
+				fmt.Fprintf(os.Stderr, "capview: audio playback write failed: %v\n", err)
 				return
 			}
+			writes.Add(1)
 		}
 	}()
 	return p, nil
+}
+
+func mixerNote(sw bool) string {
+	if sw {
+		return " (software mixer fallback)"
+	}
+	return ""
 }
