@@ -3,7 +3,9 @@
 package audio
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 
@@ -13,13 +15,25 @@ import (
 
 // ListEndpoints returns active audio capture and playback endpoint names.
 func ListEndpoints() (inputs, outputs []string, err error) {
+	in, out, err := ListEndpointInfos()
+	for _, e := range in {
+		inputs = append(inputs, e.Name)
+	}
+	for _, e := range out {
+		outputs = append(outputs, e.Name)
+	}
+	return inputs, outputs, err
+}
+
+// ListEndpointInfos returns active capture and playback endpoints with IDs.
+func ListEndpointInfos() (inputs, outputs []EndpointInfo, err error) {
 	err = withCOM(func() error {
 		inEps, e := win.AudioEndpoints(win.ECapture)
 		if e != nil {
 			return e
 		}
 		for _, ep := range inEps {
-			inputs = append(inputs, ep.Name)
+			inputs = append(inputs, EndpointInfo{ID: ep.ID, Name: ep.Name})
 			ep.Device.Release()
 		}
 		outEps, e := win.AudioEndpoints(win.ERender)
@@ -27,7 +41,7 @@ func ListEndpoints() (inputs, outputs []string, err error) {
 			return e
 		}
 		for _, ep := range outEps {
-			outputs = append(outputs, ep.Name)
+			outputs = append(outputs, EndpointInfo{ID: ep.ID, Name: ep.Name})
 			ep.Device.Release()
 		}
 		return nil
@@ -67,6 +81,11 @@ func Start(cfg Config) (*Passthrough, error) {
 	if err := <-ready; err != nil {
 		return nil, err
 	}
+	if cfg.MirrorID != "" {
+		if err := p.SetMirror(cfg.MirrorID); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: audio mirror disabled: %v\n", err)
+		}
+	}
 	return p, nil
 }
 
@@ -77,6 +96,7 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 		return fmt.Errorf("COM: %w", err)
 	}
 	defer win.COUninit()
+	defer p.SetMirror("") //nolint:errcheck // stopping never fails
 
 	// Pick capture endpoint.
 	inEps, err := win.AudioEndpoints(win.ECapture)
@@ -110,6 +130,7 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 	}
 	defer outEp.Device.Release()
 	p.OutputName = outEp.Name
+	p.OutputID = outEp.ID
 
 	// Initialize shared event-driven WASAPI clients (20 ms buffer each).
 	const bufHNS = 200_000
@@ -200,6 +221,11 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 					clear(decBuf)
 				} else {
 					decBuf = DecodeStereo(pk.Data, pk.Frames, inFmt, decBuf)
+				}
+				// Mirror tap: capture-rate, before the local resampler. Push
+				// never waits on the mirror thread.
+				if t := p.tap.Load(); t != nil {
+					t.Push(decBuf)
 				}
 				samples := ResampleLinear(decBuf, inFmt.Rate, outFmt.Rate, resBuf)
 				if inFmt.Rate != outFmt.Rate {
@@ -300,4 +326,163 @@ func pickEndpoint(eps []win.Endpoint, want, videoHint string) (win.Endpoint, boo
 		}
 	}
 	return out, chosen >= 0
+}
+
+// ErrMirrorIsMainOutput is returned when the mirror endpoint is the same
+// device as the main output.
+var ErrMirrorIsMainOutput = errors.New("mirror endpoint is the main output device")
+
+// SetMirror starts (or switches, or with id == "" stops) the mirror output
+// without restarting the main passthrough.
+func (p *Passthrough) SetMirror(id string) error {
+	p.mirMu.Lock()
+	defer p.mirMu.Unlock()
+	if id != "" && p.OutputID != "" && strings.EqualFold(id, p.OutputID) {
+		return ErrMirrorIsMainOutput // leave any running mirror untouched
+	}
+	if cur := p.mir; cur != nil {
+		running := true
+		select {
+		case <-cur.done:
+			running = false
+		default:
+		}
+		if running && id != "" && strings.EqualFold(cur.id, id) {
+			return nil
+		}
+		p.tap.CompareAndSwap(cur.tap, nil)
+		cur.stop.Store(true)
+		<-cur.done
+		p.mir = nil
+	}
+	if id == "" {
+		return nil
+	}
+	if p.InputRate <= 0 {
+		return errors.New("passthrough not running")
+	}
+	capF, targetF, maxF := MirrorRingFrames(p.InputRate)
+	st := &mirrorState{
+		id:   id,
+		tap:  newMirrorTap(NewRing(capF, targetF, maxF)),
+		done: make(chan struct{}),
+	}
+	ready := make(chan error, 1)
+	go func() {
+		defer close(st.done)
+		err := p.runMirror(st, targetF, ready)
+		p.tap.CompareAndSwap(st.tap, nil)
+		select {
+		case ready <- err: // failed before becoming ready
+		default:
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: audio mirror %q stopped: %v\n", st.name, err)
+			}
+		}
+		_, over, under := st.tap.ring.Stats()
+		fmt.Printf("audio mirror %q closed: overrun %d underrun %d contended %d pend_drop %d\n",
+			st.name, over, under, st.tap.contended.Load(), st.tap.pendDrops.Load())
+	}()
+	if err := <-ready; err != nil {
+		<-st.done
+		return err
+	}
+	p.mir = st
+	p.tap.Store(st.tap)
+	fmt.Printf("audio mirror: -> %q (%d Hz stereo float32, post-fader)\n", st.name, p.InputRate)
+	return nil
+}
+
+// runMirror renders the mirror ring to its own WASAPI endpoint on a dedicated
+// COM thread. Any device error (notably AUDCLNT_E_DEVICE_INVALIDATED on
+// unplug) ends only this goroutine; the main passthrough is unaffected.
+func (p *Passthrough) runMirror(st *mirrorState, primeFrames int, ready chan<- error) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := win.COInitMultithreaded(); err != nil {
+		return fmt.Errorf("COM: %w", err)
+	}
+	defer win.COUninit()
+
+	ep, err := win.AudioEndpointByID(st.id)
+	if err != nil {
+		return fmt.Errorf("open mirror endpoint: %w", err)
+	}
+	defer ep.Device.Release()
+	st.name = ep.Name
+
+	const bufHNS = 200_000
+	cl, err := win.NewAudioClientStereoFloat(ep.Device, bufHNS, p.InputRate)
+	if err != nil {
+		return fmt.Errorf("open mirror output %q: %w", ep.Name, err)
+	}
+	defer cl.Close()
+	rc, err := cl.Service(&win.IID_IAudioRenderClient)
+	if err != nil {
+		return fmt.Errorf("mirror render service: %w", err)
+	}
+	defer rc.Release()
+	f := toFormat(cl.Format)
+
+	if buf, err := win.RenderBuffer(rc, cl.Frames, f.BlockAlign); err == nil {
+		clear(buf)
+		win.RenderRelease(rc, cl.Frames)
+	}
+	if err := cl.Start(); err != nil {
+		return fmt.Errorf("start mirror output: %w", err)
+	}
+	defer cl.Stop()
+	ready <- nil
+
+	ring := st.tap.ring
+	var out []float32
+	primed := false
+	for !st.stop.Load() {
+		if _, err := windows.WaitForSingleObject(cl.Event, 50); err != nil {
+			return fmt.Errorf("wait mirror event: %w", err)
+		}
+		pad, err := cl.Padding()
+		if err != nil {
+			return mirrorErr(err)
+		}
+		avail := cl.Frames - pad
+		if avail <= 0 {
+			continue
+		}
+		buf, err := win.RenderBuffer(rc, avail, f.BlockAlign)
+		if err != nil {
+			return mirrorErr(err)
+		}
+		need := avail * 2
+		if cap(out) < need {
+			out = make([]float32, need)
+		}
+		out = out[:need]
+		if !primed {
+			// (Re)build ~target ms of cushion before draining, so jitter
+			// does not turn into a stream of tiny underruns.
+			if n, _, _ := ring.Stats(); n >= primeFrames {
+				primed = true
+			}
+		}
+		if primed {
+			if ring.Read(out, p.mirrorGain()) < avail {
+				primed = false
+			}
+		} else {
+			clear(out)
+		}
+		EncodeStereo(out, avail, f, buf)
+		if err := win.RenderRelease(rc, avail); err != nil {
+			return mirrorErr(err)
+		}
+	}
+	return nil
+}
+
+func mirrorErr(err error) error {
+	if errors.Is(err, win.AUDCLNT_E_DEVICE_INVALIDATED) {
+		return fmt.Errorf("device invalidated (unplugged or disabled): %w", err)
+	}
+	return err
 }

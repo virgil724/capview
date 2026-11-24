@@ -54,13 +54,30 @@ func NewRing(capFrames, targetFrames, maxFrames int) *Ring {
 
 // Write appends interleaved stereo float32 frames (len(lr) == frames*2).
 func (r *Ring) Write(lr []float32) {
-	frames := len(lr) / 2
-	if frames == 0 {
+	if len(lr)/2 == 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.writeLocked(lr)
+}
 
+// TryWrite is Write without waiting: it returns false (writing nothing) if
+// the reader currently holds the lock.
+func (r *Ring) TryWrite(lr []float32) bool {
+	if len(lr)/2 == 0 {
+		return true
+	}
+	if !r.mu.TryLock() {
+		return false
+	}
+	defer r.mu.Unlock()
+	r.writeLocked(lr)
+	return true
+}
+
+func (r *Ring) writeLocked(lr []float32) {
+	frames := len(lr) / 2
 	// If incoming data would exceed maxFrames, drop oldest frames down to targetFrames.
 	if r.avail+frames > r.maxFrames {
 		drop := r.avail + frames - r.targetFrames

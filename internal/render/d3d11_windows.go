@@ -327,6 +327,10 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		tracker  = stats.New(120, cfg.Freq)
 	)
 
+	if cfg.PrintStats {
+		defer func() { fmt.Println(tracker.RunSummary()) }()
+	}
+
 	statsTicker := time.NewTicker(time.Second)
 	defer statsTicker.Stop()
 	pumpTicker := time.NewTicker(8 * time.Millisecond)
