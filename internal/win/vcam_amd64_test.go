@@ -39,3 +39,20 @@ func TestGetFileVersionKernel32(t *testing.T) {
 		t.Fatalf("expected non-zero major version for kernel32.dll, got %+v", v)
 	}
 }
+
+func TestRtlOSVersionInfoSizeAndQuery(t *testing.T) {
+	if got := unsafe.Sizeof(rtlOSVersionInfoW{}); got != 276 {
+		t.Fatalf("sizeof(rtlOSVersionInfoW) = %d, want 276", got)
+	}
+	major, _, build, err := WindowsVersion()
+	if err != nil {
+		t.Fatalf("WindowsVersion failed: %v", err)
+	}
+	if major < 10 || build < 10240 {
+		t.Fatalf("unexpected Windows version: major=%d build=%d", major, build)
+	}
+	b2, err := WindowsBuildNumber()
+	if err != nil || b2 != build {
+		t.Fatalf("WindowsBuildNumber() = %d, %v; want %d", b2, err, build)
+	}
+}

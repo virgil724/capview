@@ -3,10 +3,14 @@
 package vcam
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/win"
 	"golang.org/x/sys/windows"
 )
@@ -107,6 +111,162 @@ func TestCreateFileBackedMappingWhileMapped(t *testing.T) {
 	}
 	windows.CloseHandle(mh2)
 	windows.CloseHandle(fh2)
+}
+
+func TestDShowControllerLifecycle(t *testing.T) {
+	tap := capture.NewTap()
+	ctrl, err := Start(tap, Options{
+		Backend: BackendDShow,
+		ShmMode: "local",
+		FPS:     60,
+	})
+	if err != nil {
+		t.Fatalf("Start(BackendDShow): %v", err)
+	}
+
+	if st := ctrl.Stats(); st.Backend != BackendDShow {
+		ctrl.Stop()
+		t.Fatalf("Stats().Backend = %q, want %q", st.Backend, BackendDShow)
+	}
+	if ctrl.SymbolicLink() != "" {
+		ctrl.Stop()
+		t.Fatalf("DShow mode must not create MF symbolic link, got %q", ctrl.SymbolicLink())
+	}
+	if !tap.Enabled() {
+		ctrl.Stop()
+		t.Fatal("expected capture tap to be enabled")
+	}
+
+	// Open a separate read-only observer mapping to inspect Active=1 -> Active=0 across Stop().
+	obsMap, err := win.OpenNamedFileMapping(ShmLocalName)
+	if err != nil {
+		ctrl.Stop()
+		t.Fatalf("OpenNamedFileMapping(%s): %v", ShmLocalName, err)
+	}
+	defer windows.CloseHandle(obsMap)
+	obsAddr, obsBuf, err := win.MapViewReadWrite(obsMap, uintptr(ShmHeaderSize))
+	if err != nil {
+		ctrl.Stop()
+		t.Fatalf("MapViewReadWrite observer: %v", err)
+	}
+	defer win.UnmapView(obsAddr)
+	obsHdr := headerFromBytes(obsBuf)
+
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 1 {
+		ctrl.Stop()
+		t.Fatalf("SHM Active after Start = %d, want 1", got)
+	}
+
+	// Push frames through capture.Tap and verify SHM writer receives them.
+	const w, h = 1280, 720
+	yPlane := make([]byte, w*h)
+	uvPlane := make([]byte, w*(h/2))
+	for i := range yPlane {
+		yPlane[i] = 172
+	}
+	for i := range uvPlane {
+		uvPlane[i] = 128
+	}
+
+	for i := 0; i < 5; i++ {
+		tap.WriteFrame(capture.Frame{
+			Width:     w,
+			Height:    h,
+			FourCC:    "NV12",
+			Plane0:    yPlane,
+			Stride0:   w,
+			Plane1:    uvPlane,
+			Stride1:   w,
+			ArriveQPC: int64(i+1) * 166667,
+		})
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for ctrl.Stats().FramesWritten == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if ctrl.Stats().FramesWritten == 0 {
+		ctrl.Stop()
+		t.Fatal("expected DShow controller to write frames to SHM")
+	}
+
+	// Disable -> tap disabled, SHM Active transitions to 0 without touching MF.
+	ctrl.Stop()
+	if tap.Enabled() {
+		t.Fatal("expected capture tap to be disabled after Stop")
+	}
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 0 {
+		t.Fatalf("SHM Active after Stop = %d, want 0 (triggers DShow placeholder)", got)
+	}
+}
+
+func TestDShowLiveShmEndToEnd(t *testing.T) {
+	dllPath, err := filepath.Abs(filepath.Join("..", "..", "vcam", "dll", "build", "x64", "capview_vcam.dll"))
+	if err != nil {
+		t.Skip(err)
+	}
+	exePath, err := filepath.Abs(filepath.Join("..", "..", "vcam", "dll", "build", "x64", "vcam_loopback_test.exe"))
+	if err != nil {
+		t.Skip(err)
+	}
+	if _, err := os.Stat(dllPath); err != nil {
+		t.Skipf("capview_vcam.dll not built yet (%s); skipping live DirectShow loopback", dllPath)
+	}
+	if _, err := os.Stat(exePath); err != nil {
+		t.Skipf("vcam_loopback_test.exe not built yet (%s); skipping live DirectShow loopback", exePath)
+	}
+
+	w, err := OpenShmWriter("local", 60)
+	if err != nil {
+		t.Fatalf("OpenShmWriter(local): %v", err)
+	}
+	const width, height = 1280, 720
+	frame := make([]byte, width*height*3/2)
+	for i := 0; i < width*height; i++ {
+		frame[i] = 172
+	}
+	for i := width * height; i < len(frame); i++ {
+		frame[i] = 128
+	}
+
+	stopPump := make(chan struct{})
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+		tick := time.NewTicker(16 * time.Millisecond)
+		defer tick.Stop()
+		var n int64
+		for {
+			select {
+			case <-stopPump:
+				return
+			case <-tick.C:
+				n++
+				_ = w.WriteNV12(frame, width, height, n*166667)
+			}
+		}
+	}()
+	// Seed first frame before launching consumer.
+	_ = w.WriteNV12(frame, width, height, 166667)
+
+	cmdLive := exec.Command(exePath, "--dll", dllPath, "--dshow-live", "--live-luma", "172", "--frames", "6")
+	outLive, errLive := cmdLive.CombinedOutput()
+
+	close(stopPump)
+	<-pumpDone
+	w.Close()
+
+	if errLive != nil {
+		t.Fatalf("DirectShow live SHM test failed: %v\n%s", errLive, string(outLive))
+	}
+
+	// After ShmWriter.Close() (Active=0), DirectShow filter must immediately fall back to placeholder.
+	cmdPh := exec.Command(exePath, "--dll", dllPath, "--dshow-inproc", "--frames", "5")
+	outPh, errPh := cmdPh.CombinedOutput()
+	if errPh != nil {
+		t.Fatalf("DirectShow placeholder fallback test failed: %v\n%s", errPh, string(outPh))
+	}
 }
 
 func BenchmarkShmWriteNV12_1080p(b *testing.B) {

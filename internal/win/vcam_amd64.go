@@ -17,9 +17,11 @@ var (
 	modAdvapi32      = windows.NewLazySystemDLL("advapi32.dll")
 	modShell32       = windows.NewLazySystemDLL("shell32.dll")
 	modVersion       = windows.NewLazySystemDLL("version.dll")
+	modNtdll         = windows.NewLazySystemDLL("ntdll.dll")
 
 	procMFCreateVirtualCamera          = modMFSensorGroup.NewProc("MFCreateVirtualCamera")
 	procMFIsVirtualCameraTypeSupported = modMFSensorGroup.NewProc("MFIsVirtualCameraTypeSupported")
+	procRtlGetVersion                  = modNtdll.NewProc("RtlGetVersion")
 
 	procConvertStringSDToSDW     = modAdvapi32.NewProc("ConvertStringSecurityDescriptorToSecurityDescriptorW")
 	procGetSecurityDescriptorDacl = modAdvapi32.NewProc("GetSecurityDescriptorDacl")
@@ -621,4 +623,35 @@ func GetFileVersion(path string) (FileVersion, error) {
 		Patch: uint16(info.FileVersionLS >> 16),
 		Build: uint16(info.FileVersionLS & 0xFFFF),
 	}, nil
+}
+
+// rtlOSVersionInfoW matches RTL_OSVERSIONINFOW (276 bytes).
+type rtlOSVersionInfoW struct {
+	OSVersionInfoSize uint32
+	MajorVersion      uint32
+	MinorVersion      uint32
+	BuildNumber       uint32
+	PlatformID        uint32
+	CSDVersion        [128]uint16
+}
+
+// WindowsVersion returns the true Windows major, minor, and build numbers via
+// ntdll!RtlGetVersion (unaffected by GetVersionEx manifest shimming).
+func WindowsVersion() (major, minor, build uint32, err error) {
+	if err := procRtlGetVersion.Find(); err != nil {
+		return 0, 0, 0, err
+	}
+	var info rtlOSVersionInfoW
+	info.OSVersionInfoSize = uint32(unsafe.Sizeof(info))
+	r, _, _ := procRtlGetVersion.Call(uintptr(unsafe.Pointer(&info)))
+	if r != 0 {
+		return 0, 0, 0, fmt.Errorf("RtlGetVersion: NTSTATUS 0x%08x", uint32(r))
+	}
+	return info.MajorVersion, info.MinorVersion, info.BuildNumber, nil
+}
+
+// WindowsBuildNumber returns the true Windows OS build number via RtlGetVersion.
+func WindowsBuildNumber() (uint32, error) {
+	_, _, build, err := WindowsVersion()
+	return build, err
 }
