@@ -90,6 +90,13 @@ type appHost struct {
 	vid     *capture.Source
 	aud     *audio.Passthrough
 
+	// Spout2 output (nil when off): a capture fan-out tap feeding a sender
+	// thread with its own D3D11 device.
+	spoutName  string
+	printStats bool
+	spoutTap   *capture.RawTap
+	spout      *render.SpoutOutput
+
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
 }
@@ -166,6 +173,63 @@ func (h *appHost) stopAudio() {
 		<-h.aud.Done()
 		h.aud = nil
 	}
+}
+
+// startSpout attaches a tap to the capture fan-out and starts the sender.
+// Callers hold h.mu.
+func (h *appHost) startSpout() error {
+	if h.spoutRunning() {
+		return nil
+	}
+	h.stopSpout() // clear a sender that died on its own
+	tap := capture.NewRawTap()
+	out, err := render.StartSpout(h.spoutName, tap, h.freq, h.printStats)
+	if err != nil {
+		return err
+	}
+	tap.SetEnabled(true)
+	h.mailbox.AddSink(tap)
+	h.spoutTap, h.spout = tap, out
+	return nil
+}
+
+// stopSpout detaches the tap and unregisters the sender. Callers hold h.mu.
+func (h *appHost) stopSpout() {
+	if h.spout == nil {
+		return
+	}
+	h.mailbox.RemoveSink(h.spoutTap)
+	h.spoutTap.SetEnabled(false)
+	h.spout.Stop()
+	h.spout, h.spoutTap = nil, nil
+}
+
+func (h *appHost) spoutRunning() bool {
+	if h.spout == nil {
+		return false
+	}
+	select {
+	case <-h.spout.Done():
+		return false
+	default:
+		return true
+	}
+}
+
+func (h *appHost) toggleSpout() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.spoutRunning() {
+		h.stopSpout()
+		h.cfg.SpoutEnabled = false
+	} else {
+		if err := h.startSpout(); err != nil {
+			win.ShowErrorBox("capview", fmt.Sprintf("Spout output failed:\n%v", err))
+			return
+		}
+		h.cfg.SpoutEnabled = true
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
 }
 
 func (h *appHost) ModeLabel() string {
@@ -306,6 +370,11 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 			Checked:  muted,
 			Disabled: h.aud == nil,
 		},
+		{
+			ID:      addAction(func() (bool, bool, bool) { h.toggleSpout(); return false, false, false }),
+			Label:   "Spout Output",
+			Checked: h.spoutRunning(),
+		},
 		{Separator: true},
 		{
 			ID:    addAction(func() (bool, bool, bool) { return false, false, true }),
@@ -396,6 +465,8 @@ func runView(args []string) error {
 	source := fs.String("source", "mf", "video source: mf or synthetic")
 	vkInfo := fs.Bool("vkinfo", false, "print Vulkan device/extension/present-mode capabilities and exit")
 	duration := fs.Duration("duration", 0, "optional run duration before clean exit (e.g. 20s)")
+	spoutOn := fs.Bool("spout", cfg.SpoutEnabled, "publish the video as a Spout2 sender (e.g. OBS Spout2 Capture)")
+	spoutName := fs.String("spout-name", "capview", "Spout2 sender name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -453,6 +524,9 @@ func runView(args []string) error {
 	if setFlags["volume"] {
 		cfg.Volume = float32(*volume)
 	}
+	if setFlags["spout"] {
+		cfg.SpoutEnabled = *spoutOn
+	}
 
 	if srcKind == "synthetic" {
 		if !setFlags["size"] {
@@ -471,6 +545,9 @@ func runView(args []string) error {
 		cfgPath: cfgPath,
 		freq:    win.QPCFrequency(),
 		mailbox: capture.NewMailbox(),
+
+		spoutName:  *spoutName,
+		printStats: *printStats,
 	}
 	if err := host.startVideo(srcKind); err != nil {
 		return err
@@ -481,6 +558,19 @@ func runView(args []string) error {
 		host.startAudio()
 		defer host.stopAudio()
 	}
+
+	if cfg.SpoutEnabled {
+		host.mu.Lock()
+		if err := host.startSpout(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: Spout output disabled: %v\n", err)
+		}
+		host.mu.Unlock()
+	}
+	defer func() {
+		host.mu.Lock()
+		host.stopSpout()
+		host.mu.Unlock()
+	}()
 
 	fmt.Println("hotkeys: [Right-Click] menu | [F11 / F / Alt+Enter] fullscreen | [V] toggle VRR/VSync | [M] mute | [Up/Down/Wheel] volume | [ESC / Q] quit")
 

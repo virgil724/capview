@@ -26,6 +26,8 @@ type Config struct {
 	WinY          int32   `json:"win_y,omitempty"`
 	WinW          int32   `json:"win_w,omitempty"`
 	WinH          int32   `json:"win_h,omitempty"`
+	// SpoutEnabled publishes the capture as a Spout2 sender (Windows).
+	SpoutEnabled bool `json:"spout_enabled"`
 }
 
 // Default returns sensible defaults for first launch.

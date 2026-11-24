@@ -15,6 +15,7 @@ All notable changes to `capview` are documented in this file.
   - Latency note: compositors without tearing control (e.g. niri) add one repaint (~16–35 ms at 60 Hz); on compositors with tearing control Mesa offers `IMMEDIATE` and capview uses it.
 - **Vulkan renderer on Windows** (`-renderer vulkan`, opt-in; D3D11 stays the default). On an RX 9070 XT it reaches Independent Flip with tearing at +0.26 ms p50 vs D3D11; NVIDIA not yet validated.
 - `-source synthetic` test pattern and `-duration` for repeatable measurements.
+- **Spout2 output** for OBS (Windows): right-click **Spout Output** / `-spout` / `spout_enabled`. Pure-Go Spout 2.007-compatible sender on its own D3D11 device, fed by a new capture fan-out (`Mailbox.AddSink`, independent drop-oldest taps). `tools/spoutcheck` verifies a sender without OBS.
 
 ## [0.1.1] - 2026-11-21
 
