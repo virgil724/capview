@@ -1,0 +1,41 @@
+#include <winresrc.h>
+
+#ifndef CAPVIEW_VCAM_VER_CSV
+#define CAPVIEW_VCAM_VER_CSV 1,0,0,0
+#endif
+
+#ifndef CAPVIEW_VCAM_VER_STR
+#define CAPVIEW_VCAM_VER_STR "1.0.0.0"
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION CAPVIEW_VCAM_VER_CSV
+PRODUCTVERSION CAPVIEW_VCAM_VER_CSV
+FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+FILEFLAGS 0x1L
+#else
+FILEFLAGS 0x0L
+#endif
+FILEOS 0x40004L
+FILETYPE 0x2L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "capview"
+            VALUE "FileDescription", "capview Windows 11 Virtual Camera COM Media Source"
+            VALUE "FileVersion", CAPVIEW_VCAM_VER_STR
+            VALUE "InternalName", "capview_vcam.dll"
+            VALUE "OriginalFilename", "capview_vcam.dll"
+            VALUE "ProductName", "capview"
+            VALUE "ProductVersion", CAPVIEW_VCAM_VER_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
