@@ -1,11 +1,11 @@
 #include <winresrc.h>
 
 #ifndef CAPVIEW_VCAM_VER_CSV
-#define CAPVIEW_VCAM_VER_CSV 1,0,0,0
+#define CAPVIEW_VCAM_VER_CSV 1,1,0,0
 #endif
 
 #ifndef CAPVIEW_VCAM_VER_STR
-#define CAPVIEW_VCAM_VER_STR "1.0.0.0"
+#define CAPVIEW_VCAM_VER_STR "1.1.0.0"
 #endif
 
 VS_VERSION_INFO VERSIONINFO
@@ -26,7 +26,7 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName", "capview"
-            VALUE "FileDescription", "capview Windows 11 Virtual Camera COM Media Source"
+            VALUE "FileDescription", "capview Virtual Camera COM Source (Media Foundation & DirectShow)"
             VALUE "FileVersion", CAPVIEW_VCAM_VER_STR
             VALUE "InternalName", "capview_vcam.dll"
             VALUE "OriginalFilename", "capview_vcam.dll"

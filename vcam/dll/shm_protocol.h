@@ -4,11 +4,19 @@
 #include <cstdint>
 #include <guiddef.h>
 
-// COM CLSID of the capview virtual camera media source:
+// COM CLSID of the capview Media Foundation virtual camera media source:
 // {7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A03}
 static constexpr GUID CLSID_CapviewVirtualCam = {
     0x7e4b8a12, 0x3d5c, 0x4f91, {0xb2, 0xa7, 0x9c, 0x6e, 0x1d, 0x4f, 0x8a, 0x03}};
 static constexpr wchar_t CAPVIEW_VCAM_CLSID_STR[] = L"{7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A03}";
+
+// COM CLSID of the capview DirectShow virtual camera source filter (Windows 10):
+// {7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A04}
+static constexpr GUID CLSID_CapviewVirtualCamDShow = {
+    0x7e4b8a12, 0x3d5c, 0x4f91, {0xb2, 0xa7, 0x9c, 0x6e, 0x1d, 0x4f, 0x8a, 0x04}};
+static constexpr wchar_t CAPVIEW_VCAM_DSHOW_CLSID_STR[] = L"{7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A04}";
+
+static constexpr wchar_t CAPVIEW_VCAM_FRIENDLY_NAME[] = L"capview Virtual Camera";
 
 static constexpr wchar_t CAPVIEW_SHM_GLOBAL_NAME[] = L"Global\\CapviewVirtualCam_Shm";
 static constexpr wchar_t CAPVIEW_SHM_LOCAL_NAME[] = L"Local\\CapviewVirtualCam_Shm";

@@ -168,6 +168,29 @@ bool ShmReader::EnsureAttached() {
     if (m_filePathOverride.empty()) {
         mapH = OpenFileMappingW(FILE_MAP_READ, FALSE, CAPVIEW_SHM_GLOBAL_NAME);
     }
+    if (!mapH && m_filePathOverride.empty()) {
+        // Prefer an active Local\ mapping if present (used by same-session tests),
+        // otherwise attach to the standard ProgramData file-backed SHM.
+        HANDLE localMap = OpenFileMappingW(FILE_MAP_READ, FALSE, CAPVIEW_SHM_LOCAL_NAME);
+        if (localMap) {
+            const void* localView = MapViewOfFile(localMap, FILE_MAP_READ, 0, 0, CAPVIEW_SHM_HEADER_SIZE);
+            bool localActive = false;
+            if (localView) {
+                const auto* lh = static_cast<const CapviewShmHeader*>(localView);
+                if (lh->magic == CAPVIEW_SHM_MAGIC && lh->version == CAPVIEW_SHM_VERSION &&
+                    lh->slotCount == CAPVIEW_SHM_SLOT_COUNT && lh->slotStride == CAPVIEW_SHM_SLOT_STRIDE &&
+                    std::atomic_ref<const uint32_t>(lh->active).load(std::memory_order_acquire) != 0) {
+                    localActive = true;
+                }
+                UnmapViewOfFile(localView);
+            }
+            if (localActive) {
+                mapH = localMap;
+            } else {
+                CloseHandle(localMap);
+            }
+        }
+    }
     if (!mapH) {
         const wchar_t* shmPath = m_filePathOverride.empty() ? CAPVIEW_SHM_FILE_PATH : m_filePathOverride.c_str();
         fileH = CreateFileW(

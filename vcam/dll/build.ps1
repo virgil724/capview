@@ -2,7 +2,7 @@
 param(
     [ValidateSet("x64")]
     [string]$Arch = "x64",
-    [string]$Version = "1.0.0.0"
+    [string]$Version = "1.1.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,16 +39,16 @@ if errorlevel 1 exit /b 1
 rc.exe /nologo /dCAPVIEW_VCAM_VER_CSV=$verCsv /dCAPVIEW_VCAM_VER_STR="\"$Version\"" /fo "$outDir\version.res" "$srcDir\version.rc"
 if errorlevel 1 exit /b 1
 cl.exe /nologo /std:c++20 /O2 /EHsc /W4 /DUNICODE /D_UNICODE /LD ^
-  "$srcDir\dllmain.cpp" "$srcDir\vcam_source.cpp" "$srcDir\shm_reader.cpp" "$srcDir\placeholder.cpp" ^
+  "$srcDir\dllmain.cpp" "$srcDir\vcam_source.cpp" "$srcDir\dshow_filter.cpp" "$srcDir\shm_reader.cpp" "$srcDir\placeholder.cpp" ^
   "$outDir\version.res" ^
   /Fe:"$outDir\capview_vcam.dll" /Fo:"$outDir\\" ^
   /link /DEF:"$srcDir\capview_vcam.def" ^
-  mfplat.lib mf.lib mfuuid.lib ole32.lib advapi32.lib winmm.lib
+  mfplat.lib mf.lib mfuuid.lib strmiids.lib ole32.lib advapi32.lib winmm.lib
 if errorlevel 1 exit /b 1
 cl.exe /nologo /std:c++20 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
   "$srcDir\vcam_loopback_test.cpp" "$srcDir\vcam_source.cpp" "$srcDir\shm_reader.cpp" "$srcDir\placeholder.cpp" ^
   /Fe:"$outDir\vcam_loopback_test.exe" /Fo:"$outDir\\" ^
-  /link mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib ole32.lib advapi32.lib winmm.lib
+  /link mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib strmiids.lib ole32.lib oleaut32.lib advapi32.lib winmm.lib
 if errorlevel 1 exit /b 1
 "@
 

@@ -2,6 +2,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <dshow.h>
+#include <ks.h>
+#include <ksmedia.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -13,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -26,6 +30,28 @@ std::atomic<long> g_comObjectCount{0};
 namespace {
 
 using FnDllGetClassObject = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, LPVOID*);
+using FnDllCanUnloadNow = HRESULT(STDAPICALLTYPE*)();
+
+constexpr GUID kSubtypeNV12 = {
+    0x3231564E, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71}};
+
+void FreeMT(AM_MEDIA_TYPE& mt) {
+    if (mt.cbFormat && mt.pbFormat) {
+        CoTaskMemFree(mt.pbFormat);
+        mt.cbFormat = 0;
+        mt.pbFormat = nullptr;
+    }
+    if (mt.pUnk) {
+        mt.pUnk->Release();
+        mt.pUnk = nullptr;
+    }
+}
+
+void DeleteMT(AM_MEDIA_TYPE* pmt) {
+    if (!pmt) return;
+    FreeMT(*pmt);
+    CoTaskMemFree(pmt);
+}
 
 double Percentile(std::vector<double> v, double p) {
     if (v.empty()) return 0.0;
@@ -96,6 +122,688 @@ bool VerifyNV12PlaceholderPixels(const uint8_t* yPlane, int yStride, int w, int 
     }
     std::printf("OK [%s]: cornerY=%u, maxWordY=%u, brightPx=%d\n", label, cornerY, maxWordY, brightCount);
     return true;
+}
+
+bool VerifyYUY2PlaceholderPixels(const uint8_t* data, int w, int h, const char* label) {
+    const int stride = w * 2;
+    uint8_t cornerY = data[static_cast<size_t>(8) * stride + 8 * 2];
+    if (cornerY < 16 || cornerY > 45) {
+        std::printf("FAIL [%s]: corner Y=%u outside [16..45]\n", label, cornerY);
+        return false;
+    }
+    uint8_t maxWordY = 0;
+    int brightCount = 0;
+    const int y0 = static_cast<int>(h * 0.34);
+    const int y1 = static_cast<int>(h * 0.56);
+    const int x0 = static_cast<int>(w * 0.25);
+    const int x1 = static_cast<int>(w * 0.75);
+    for (int y = y0; y < y1; ++y) {
+        const uint8_t* row = data + static_cast<size_t>(y) * stride;
+        for (int x = x0; x < x1; ++x) {
+            uint8_t yv = row[static_cast<size_t>(x) * 2];
+            if (yv > maxWordY) maxWordY = yv;
+            if (yv >= 190) ++brightCount;
+        }
+    }
+    if (maxWordY < 200 || brightCount < 100) {
+        std::printf("FAIL [%s]: YUY2 wordmark missing/dim (maxY=%u, brightPx=%d)\n", label, maxWordY, brightCount);
+        return false;
+    }
+    std::printf("OK [%s]: cornerY=%u, maxWordY=%u, brightPx=%d\n", label, cornerY, maxWordY, brightCount);
+    return true;
+}
+
+bool VerifyRGB24PlaceholderBottomUp(const uint8_t* data, int w, int h, const char* label) {
+    const int stride = ((w * 3) + 3) & ~3;
+    auto pxAtTopDown = [&](int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) {
+        // Bottom-up DIB: visual row y is stored at buffer row (h - 1 - y).
+        const int bufY = h - 1 - y;
+        const uint8_t* row = data + static_cast<size_t>(bufY) * stride;
+        b = row[static_cast<size_t>(x) * 3 + 0];
+        g = row[static_cast<size_t>(x) * 3 + 1];
+        r = row[static_cast<size_t>(x) * 3 + 2];
+    };
+
+    uint8_t cr = 0, cg = 0, cb = 0;
+    pxAtTopDown(8, 8, cr, cg, cb);
+    if (cr > 45 || cg > 50 || cb > 60) {
+        std::printf("FAIL [%s]: corner RGB=(%u,%u,%u) too bright for dark slate\n", label, cr, cg, cb);
+        return false;
+    }
+
+    // Wordmark sits in upper-middle (visual y in [0.34*h, 0.56*h]).
+    int brightWordPx = 0;
+    for (int y = static_cast<int>(h * 0.34); y < static_cast<int>(h * 0.56); ++y) {
+        for (int x = static_cast<int>(w * 0.25); x < static_cast<int>(w * 0.75); ++x) {
+            uint8_t r, g, b;
+            pxAtTopDown(x, y, r, g, b);
+            if (r >= 200 && g >= 200 && b >= 200) ++brightWordPx;
+        }
+    }
+
+    // Cyan divider bar (#38BDF8 -> B >> R) sits BELOW vertical center (visual y in [0.51*h, 0.60*h]).
+    // Checking it appears at visual y > 0.50*h (and NOT mirrored at y < 0.49*h) proves exact bottom-up orientation!
+    int cyanBelowCenter = 0;
+    for (int y = static_cast<int>(h * 0.51); y < static_cast<int>(h * 0.60); ++y) {
+        for (int x = static_cast<int>(w * 0.42); x < static_cast<int>(w * 0.58); ++x) {
+            uint8_t r, g, b;
+            pxAtTopDown(x, y, r, g, b);
+            if (b > 180 && g > 140 && b > r + 100) ++cyanBelowCenter;
+        }
+    }
+    int cyanAboveCenter = 0;
+    for (int y = static_cast<int>(h * 0.40); y < static_cast<int>(h * 0.49); ++y) {
+        for (int x = static_cast<int>(w * 0.42); x < static_cast<int>(w * 0.58); ++x) {
+            uint8_t r, g, b;
+            pxAtTopDown(x, y, r, g, b);
+            if (b > 180 && g > 140 && b > r + 100) ++cyanAboveCenter;
+        }
+    }
+
+    if (brightWordPx < 100 || cyanBelowCenter < 50 || cyanAboveCenter > 5) {
+        std::printf("FAIL [%s]: RGB24 bottom-up check failed (wordPx=%d, cyanBelow=%d, cyanAbove=%d)\n",
+                    label, brightWordPx, cyanBelowCenter, cyanAboveCenter);
+        return false;
+    }
+    std::printf("OK [%s]: corner=(%u,%u,%u) wordPx=%d cyanBelow=%d cyanAbove=%d (bottom-up verified)\n",
+                label, cr, cg, cb, brightWordPx, cyanBelowCenter, cyanAboveCenter);
+    return true;
+}
+
+// ============================================================================
+// Tiny In-Process DirectShow Sink Filter for Loopback Testing
+// ============================================================================
+
+class TestSinkPin final : public IPin, public IMemInputPin {
+public:
+    explicit TestSinkPin(int targetFrames) : m_targetFrames(targetFrames) {
+        m_doneEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+
+    ~TestSinkPin() {
+        Disconnect();
+        if (m_doneEvt) CloseHandle(m_doneEvt);
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IPin) {
+            *ppv = static_cast<IPin*>(this);
+        } else if (riid == IID_IMemInputPin) {
+            *ppv = static_cast<IMemInputPin*>(this);
+        } else {
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        AddRef();
+        return S_OK;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(m_ref.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+
+    STDMETHODIMP_(ULONG) Release() override {
+        long c = m_ref.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (c == 0) delete this;
+        return static_cast<ULONG>(c);
+    }
+
+    STDMETHODIMP Connect(IPin*, const AM_MEDIA_TYPE*) override { return E_UNEXPECTED; }
+
+    STDMETHODIMP ReceiveConnection(IPin* pConnector, const AM_MEDIA_TYPE* pmt) override {
+        if (!pConnector || !pmt) return E_POINTER;
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_connected) return VFW_E_ALREADY_CONNECTED;
+        m_connected = pConnector;
+        m_connected->AddRef();
+        m_mt = *pmt;
+        m_mt.pbFormat = nullptr;
+        m_mt.cbFormat = 0;
+        m_mt.pUnk = nullptr;
+        if (pmt->cbFormat > 0 && pmt->pbFormat) {
+            m_mt.pbFormat = static_cast<BYTE*>(CoTaskMemAlloc(pmt->cbFormat));
+            if (!m_mt.pbFormat) return E_OUTOFMEMORY;
+            std::memcpy(m_mt.pbFormat, pmt->pbFormat, pmt->cbFormat);
+            m_mt.cbFormat = pmt->cbFormat;
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP Disconnect() override {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_connected) {
+            m_connected->Release();
+            m_connected = nullptr;
+        }
+        if (m_allocator) {
+            m_allocator->Release();
+            m_allocator = nullptr;
+        }
+        FreeMT(m_mt);
+        return S_OK;
+    }
+
+    STDMETHODIMP ConnectedTo(IPin** pPin) override {
+        if (!pPin) return E_POINTER;
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (!m_connected) {
+            *pPin = nullptr;
+            return VFW_E_NOT_CONNECTED;
+        }
+        *pPin = m_connected;
+        (*pPin)->AddRef();
+        return S_OK;
+    }
+
+    STDMETHODIMP ConnectionMediaType(AM_MEDIA_TYPE* pmt) override {
+        if (!pmt) return E_POINTER;
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (!m_connected) return VFW_E_NOT_CONNECTED;
+        *pmt = m_mt;
+        if (m_mt.cbFormat && m_mt.pbFormat) {
+            pmt->pbFormat = static_cast<BYTE*>(CoTaskMemAlloc(m_mt.cbFormat));
+            std::memcpy(pmt->pbFormat, m_mt.pbFormat, m_mt.cbFormat);
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP QueryPinInfo(PIN_INFO* pInfo) override {
+        if (!pInfo) return E_POINTER;
+        pInfo->pFilter = nullptr;
+        pInfo->dir = PINDIR_INPUT;
+        wcscpy_s(pInfo->achName, L"In");
+        return S_OK;
+    }
+
+    STDMETHODIMP QueryDirection(PIN_DIRECTION* pPinDir) override {
+        if (!pPinDir) return E_POINTER;
+        *pPinDir = PINDIR_INPUT;
+        return S_OK;
+    }
+
+    STDMETHODIMP QueryId(LPWSTR* Id) override {
+        if (!Id) return E_POINTER;
+        *Id = static_cast<LPWSTR>(CoTaskMemAlloc(6));
+        wcscpy_s(*Id, 3, L"In");
+        return S_OK;
+    }
+
+    STDMETHODIMP QueryAccept(const AM_MEDIA_TYPE*) override { return S_OK; }
+    STDMETHODIMP EnumMediaTypes(IEnumMediaTypes**) override { return E_NOTIMPL; }
+    STDMETHODIMP QueryInternalConnections(IPin**, ULONG*) override { return E_NOTIMPL; }
+    STDMETHODIMP EndOfStream() override { return S_OK; }
+    STDMETHODIMP BeginFlush() override {
+        m_flushing.store(true, std::memory_order_release);
+        return S_OK;
+    }
+    STDMETHODIMP EndFlush() override {
+        m_flushing.store(false, std::memory_order_release);
+        return S_OK;
+    }
+    STDMETHODIMP NewSegment(REFERENCE_TIME, REFERENCE_TIME, double) override { return S_OK; }
+
+    // IMemInputPin
+    STDMETHODIMP GetAllocator(IMemAllocator**) override { return VFW_E_NO_ALLOCATOR; }
+
+    STDMETHODIMP NotifyAllocator(IMemAllocator* pAllocator, BOOL) override {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_allocator) m_allocator->Release();
+        m_allocator = pAllocator;
+        if (m_allocator) m_allocator->AddRef();
+        return S_OK;
+    }
+
+    STDMETHODIMP GetAllocatorRequirements(ALLOCATOR_PROPERTIES* pProps) override {
+        if (!pProps) return E_POINTER;
+        std::memset(pProps, 0, sizeof(*pProps));
+        return E_NOTIMPL;
+    }
+
+    STDMETHODIMP Receive(IMediaSample* pSample) override {
+        if (m_flushing.load(std::memory_order_acquire)) return S_FALSE;
+        if (!pSample) return E_POINTER;
+
+        BYTE* ptr = nullptr;
+        HRESULT hr = pSample->GetPointer(&ptr);
+        const long len = pSample->GetActualDataLength();
+        REFERENCE_TIME tStart = 0, tStop = 0;
+        const bool hasTime = SUCCEEDED(pSample->GetTime(&tStart, &tStop));
+        const bool syncPt = (pSample->IsSyncPoint() == S_OK);
+
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (SUCCEEDED(hr) && ptr && len > 0) {
+            m_lastFrame.assign(ptr, ptr + len);
+        }
+        if (hasTime) {
+            if (m_received > 0 && tStart <= m_lastRtStart) {
+                m_nonMonotonicTimestamps++;
+            }
+            m_lastRtStart = tStart;
+        }
+        if (!syncPt) {
+            m_missingSyncPoints++;
+        }
+        m_received++;
+        if (m_received >= m_targetFrames) {
+            SetEvent(m_doneEvt);
+        }
+        return S_OK;
+    }
+
+    STDMETHODIMP ReceiveMultiple(IMediaSample** pSamples, long nSamples, long* nSamplesProcessed) override {
+        long done = 0;
+        for (long i = 0; i < nSamples; ++i) {
+            if (FAILED(Receive(pSamples[i]))) break;
+            ++done;
+        }
+        if (nSamplesProcessed) *nSamplesProcessed = done;
+        return S_OK;
+    }
+
+    STDMETHODIMP ReceiveCanBlock() override { return S_FALSE; }
+
+    bool WaitDone(DWORD timeoutMs) {
+        return WaitForSingleObject(m_doneEvt, timeoutMs) == WAIT_OBJECT_0;
+    }
+
+    int ReceivedCount() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_received;
+    }
+
+    std::vector<uint8_t> LastFrame() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_lastFrame;
+    }
+
+    int NonMonotonicTimestamps() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_nonMonotonicTimestamps;
+    }
+
+    int MissingSyncPoints() {
+        std::lock_guard<std::mutex> lock(m_mu);
+        return m_missingSyncPoints;
+    }
+
+private:
+    std::atomic<long> m_ref{1};
+    std::atomic<bool> m_flushing{false};
+    std::mutex m_mu;
+    IPin* m_connected = nullptr;
+    IMemAllocator* m_allocator = nullptr;
+    AM_MEDIA_TYPE m_mt{};
+    int m_targetFrames = 5;
+    int m_received = 0;
+    REFERENCE_TIME m_lastRtStart = -1;
+    int m_nonMonotonicTimestamps = 0;
+    int m_missingSyncPoints = 0;
+    std::vector<uint8_t> m_lastFrame;
+    HANDLE m_doneEvt = nullptr;
+};
+
+int RunDShowInprocTest(const std::wstring& dllPath, int numFrames, bool expectLive, uint8_t expectedLiveLuma) {
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        std::wprintf(L"FAIL: LoadLibraryW(%ls) failed: %lu\n", dllPath.c_str(), GetLastError());
+        return 1;
+    }
+    auto fnGetClass = reinterpret_cast<FnDllGetClassObject>(GetProcAddress(mod, "DllGetClassObject"));
+    auto fnCanUnload = reinterpret_cast<FnDllCanUnloadNow>(GetProcAddress(mod, "DllCanUnloadNow"));
+    if (!fnGetClass) {
+        std::printf("FAIL: DllGetClassObject export missing\n");
+        FreeLibrary(mod);
+        return 1;
+    }
+
+    int rc = 1;
+    do {
+        IClassFactory* factory = nullptr;
+        HRESULT hr = fnGetClass(CLSID_CapviewVirtualCamDShow, IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) {
+            std::printf("FAIL: DllGetClassObject(CLSID_CapviewVirtualCamDShow) failed: 0x%08lX\n", hr);
+            break;
+        }
+
+        IBaseFilter* filter = nullptr;
+        hr = factory->CreateInstance(nullptr, IID_PPV_ARGS(&filter));
+        factory->Release();
+        if (FAILED(hr) || !filter) {
+            std::printf("FAIL: CreateInstance(IBaseFilter) failed: 0x%08lX\n", hr);
+            break;
+        }
+
+        // 1. Check CLSID, IAMFilterMiscFlags, FILTER_INFO
+        CLSID clsid{};
+        if (FAILED(filter->GetClassID(&clsid)) || clsid != CLSID_CapviewVirtualCamDShow) {
+            std::printf("FAIL: GetClassID mismatch\n");
+            filter->Release();
+            break;
+        }
+        IAMFilterMiscFlags* misc = nullptr;
+        if (FAILED(filter->QueryInterface(IID_PPV_ARGS(&misc))) ||
+            misc->GetMiscFlags() != AM_FILTER_MISC_FLAGS_IS_SOURCE) {
+            std::printf("FAIL: IAMFilterMiscFlags mismatch\n");
+            if (misc) misc->Release();
+            filter->Release();
+            break;
+        }
+        misc->Release();
+
+        FILTER_INFO fi{};
+        if (FAILED(filter->QueryFilterInfo(&fi)) || std::wcscmp(fi.achName, CAPVIEW_VCAM_FRIENDLY_NAME) != 0) {
+            std::wprintf(L"FAIL: QueryFilterInfo name=%ls want=%ls\n", fi.achName, CAPVIEW_VCAM_FRIENDLY_NAME);
+            if (fi.pGraph) fi.pGraph->Release();
+            filter->Release();
+            break;
+        }
+        if (fi.pGraph) fi.pGraph->Release();
+
+        // 2. Enumerate output pin
+        IEnumPins* enumPins = nullptr;
+        hr = filter->EnumPins(&enumPins);
+        if (FAILED(hr)) {
+            std::printf("FAIL: EnumPins failed: 0x%08lX\n", hr);
+            filter->Release();
+            break;
+        }
+        IPin* outPin = nullptr;
+        ULONG fetched = 0;
+        hr = enumPins->Next(1, &outPin, &fetched);
+        enumPins->Release();
+        if (hr != S_OK || fetched != 1 || !outPin) {
+            std::printf("FAIL: EnumPins::Next did not return output pin\n");
+            filter->Release();
+            break;
+        }
+
+        PIN_DIRECTION dir = PINDIR_INPUT;
+        outPin->QueryDirection(&dir);
+        if (dir != PINDIR_OUTPUT) {
+            std::printf("FAIL: pin direction != PINDIR_OUTPUT\n");
+            outPin->Release();
+            filter->Release();
+            break;
+        }
+
+        // 3. Check IKsPropertySet -> PIN_CATEGORY_CAPTURE
+        IKsPropertySet* ks = nullptr;
+        hr = outPin->QueryInterface(IID_PPV_ARGS(&ks));
+        if (FAILED(hr)) {
+            std::printf("FAIL: QI(IKsPropertySet) failed: 0x%08lX\n", hr);
+            outPin->Release();
+            filter->Release();
+            break;
+        }
+        DWORD support = 0;
+        GUID cat = GUID_NULL;
+        DWORD returned = 0;
+        if (FAILED(ks->QuerySupported(AMPROPSETID_Pin, AMPROPERTY_PIN_CATEGORY, &support)) ||
+            (support & KSPROPERTY_SUPPORT_GET) == 0 ||
+            FAILED(ks->Get(AMPROPSETID_Pin, AMPROPERTY_PIN_CATEGORY, nullptr, 0, &cat, sizeof(cat), &returned)) ||
+            returned != sizeof(GUID) || cat != PIN_CATEGORY_CAPTURE) {
+            std::printf("FAIL: IKsPropertySet PIN_CATEGORY_CAPTURE check failed\n");
+            ks->Release();
+            outPin->Release();
+            filter->Release();
+            break;
+        }
+        ks->Release();
+
+        // 4. Check IAMStreamConfig caps
+        IAMStreamConfig* cfg = nullptr;
+        hr = outPin->QueryInterface(IID_PPV_ARGS(&cfg));
+        if (FAILED(hr)) {
+            std::printf("FAIL: QI(IAMStreamConfig) failed: 0x%08lX\n", hr);
+            outPin->Release();
+            filter->Release();
+            break;
+        }
+        int capCount = 0, capSize = 0;
+        if (FAILED(cfg->GetNumberOfCapabilities(&capCount, &capSize)) ||
+            capCount != 12 || capSize != static_cast<int>(sizeof(VIDEO_STREAM_CONFIG_CAPS))) {
+            std::printf("FAIL: GetNumberOfCapabilities count=%d size=%d\n", capCount, capSize);
+            cfg->Release();
+            outPin->Release();
+            filter->Release();
+            break;
+        }
+
+        struct FormatTest {
+            const char* name;
+            GUID subtype;
+            int width;
+            int height;
+        };
+        const FormatTest tests[3] = {
+            {"NV12",  kSubtypeNV12,       1920, 1080},
+            {"YUY2",  MEDIASUBTYPE_YUY2,  1280,  720},
+            {"RGB24", MEDIASUBTYPE_RGB24, 1280,  720},
+        };
+
+        bool allOk = true;
+        for (const auto& tc : tests) {
+            // Find matching stream cap
+            AM_MEDIA_TYPE* chosenMt = nullptr;
+            for (int i = 0; i < capCount; ++i) {
+                AM_MEDIA_TYPE* mt = nullptr;
+                VIDEO_STREAM_CONFIG_CAPS scc{};
+                if (SUCCEEDED(cfg->GetStreamCaps(i, &mt, reinterpret_cast<BYTE*>(&scc))) && mt) {
+                    const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(mt->pbFormat);
+                    if (mt->subtype == tc.subtype &&
+                        vih->bmiHeader.biWidth == tc.width &&
+                        vih->bmiHeader.biHeight == tc.height &&
+                        vih->AvgTimePerFrame <= 170000) {
+                        chosenMt = mt;
+                        break;
+                    }
+                    DeleteMT(mt);
+                }
+            }
+            if (!chosenMt) {
+                std::printf("FAIL [%s]: matching cap %dx%d@60 not advertised\n", tc.name, tc.width, tc.height);
+                allOk = false;
+                break;
+            }
+
+            // SetFormat -> Connect -> Pause -> Run -> Pause -> Run -> Stop -> Disconnect
+            hr = cfg->SetFormat(chosenMt);
+            if (FAILED(hr)) {
+                std::printf("FAIL [%s]: SetFormat failed: 0x%08lX\n", tc.name, hr);
+                DeleteMT(chosenMt);
+                allOk = false;
+                break;
+            }
+
+            auto* sink = new TestSinkPin(numFrames);
+            hr = outPin->Connect(static_cast<IPin*>(sink), nullptr);
+            if (FAILED(hr)) {
+                std::printf("FAIL [%s]: Connect failed: 0x%08lX\n", tc.name, hr);
+                sink->Release();
+                DeleteMT(chosenMt);
+                allOk = false;
+                break;
+            }
+
+            AM_MEDIA_TYPE connMt{};
+            hr = outPin->ConnectionMediaType(&connMt);
+            if (FAILED(hr) || connMt.subtype != tc.subtype) {
+                std::printf("FAIL [%s]: ConnectionMediaType subtype mismatch\n", tc.name);
+                FreeMT(connMt);
+                outPin->Disconnect();
+                sink->Disconnect();
+                sink->Release();
+                DeleteMT(chosenMt);
+                allOk = false;
+                break;
+            }
+            FreeMT(connMt);
+
+            hr = filter->Pause();
+            if (FAILED(hr)) {
+                std::printf("FAIL [%s]: Pause failed: 0x%08lX\n", tc.name, hr);
+                allOk = false;
+            }
+            if (allOk) {
+                hr = filter->Run(0);
+                if (FAILED(hr)) {
+                    std::printf("FAIL [%s]: Run failed: 0x%08lX\n", tc.name, hr);
+                    allOk = false;
+                }
+            }
+
+            if (allOk && !sink->WaitDone(5000)) {
+                std::printf("FAIL [%s]: timed out waiting for %d frames (got %d)\n",
+                            tc.name, numFrames, sink->ReceivedCount());
+                allOk = false;
+            }
+
+            // Exercise Running -> Paused -> Running -> Stopped transition cleanly (no deadlock!).
+            if (allOk) {
+                (void)filter->Pause();
+                Sleep(20);
+                (void)filter->Run(0);
+                Sleep(20);
+            }
+            (void)filter->Stop();
+
+            const auto frame = sink->LastFrame();
+            const int gotFrames = sink->ReceivedCount();
+            const int badTs = sink->NonMonotonicTimestamps();
+            const int badSync = sink->MissingSyncPoints();
+
+            outPin->Disconnect();
+            sink->Disconnect();
+            sink->Release();
+            DeleteMT(chosenMt);
+
+            if (!allOk) break;
+
+            if (gotFrames < numFrames || badTs != 0 || badSync != 0) {
+                std::printf("FAIL [%s]: frames=%d/%d badTs=%d badSync=%d\n",
+                            tc.name, gotFrames, numFrames, badTs, badSync);
+                allOk = false;
+                break;
+            }
+
+            if (expectLive) {
+                // Verify live SHM payload marker propagated cleanly through NV12, YUY2, and RGB24!
+                if (tc.subtype == kSubtypeNV12) {
+                    const uint8_t gotY = frame[static_cast<size_t>(tc.width) * 16 + 16];
+                    if (std::abs(static_cast<int>(gotY) - static_cast<int>(expectedLiveLuma)) > 2) {
+                        std::printf("FAIL [DShow-live-NV12]: gotY=%u want~%u\n", gotY, expectedLiveLuma);
+                        allOk = false;
+                        break;
+                    }
+                    std::printf("OK [DShow-live-NV12]: %d frames, luma=%u\n", gotFrames, gotY);
+                } else if (tc.subtype == MEDIASUBTYPE_YUY2) {
+                    const uint8_t gotY = frame[static_cast<size_t>(tc.width) * 2 * 16 + 16 * 2];
+                    if (std::abs(static_cast<int>(gotY) - static_cast<int>(expectedLiveLuma)) > 2) {
+                        std::printf("FAIL [DShow-live-YUY2]: gotY=%u want~%u\n", gotY, expectedLiveLuma);
+                        allOk = false;
+                        break;
+                    }
+                    std::printf("OK [DShow-live-YUY2]: %d frames, luma=%u\n", gotFrames, gotY);
+                } else {
+                    const int stride = ((tc.width * 3) + 3) & ~3;
+                    const int bufY = tc.height - 1 - 16;
+                    const uint8_t b = frame[static_cast<size_t>(bufY) * stride + 16 * 3 + 0];
+                    const uint8_t g = frame[static_cast<size_t>(bufY) * stride + 16 * 3 + 1];
+                    const uint8_t r = frame[static_cast<size_t>(bufY) * stride + 16 * 3 + 2];
+                    const int wantRgb = static_cast<int>(std::lround((static_cast<double>(expectedLiveLuma) - 16.0) * 255.0 / 219.0));
+                    if (std::abs(static_cast<int>(r) - wantRgb) > 10 ||
+                        std::abs(static_cast<int>(g) - wantRgb) > 10 ||
+                        std::abs(static_cast<int>(b) - wantRgb) > 10) {
+                        std::printf("FAIL [DShow-live-RGB24]: got=(%u,%u,%u) want~%d\n", r, g, b, wantRgb);
+                        allOk = false;
+                        break;
+                    }
+                    std::printf("OK [DShow-live-RGB24]: %d frames, rgb=(%u,%u,%u)\n", gotFrames, r, g, b);
+                }
+            } else {
+                if (tc.subtype == kSubtypeNV12) {
+                    allOk = VerifyNV12PlaceholderPixels(frame.data(), tc.width, tc.width, tc.height, "DShow-inproc-NV12");
+                } else if (tc.subtype == MEDIASUBTYPE_YUY2) {
+                    allOk = VerifyYUY2PlaceholderPixels(frame.data(), tc.width, tc.height, "DShow-inproc-YUY2");
+                } else {
+                    allOk = VerifyRGB24PlaceholderBottomUp(frame.data(), tc.width, tc.height, "DShow-inproc-RGB24");
+                }
+                if (!allOk) break;
+            }
+        }
+
+        cfg->Release();
+        outPin->Release();
+        filter->Release();
+
+        if (allOk) {
+            if (fnCanUnload && fnCanUnload() != S_OK) {
+                std::printf("FAIL: DllCanUnloadNow != S_OK after releasing all DirectShow COM objects\n");
+                break;
+            }
+            std::printf("PASS: DirectShow in-proc test succeeded (NV12 + YUY2 + RGB24, zero COM leaks)\n");
+            rc = 0;
+        }
+    } while (false);
+
+    FreeLibrary(mod);
+    return rc;
+}
+
+int RunDShowEnum() {
+    ICreateDevEnum* devEnum = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_SystemDeviceEnum, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&devEnum));
+    if (FAILED(hr)) {
+        std::printf("CoCreateInstance(CLSID_SystemDeviceEnum) failed: 0x%08lX\n", hr);
+        return 1;
+    }
+
+    IEnumMoniker* enumMon = nullptr;
+    hr = devEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &enumMon, 0);
+    devEnum->Release();
+    if (hr == S_FALSE || !enumMon) {
+        std::printf("DirectShow VideoInputDeviceCategory: (none)\n");
+        return 0;
+    }
+    if (FAILED(hr)) {
+        std::printf("CreateClassEnumerator failed: 0x%08lX\n", hr);
+        return 1;
+    }
+
+    int idx = 0;
+    int capviewMatches = 0;
+    IMoniker* mon = nullptr;
+    while (enumMon->Next(1, &mon, nullptr) == S_OK) {
+        IPropertyBag* bag = nullptr;
+        if (SUCCEEDED(mon->BindToStorage(nullptr, nullptr, IID_PPV_ARGS(&bag)))) {
+            VARIANT vName;
+            VariantInit(&vName);
+            VARIANT vClsid;
+            VariantInit(&vClsid);
+            std::wstring name = L"(unnamed)";
+            std::wstring clsid = L"";
+            if (SUCCEEDED(bag->Read(L"FriendlyName", &vName, nullptr)) && vName.vt == VT_BSTR && vName.bstrVal) {
+                name = vName.bstrVal;
+            }
+            if (SUCCEEDED(bag->Read(L"CLSID", &vClsid, nullptr)) && vClsid.vt == VT_BSTR && vClsid.bstrVal) {
+                clsid = vClsid.bstrVal;
+            }
+            VariantClear(&vName);
+            VariantClear(&vClsid);
+            bag->Release();
+
+            std::wprintf(L"  DShow device[%d]: %ls (CLSID=%ls)\n", idx, name.c_str(), clsid.c_str());
+            if (name.find(L"capview Virtual Camera") != std::wstring::npos) {
+                ++capviewMatches;
+            }
+        }
+        mon->Release();
+        ++idx;
+    }
+    enumMon->Release();
+    std::printf("DirectShow total=%d capview_matches=%d\n", idx, capviewMatches);
+    return 0;
 }
 
 int RunReader(IMFMediaSource* source, int targetW, int targetH, double targetFPS, int numFrames,
@@ -567,6 +1275,10 @@ int wmain(int argc, wchar_t** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
     bool useFrameServer = false;
     bool verifyPlaceholder = false;
+    bool dshowInproc = false;
+    bool dshowEnum = false;
+    bool dshowLive = false;
+    uint8_t dshowLiveLuma = 160;
     int numFrames = 120;
     int width = 1920;
     int height = 1080;
@@ -577,6 +1289,15 @@ int wmain(int argc, wchar_t** argv) {
     for (int i = 1; i < argc; ++i) {
         if (_wcsicmp(argv[i], L"--frameserver") == 0) {
             useFrameServer = true;
+        } else if (_wcsicmp(argv[i], L"--dshow-inproc") == 0) {
+            dshowInproc = true;
+        } else if (_wcsicmp(argv[i], L"--dshow-enum") == 0) {
+            dshowEnum = true;
+        } else if (_wcsicmp(argv[i], L"--dshow-live") == 0) {
+            dshowInproc = true;
+            dshowLive = true;
+        } else if (_wcsicmp(argv[i], L"--live-luma") == 0 && i + 1 < argc) {
+            dshowLiveLuma = static_cast<uint8_t>(std::clamp(_wtoi(argv[++i]), 16, 235));
         } else if (_wcsicmp(argv[i], L"--verify-placeholder") == 0) {
             verifyPlaceholder = true;
         } else if (_wcsicmp(argv[i], L"--dump-placeholder") == 0 && i + 1 < argc) {
@@ -590,6 +1311,23 @@ int wmain(int argc, wchar_t** argv) {
             height = 720;
             fps = 30.0;
         }
+    }
+
+    if (dshowInproc || dshowEnum) {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hr)) {
+            std::printf("CoInitializeEx failed: 0x%08lX\n", hr);
+            return 1;
+        }
+        int rc = 0;
+        if (dshowEnum) {
+            rc = RunDShowEnum();
+        }
+        if (rc == 0 && dshowInproc) {
+            rc = RunDShowInprocTest(dllPath, std::min(numFrames, 15), dshowLive, dshowLiveLuma);
+        }
+        CoUninitialize();
+        return rc;
     }
 
     if (verifyPlaceholder || !dumpPpmPath.empty()) {
