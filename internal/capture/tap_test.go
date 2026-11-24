@@ -192,3 +192,16 @@ func TestMailboxFanOutIndependentSinks(t *testing.T) {
 		t.Fatal("removed/disabled sinks must not receive frames")
 	}
 }
+
+func TestFanOutDisplayReleaseIdempotent(t *testing.T) {
+	var released atomic.Int32
+	f := nv12Frame(t, 1, 4, func() { released.Add(1) })
+	job := prepareFanOut(&f, nil)
+	rel := f.release
+	rel()
+	rel() // a second call through a copied Frame must not panic or double-count
+	job.release()
+	if released.Load() != 1 {
+		t.Fatalf("released %d times, want 1", released.Load())
+	}
+}

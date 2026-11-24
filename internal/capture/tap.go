@@ -51,9 +51,14 @@ func prepareFanOut(f *Frame, sinks []Sink) *fanJob {
 			orig()
 		}
 	}
+	// The display side's reference: idempotent even if a caller releases a
+	// copy of the frame twice.
+	var once sync.Once
 	f.release = func() {
-		close(job.shown)
-		job.release()
+		once.Do(func() {
+			close(job.shown)
+			job.release()
+		})
 	}
 	return job
 }
