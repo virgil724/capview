@@ -15,6 +15,7 @@ import (
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
+	"github.com/virgil724/capview/internal/virtualcam"
 	"github.com/virgil724/capview/internal/win"
 )
 
@@ -33,11 +34,50 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "vcam-probe" {
+		if err := runVcamProbe(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := runView(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		win.ShowErrorBox("capview", err.Error())
 		os.Exit(1)
 	}
+}
+
+func runVcamProbe(args []string) error {
+	fs := flag.NewFlagSet("capview vcam-probe", flag.ExitOnError)
+	friendly := fs.String("friendly-name", virtualcam.DefaultFriendlyName, "virtual camera friendly name")
+	lifetime := fs.String("lifetime", "session", "lifetime: session or system")
+	access := fs.String("access", "current", "access: current or all")
+	shmMode := fs.String("shm", "auto", "shared memory mode: auto, global, file, or local")
+	size := fs.String("size", "1920x1080", "synthetic frame resolution WxH")
+	fps := fs.Float64("fps", 60, "synthetic frame rate")
+	hold := fs.Duration("hold", 0, "duration to keep virtual camera alive and pump synthetic NV12 frames")
+	skipMF := fs.Bool("skip-mf", false, "skip MFCreateVirtualCamera (test SHM/Event only)")
+	noRemove := fs.Bool("no-remove", false, "skip IMFVirtualCamera::Remove during cleanup")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	w, h, err := parseSize(*size)
+	if err != nil {
+		return err
+	}
+	return virtualcam.RunProbe(os.Stdout, virtualcam.ProbeOptions{
+		FriendlyName: *friendly,
+		Lifetime:     *lifetime,
+		Access:       *access,
+		ShmMode:      *shmMode,
+		Width:        w,
+		Height:       h,
+		FPS:          *fps,
+		Hold:         *hold,
+		SkipMF:       *skipMF,
+		NoRemove:     *noRemove,
+	})
 }
 
 func runList() error {
@@ -87,8 +127,11 @@ type appHost struct {
 	cfgPath string
 	freq    int64
 	mailbox *capture.Mailbox
+	tap     *capture.Tap
 	vid     *capture.Source
 	aud     *audio.Passthrough
+	vcam    *virtualcam.Controller
+	vcamShm string
 
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
@@ -278,6 +321,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 	}
 
 	muted := h.aud != nil && h.aud.Muted()
+	vcamOn := h.vcam != nil
 
 	return []render.MenuItem{
 		{Label: "Video Device", Submenu: vidItems},
@@ -305,6 +349,14 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 			Label:    "Mute Audio (M)",
 			Checked:  muted,
 			Disabled: h.aud == nil,
+		},
+		{
+			ID: addAction(func() (bool, bool, bool) {
+				h.toggleVirtualCamera()
+				return false, false, false
+			}),
+			Label:   "Virtual Camera",
+			Checked: vcamOn,
 		},
 		{Separator: true},
 		{
@@ -336,6 +388,9 @@ func (h *appHost) switchVideoDevice(dev string) {
 		_ = h.startVideo("mf")
 		return
 	}
+	if h.vcam != nil && h.vid != nil {
+		h.vcam.SetFPS(h.vid.Mode.FPS)
+	}
 	_ = config.Save(h.cfgPath, h.cfg)
 }
 
@@ -351,6 +406,66 @@ func (h *appHost) switchVideoMode(m capture.Mode) {
 		_ = h.startVideo("mf")
 		return
 	}
+	if h.vcam != nil && h.vid != nil {
+		h.vcam.SetFPS(h.vid.Mode.FPS)
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) startVirtualCameraLocked() error {
+	if h.vcam != nil {
+		return nil
+	}
+	fps := h.cfg.FPS
+	if h.vid != nil && h.vid.Mode.FPS > 0 {
+		fps = h.vid.Mode.FPS
+	}
+	vc, err := virtualcam.Start(h.tap, virtualcam.Options{
+		FriendlyName: virtualcam.DefaultFriendlyName,
+		Lifetime:     "session",
+		Access:       "current",
+		ShmMode:      h.vcamShm,
+		FPS:          fps,
+	})
+	if err != nil {
+		return err
+	}
+	h.vcam = vc
+	st := vc.Stats()
+	fmt.Printf("virtual_camera: enabled (shm=%s event=%s link=%q)\n", st.ShmBackend, st.EventMode, st.SymbolicLink)
+	return nil
+}
+
+func (h *appHost) stopVirtualCameraLocked() {
+	if h.vcam != nil {
+		st := h.vcam.Stats()
+		h.vcam.Stop()
+		h.vcam = nil
+		fmt.Printf("virtual_camera: stopped (frames=%d tap_dropped=%d)\n", st.FramesWritten, h.tap.Dropped())
+	}
+}
+
+func (h *appHost) stopVirtualCamera() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopVirtualCameraLocked()
+}
+
+func (h *appHost) toggleVirtualCamera() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.vcam != nil {
+		h.stopVirtualCameraLocked()
+		h.cfg.VirtualCamera = false
+		_ = config.Save(h.cfgPath, h.cfg)
+		return
+	}
+	if err := h.startVirtualCameraLocked(); err != nil {
+		h.cfg.VirtualCamera = false
+		win.ShowErrorBox("capview", fmt.Sprintf("Failed to start Virtual Camera:\n%v", err))
+		return
+	}
+	h.cfg.VirtualCamera = true
 	_ = config.Save(h.cfgPath, h.cfg)
 }
 
@@ -394,6 +509,8 @@ func runView(args []string) error {
 	volume := fs.Float64("volume", float64(cfg.Volume), "initial audio volume (0.0 to 1.0)")
 	renderer := fs.String("renderer", "d3d11", "render backend: d3d11 or vulkan")
 	source := fs.String("source", "mf", "video source: mf or synthetic")
+	virtualCam := fs.Bool("virtual-cam", cfg.VirtualCamera, "enable Windows 11 Virtual Camera output")
+	vcamShm := fs.String("virtual-cam-shm", "auto", "virtual camera shared memory mode: auto, global, file, local")
 	vkInfo := fs.Bool("vkinfo", false, "print Vulkan device/extension/present-mode capabilities and exit")
 	duration := fs.Duration("duration", 0, "optional run duration before clean exit (e.g. 20s)")
 	if err := fs.Parse(args); err != nil {
@@ -453,6 +570,9 @@ func runView(args []string) error {
 	if setFlags["volume"] {
 		cfg.Volume = float32(*volume)
 	}
+	if setFlags["virtual-cam"] {
+		cfg.VirtualCamera = *virtualCam
+	}
 
 	if srcKind == "synthetic" {
 		if !setFlags["size"] {
@@ -466,16 +586,36 @@ func runView(args []string) error {
 		}
 	}
 
+	mb := capture.NewMailbox()
+	tap := capture.NewTap()
+	mb.SetTap(tap)
+
 	host := &appHost{
 		cfg:     cfg,
 		cfgPath: cfgPath,
 		freq:    win.QPCFrequency(),
-		mailbox: capture.NewMailbox(),
+		mailbox: mb,
+		tap:     tap,
+		vcamShm: *vcamShm,
 	}
 	if err := host.startVideo(srcKind); err != nil {
 		return err
 	}
 	defer host.stopVideo()
+
+	if cfg.VirtualCamera {
+		host.mu.Lock()
+		vcamErr := host.startVirtualCameraLocked()
+		host.mu.Unlock()
+		if vcamErr != nil {
+			if setFlags["virtual-cam"] {
+				return fmt.Errorf("virtual camera: %w", vcamErr)
+			}
+			fmt.Fprintf(os.Stderr, "warning: virtual camera disabled: %v\n", vcamErr)
+			host.cfg.VirtualCamera = false
+		}
+	}
+	defer host.stopVirtualCamera()
 
 	if srcKind != "synthetic" {
 		host.startAudio()

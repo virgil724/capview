@@ -2,3 +2,10 @@
 *.exe~
 *.test
 *.out
+*.dll
+*.pdb
+*.obj
+*.lib
+*.exp
+dist/
+virtualcam/build/

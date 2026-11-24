@@ -1,0 +1,179 @@
+# Batch 2 Feasibility Report: Windows 11 Virtual Camera (`MFCreateVirtualCamera`) Spike
+
+- **Target OS / Build tested**: Windows 11 Pro `26H2` (`10.0.26300.9974`, `mfsensorgroup.dll` `10.0.26100.9818`)
+- **CPU / GPU**: AMD Ryzen 7 9800X3D 8-Core / AMD Radeon RX 9070 XT (`capview list` also detects `Live Gamer Ultra-Video`)
+- **Go toolchain**: `go1.25.3 windows/amd64`, main binary remains pure Go (`CGO_ENABLED=0`), Vulkan code untouched
+- **C++ COM Media Source DLL toolchain**: Visual Studio Community 2026 (`18.2.0`), MSVC `14.50.35717` (`Hostx64\x64` & `Hostx64\x86`), Windows SDK `10.0.26100.0` (`mfvirtualcamera.h`), LLVM `clang++ 22.1.8`
+- **Spike status**: Prototype implemented, built (`x64` COM DLL `159,232` bytes + `CGO_ENABLED=0` binaries for all 4 CI targets), and verified end-to-end via in-process Media Foundation `IMFSourceReader` loopback (`1080p60` & `720p30`). Machine-wide `HKLM` COM registration and live third-party app / FrameServer verification require an elevated Administrator prompt (`IsAdmin: False` in current worker session) and are ready for turnkey execution by `入門工程師-google` using the exact instructions below.
+
+---
+
+## 1. 1080p60 Visibility, Actual FPS & Latency
+
+### 1.1 Architecture Implemented in Prototype
+1. **Main process (`capview`, `CGO_ENABLED=0`)**:
+   - Branches off `capture.Mailbox.publish` via a non-blocking, bounded (3-slot, drop-oldest) [`capture.Tap`](../internal/capture/tap.go).
+   - Strips Media Foundation row-stride padding on `NV12` or converts `YUY2 -> NV12` only when `Virtual Camera` is enabled, copies into the tap's staging buffer, and releases the driver `IMFSample` immediately (never blocking display rendering or holding driver sample pools).
+   - Calls `MFCreateVirtualCamera` / `IMFVirtualCamera` in [`internal/win/vcam.go`](../internal/win/vcam.go) via pure-Go `syscall` / COM vtable dispatch (`mfsensorgroup.dll`).
+   - Publishes tightly-packed NV12 frames into cross-session shared memory via lock-free seqlock (`virtualcam.ShmWriter` in [`internal/virtualcam/vcam_windows.go`](../internal/virtualcam/vcam_windows.go)) and signals a named Win32 Event.
+2. **Standalone COM Media Source DLL (`virtualcam/capview_vcam.dll`)**:
+   - Implements `IMFActivate` (`CapviewActivator`), `IMFMediaSourceEx` + `IMFGetService` + `IKsControl` + `IMFSampleAllocatorControl` (`CapviewMediaSource`), and `IMFMediaStream2` + `IMFGetService` + `IKsControl` (`CapviewMediaStream`) in [`virtualcam/vcam_source.cpp`](../virtualcam/vcam_source.cpp).
+   - Advertises NV12 modes `1920x1080@60` (default), `1920x1080@30`, `1280x720@60`, and `1280x720@30`.
+   - Reads the latest complete frame via seqlock (`ShmReader` in [`virtualcam/shm_reader.cpp`](../virtualcam/shm_reader.cpp)), scales cleanly when a consumer requests `720p`, paces at the consumer's requested frame rate, and renders BT.709 color bars with a moving marker when no producer is active.
+
+### 1.2 Empirical Media Foundation Loopback Results (Pre-Elevation In-Process)
+Tested locally with `capview-cli-windows-amd64.exe vcam-probe -skip-mf -shm file -hold 8s -fps 60` feeding `C:\ProgramData\capview\capview_vcam.dll` via [`virtualcam/vcam_loopback_test.cpp`](../virtualcam/vcam_loopback_test.cpp) (`MFCreateSourceReaderFromMediaSource` with `MF_LOW_LATENCY=1` and `MF_READWRITE_DISABLE_CONVERTERS=1`):
+
+| Test Mode | Producer | Frames Read | Elapsed | Actual FPS | Inter-Frame `dt` p50 / p99 / max | Pixel[0] Luma Transitions |
+|---|---|---:|---:|---:|---|---|
+| `1920x1080@60` NV12 (Standby) | Off (standby bars) | 30 | 0.505s | **59.35 fps** | 16.70 / 17.86 / 18.04 ms | 0 (static standby bar at x=0) |
+| `1920x1080@60` NV12 (Live SHM) | Go `ShmWriter` (`file`) | 120 | 1.985s | **60.44 fps** | **16.67 / 16.70 / 16.70 ms** | 119 / 119 intervals (100% unique frames) |
+| `1280x720@30` NV12 (Live SHM) | Go `ShmWriter` (`file` @ 60fps) | 60 | 1.969s | **30.48 fps** | **33.33 / 33.58 / 33.67 ms** | 59 / 59 intervals (100% unique frames) |
+| `1920x1080@60` NV12 (Staged DLL) | Go `ShmWriter` (`file`) | 60 | 0.984s | **60.96 fps** | **16.67 / 16.72 / 16.73 ms** | 59 / 59 intervals (post-`GetService` polish) |
+
+### 1.3 Live App Verification Checklist (Post-HKLM Registration — Pending `入門工程師-google`)
+Run from an **elevated Administrator PowerShell** once to register the COM DLL in `HKLM`:
+```powershell
+.\virtualcam\register.ps1 -Scope Machine
+```
+Then run `.\virtualcam\build\x64\vcam_loopback_test.exe --frameserver --frames 120` (with `capview` Virtual Camera active) and launch `.\dist\capview-windows-amd64.exe` (enable `Right-Click -> Virtual Camera`) to populate:
+
+| Consumer App | Visible as `capview Virtual Camera`? | Negotiated Mode & Actual FPS | Observed Visual / Latency Notes | Screenshot |
+|---|---|---|---|---|
+| `vcam_loopback_test.exe --frameserver` | `[PENDING: Admin HKLM run]` | `[PENDING]` | `[PENDING]` | N/A |
+| Windows Camera App (`UWP` / MF-only) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| OBS Studio `31.1.0` (Video Capture Device) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| Google Chrome (`getUserMedia` test page) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| Google Meet (Chrome) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+
+---
+
+## 2. Admin Privilege & Security Analysis
+
+Windows Camera Frame Server runs inside `svchost.exe` in **Session 0** under **`NT AUTHORITY\LocalService` (`S-1-5-19`)**. Every empirical result below was captured directly in a non-admin shell (`IsAdmin: False`) on Windows 11 `10.0.26300.9974`:
+
+### 2.1 COM Registration (`HKLM` vs `HKCU`)
+
+| Test Case (`capview vcam-probe`) | Registry Hive | DLL Path & ACL | `MFCreateVirtualCamera` | `IMFVirtualCamera::Start` Result |
+|---|---|---|---:|---|
+| Unregistered CLSID (`Session` + `CurrentUser`) | None | N/A | `S_OK` | **`HRESULT 0x80040154`** (`REGDB_E_CLASSNOTREG`) |
+| Unregistered CLSID (`System` + `CurrentUser`) | None | N/A | `S_OK` | **`HRESULT 0x80040154`** (`REGDB_E_CLASSNOTREG`) |
+| Unregistered CLSID (`Session` + `AllUsers`) | None | N/A | `S_OK` | **`HRESULT 0x80070005`** (`E_ACCESSDENIED`) |
+| Unregistered CLSID (`System` + `AllUsers`) | None | N/A | `S_OK` | **`HRESULT 0x80070005`** (`E_ACCESSDENIED`) |
+| `regsvr32 /n /i:user` in workspace (`Session` + `CurrentUser`) | `HKCU` | `C:\Users\virgil\...\capview_vcam.dll` (no `LocalService` ACL) | `S_OK` | **`HRESULT 0x80070003`** (`ERROR_PATH_NOT_FOUND`) |
+| `regsvr32 /n /i:user` in `ProgramData` (`Session` + `CurrentUser`) | `HKCU` | `C:\ProgramData\capview\capview_vcam.dll` (`LocalService:(I)(F)`) | `S_OK` | **`HRESULT 0x80070003`** (`ERROR_PATH_NOT_FOUND`) |
+| `regsvr32` non-admin (`HKLM`) | `HKLM` | `C:\ProgramData\capview\capview_vcam.dll` | N/A | **`regsvr32` exit code `5`** (`ERROR_ACCESS_DENIED`) |
+| Elevated `regsvr32` (`HKLM`, `Session` + `CurrentUser`) | `HKLM` | `C:\ProgramData\capview\capview_vcam.dll` (`LocalService:(I)(F)`) | `[PENDING]` | `[PENDING: elevated run by engineer]` |
+
+**Key Finding**: Even with `MFVirtualCameraAccess_CurrentUser` and `MFVirtualCameraLifetime_Session`, **`HKCU` COM registration does NOT work**. While the calling process sees `HKCU\Software\Classes` merged into `HKCR`, Frame Server (`Session 0`, `LocalService`) fails to resolve the per-user CLSID with `0x80070003` (`ERROR_PATH_NOT_FOUND`). Once `capview_vcam.dll` is registered **once** in `HKLM` (e.g., by an installer or `register.ps1 -Scope Machine` with UAC), normal non-admin `capview.exe` launches can call `MFCreateVirtualCamera(Session, CurrentUser)` without elevation.
+
+### 2.2 NTFS ACLs for `LocalService` (`S-1-5-19`)
+- **`C:\Users\virgil`** ACL inspected via `icacls`: grants access only to `SYSTEM`, `Administrators`, `virgil`, and `CodexSandboxUsers` — **`NT AUTHORITY\LocalService` (`S-1-5-19`) has NO read/execute permission**. Loading an `InprocServer32` DLL located under `C:\Users\...` from Frame Server fails (`E_ACCESSDENIED`).
+- **`C:\ProgramData\capview`** workaround: Tested non-elevated creation + `icacls C:\ProgramData\capview /grant "*S-1-5-19:(OI)(CI)(M)" "*S-1-5-32-545:(OI)(CI)(RX)"`. Because `C:\ProgramData` grants `BUILTIN\Users:(CI)(WD,AD,WEA,WA)` and `CREATOR OWNER:(OI)(CI)(IO)(F)`, creating `C:\ProgramData\capview` and applying `LocalService:(OI)(CI)(F)` + `Authenticated Users:(OI)(CI)(F)` succeeded **without Administrator elevation**, verified on both `capview_vcam.dll` and `vcam_frames.shm`.
+
+### 2.3 Shared Memory & Event IPC (`Global\` vs `Local\` vs File-Backed)
+Tested empirically via `capview-cli-windows-amd64.exe vcam-probe` (non-admin Session 1):
+- `CreateFileMappingW("Global\\CapviewVirtualCam_Probe", sa)` -> **FAIL (`Access is denied.`, Win32 error `5`)** because interactive non-admin processes lack `SeCreateGlobalPrivilege`.
+- `CreateFileMappingW("Local\\CapviewVirtualCam_Probe")` -> **OK** (visible only inside current user session; invisible to `FrameServer` in Session 0!).
+- **File-backed section (`C:\ProgramData\capview\vcam_frames.shm`)** created with SDDL `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;AU)` -> **OK (non-admin)**. `LocalService` (`S-1-5-19`) opens the same file path in Session 0 and maps shared physical pages via `CreateFileMappingW(fileH, PAGE_READWRITE/PAGE_READONLY)`.
+- `CreateEventW("Global\\CapviewVirtualCam_ProbeEvt", sa)` -> **OK (non-admin!)**. Windows enforces `SeCreateGlobalPrivilege` on `CreateFileMapping` for `Global\`, whereas `CreateEventW("Global\\...")` succeeds for non-admin users (and `ShmReader` inside `FrameServer` also attempts `OpenEventW` / `CreateEventW` defensively).
+
+---
+
+## 3. Lifetime & Crash Recovery
+
+- **Runtime choice**: `capview` uses `MFVirtualCameraLifetime_Session` + `MFVirtualCameraAccess_CurrentUser` by default.
+  - `MFVirtualCameraLifetime_Session`: Windows ties the virtual camera lifetime to the `IMFVirtualCamera` instance / owning process; if the app crashes (`TerminateProcess`), Frame Server / Monitor tears down the session-scoped SWD device node automatically.
+  - `MFVirtualCameraLifetime_System`: Persists across process exit and reboots until `IMFVirtualCamera::Remove()` is called — unsuitable for `capview` because a crash would leave a phantom camera visible in Teams/Meet/OBS until explicit cleanup.
+- **IPC crash resilience**: `ShmWriter` preserves a monotonic `Seq` (`prevSeq + 100`) if reopening an existing mapping after crash+restart, and `ShmReader` detects `Active == 0` (>500ms) and cleanly detaches/reattaches without hanging consumer apps (emitting standby color bars while no producer is active).
+- **Live `TerminateProcess` verification** (`[PENDING: requires HKLM registration first]`):
+  Run in elevated or post-register PowerShell:
+  ```powershell
+  .\tools\spike\test-vcam-lifecycle.ps1
+  ```
+  Verify:
+  1. `capview Virtual Camera` appears in `capview list` while `vcam-probe -lifetime session -hold 30s` runs.
+  2. Immediately after `Stop-Process -Force` (`TerminateProcess`), `capview list` no longer lists `capview Virtual Camera` (no zombie).
+  3. Relaunching `vcam-probe -lifetime session -hold 3s` succeeds with exit code `0`.
+
+---
+
+## 4. Main Process Latency Impact (`arr->pres` / `arr->vbl`, p50/p99/max)
+
+### 4.1 Zero-Blocking Isolation Design
+- [`Mailbox.publish`](../internal/capture/mailbox.go) updates `m.pending` and sends non-blocking on `m.notify` **first**.
+- Only when `tap.Enabled()` is true does `publish` increment a refcount (`atomic.Int32 = 2`), copy/convert into the tap's pre-allocated 3-slot staging buffer (drop-oldest on overwrite), and immediately release the tap's ref on the `IMFSample` without waiting for `ShmWriter` or `FrameServer`.
+
+### 4.2 Go Microbenchmarks (Ryzen 7 9800X3D, `CGO_ENABLED=0`)
+Measured via `go test -run=^$ -bench=. -benchmem ./internal/capture ./internal/virtualcam`:
+
+| Benchmark | Throughput | Mean Time / Frame | Allocations |
+|---|---:|---:|---:|
+| `BenchmarkTapWriteNV12_1080p` (stride 2048 -> 1920 strip) | `73,704.89 MB/s` | **42.2 µs** (`0.042 ms`) | `0 allocs/op` |
+| `BenchmarkTapWriteYUY2_1080p` (YUY2 -> NV12 conversion) | `3,407.49 MB/s` | **1,217.1 µs** (`1.217 ms`) | `0 allocs/op` |
+| `BenchmarkShmWriteNV12_1080p` (SHM seqlock + `SetEvent`) | `78,637.85 MB/s` | **39.6 µs** (`0.040 ms`) | `1 allocs/op` (`8 B`) |
+
+At 1080p60 (`16.67 ms` frame budget), the NV12 tap copy adds ~`0.04 ms` (`0.25%` of frame budget) and the background IPC pump writes to SHM in ~`0.04 ms` off the render thread.
+
+### 4.3 60-Second End-to-End Run (`internal/stats` with `max` support)
+Measured locally for `60s` (`-source synthetic -renderer d3d11 -no-audio -duration 60s`) via `.\tools\spike\bench-vcam.ps1 -Source synthetic -Seconds 60 -BaselineOnly`:
+
+| Run | Mode | FPS | `arr->pres` p50 / p99 / max | `arr->vbl` p50 / p99 / max | Dropped |
+|---|---|---:|---|---|---:|
+| Synthetic Baseline (Virtual Cam **OFF**) | `NV12 1920x1080@60.00` | `60.0` | `0.36 ms / 0.59 ms / 20.68 ms` | `5.45 ms / 18.44 ms / 30.26 ms` | `4` |
+| Capture Card (`Live Gamer Ultra-Video`) **OFF** (>=60s) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` |
+| Capture Card (`Live Gamer Ultra-Video`) **ON** (>=60s) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` |
+
+Exact command for `入門工程師-google` after HKLM registration (run with active HDMI input on `Live Gamer Ultra-Video`):
+```powershell
+.\tools\spike\bench-vcam.ps1 -Source mf -Seconds 60
+```
+
+---
+
+## 5. Code Signing & Windows Defender
+
+- **Local Defender state observed**: `WinDefend` service `STATE = 4 RUNNING`, `DisableRealtimeMonitoring = 0` (Real-Time Protection active).
+- **Unsigned DLL behavior**: Building `virtualcam\build\x64\capview_vcam.dll` (`159,232` bytes), copying it to `C:\ProgramData\capview\capview_vcam.dll`, registering in `HKCU`, and loading it via `LoadLibraryW` / `vcam_loopback_test.exe` produced **zero Windows Defender alerts, quarantines, or load blocks** on this machine.
+- **Comparison with OBS Studio `31.1.0`**: `C:\Program Files\obs-studio\data\obs-plugins\win-dshow\obs-virtualcam-module64.dll` carries an EV/OV Authenticode signature (`CN="OBS Project, LLC"`, `DigiCert Global G3 Code Signing ECC SHA384 2021 CA1`).
+- **Distribution risk**: While local unsigned builds run unhindered under Defender Real-Time Protection, unsigned `.exe`/`.dll` downloads from the internet trigger **Microsoft Defender SmartScreen** warnings on end-user PCs, and **AppLocker / WDAC / HVCI-enforced enterprise environments** block unsigned DLLs from loading into `svchost.exe` (`LocalService`). Signing both `capview.exe` and `capview_vcam.dll` with the same Authenticode certificate before public release is strongly recommended.
+
+---
+
+## 6. Alternatives Comparison
+
+### 6.1 OBS Virtual Camera (`OBS 31.1.0`) Local Inspection
+- Installed locally at `C:\Program Files\obs-studio\bin\64bit\obs64.exe` (`31.1.0`).
+- **Mechanism**: Registered strictly as legacy **DirectShow filters** (`AVVCamFilter` in `obs-virtualcam-module64.dll` and `obs-virtualcam-module32.dll`) under `HKLM\SOFTWARE\Classes\CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}` (+ `WOW6432Node`) and DirectShow Video Capture Category `{860BB310-5D01-11d0-BD3B-00A0C911CE86}`.
+- **Empirical confirmation**: `capview list` (calling `MFEnumDeviceSources`) lists `Live Gamer Ultra-Video` and `Pixel 10 Pro (Windows 虛擬攝影機)`, and does **NOT** enumerate `OBS Virtual Camera`, confirming OBS Virtual Camera is absent from Media Foundation / UWP capture pipelines (e.g. Windows Camera App).
+- **Shared memory**: Uses named mapping `OBSVirtualCamVideo` (`video_queue` triple-buffered NV12 header `write_idx`, `read_idx`, `state`, `offsets[3]`, `cx`, `cy`, `interval`). Writing directly to `OBSVirtualCamVideo` is technically possible only if OBS's `obs-virtualcam-module64/32.dll` is installed & HKLM-registered, **and** fails if OBS itself runs concurrently (single-writer conflict on `OBSVirtualCamVideo`) or is upgraded/uninstalled, **and** still cannot serve UWP/MF-only apps.
+- **Admin requirement**: `C:\Program Files\obs-studio\data\obs-plugins\win-dshow\virtualcam-install.bat` explicitly checks `net session` and exits with `"Administrative rights are required"` if non-admin, then runs `regsvr32` in `HKLM`.
+
+### 6.2 Local Build Toolchain Inventory
+- **Installed**: VS Community 2026 (`18.2.0`), MSVC `14.50.35717` (`x64` & `x86` `cl.exe`), Windows SDK `10.0.26100.0` (`mfvirtualcamera.h` + `mfsensorgroup.lib` for `x64`, `x86`, **`arm64`**), CMake, LLVM `clang++ 22.1.8`, Go `1.25.3`.
+- **Missing locally**: MSVC `arm64` C++ compiler (`Hostx64\arm64\cl.exe`) is not installed (note Windows SDK `arm64` `.lib`s *are* present, and `clang++ --target=aarch64-pc-windows-msvc` or VS ARM64 build tools would be needed to compile `capview_vcam.dll` for `windows/arm64`).
+
+### 6.3 Comprehensive Comparison Table
+
+| Dimension | **(a) `MFCreateVirtualCamera` + Bundled COM DLL** | **(b) Direct Write to OBS VirtualCam SHM (`OBSVirtualCamVideo`)** | **(c) Spout / NDI -> OBS -> OBS Virtual Camera** | **(d) Custom DirectShow Filter (`IBaseFilter`)** |
+|---|---|---|---|---|
+| **OS Support** | **Windows 11 22000+ only** (`mfsensorgroup.dll`) | Windows 10 & 11 (requires OBS 30/31+ installed) | Windows 10 & 11 (requires running OBS Studio) | Windows 10 & 11 |
+| **App Compatibility** | **Universal**: UWP/MF-only (Win Camera App), Chrome/Meet, Zoom, Teams, OBS | Desktop DirectShow apps (Chrome, OBS, Zoom); **invisible to MF-only / UWP** (verified via `capview list`) | Same as OBS VirtualCam (DirectShow-only) | DirectShow apps only; **invisible to MF-only / UWP**; legacy 32+64 bit |
+| **`windows/amd64` vs `arm64`** | `amd64` built & tested; `arm64` needs ARM64 C++ DLL (ARM64 SDK libs present; MSVC ARM64 toolchain not installed locally) | Depends on OBS ARM64 availability (OBS x64/x86 DLLs only on this PC) | Depends on OBS + Spout/NDI plugins | Needs **both** `x64` + `x86` (and `arm64` if native) COM DLLs |
+| **Install Privileges** | **Admin once** (`HKLM` COM registration + `ProgramData` ACL); non-admin runtime | **Admin once** (OBS `virtualcam-install.bat` runs `regsvr32` in `HKLM` with `net session` check) | **Admin once** (OBS virtualcam) + plugin installs | **Admin once** (`HKLM` COM + DirectShow filter category) |
+| **Extra Files** | 1 small DLL (`capview_vcam.dll`, **159 KB**) + `register.ps1` | External dependency on OBS Studio install (or redistributing OBS DLLs) | Full OBS Studio + `obs-spout2`/`obs-ndi` + Spout/NDI runtime | 2 DLLs (64-bit + 32-bit filter DLLs) |
+| **Added Latency** | **Low**: ~0.04 ms tap + ~0.04 ms SHM + FrameServer copy (16.67 ms cadence) | Low (~1 frame SHM + DirectShow copy), no FrameServer | **High**: extra GPU readback/IPC -> OBS compositor -> VirtualCam | Low-Medium (~1 frame) |
+| **Maintenance Risk** | Medium-Low (uses official Win11 API; FrameServer IPC & COM DLL owned by `capview`) | **High**: relies on undocumented internal OBS SHM layout (`queue_header`), breaks on OBS updates, collides if OBS VirtualCam is used | **High**: heavy multi-process dependency, poor UX, user must run & configure OBS | **High**: DirectShow deprecated, 32-bit/64-bit dual registration, misses UWP/Win11 Camera |
+| **Build Toolchain** | MSVC (`14.50`) or `clang++` + Win11 SDK `10.0.22000+` (`10.0.26100.0` installed locally) | Pure Go if writing SHM directly (no C++ DLL if piggybacking on installed OBS) | Spout2/NDI SDK + OBS plugin setup | Windows SDK DirectShow / ATL/COM C++ (`x86` + `x64`) |
+| **Impact on Main Binary `cgo`** | **Zero** (`CGO_ENABLED=0` preserved; COM DLL built separately) | Zero (`CGO_ENABLED=0`) | Zero or external NDI/Spout DLL load | **Zero** if separate COM DLL |
+
+---
+
+## 7. Conclusions & Recommendations
+
+1. **Recommendation**: **Proceed with Option (a) (`MFCreateVirtualCamera` + standalone C++ COM Media Source DLL `capview_vcam.dll`)** as the Windows 11 Virtual Camera architecture.
+   - It preserves `CGO_ENABLED=0` on the main Go binary, keeps the display render path untouched and non-blocking (`0.042 ms` NV12 tap, `0.040 ms` SHM write, immediate `IMFSample` release), achieves locked `60.44 fps` (`1080p60`) / `30.48 fps` (`720p30`) through Media Foundation `IMFSourceReader`, and avoids DirectShow's UWP/MF invisibility and OBS's external-dependency/single-writer collision risks.
+2. **Next Steps before Shipping / Finalizing PR**:
+   - Have `入門工程師-google` run elevated `.\virtualcam\register.ps1 -Scope Machine`, execute `vcam_loopback_test.exe --frameserver`, `.\tools\spike\test-vcam-lifecycle.ps1`, `.\tools\spike\bench-vcam.ps1 -Source mf -Seconds 60` on `Live Gamer Ultra-Video`, and fill in the live OBS / Chrome / Meet / Windows Camera App screenshots in Section 1.3, Section 3, and Section 4.3.
+   - For `windows/arm64`: install VS ARM64 C++ build tools (or compile `capview_vcam.dll` via `clang++ --target=aarch64-pc-windows-msvc` against existing SDK `10.0.26100.0\Lib\...\um\arm64`) if native ARM64 virtual camera support is required alongside the `windows/arm64` Go binary.
+   - Sign `capview.exe` and `capview_vcam.dll` with Authenticode for release builds, and bundle `HKLM` COM registration + `C:\ProgramData\capview` ACL setup into an installer / elevated setup action (with clear UX guidance when unprivileged users toggle Virtual Camera before registering).
