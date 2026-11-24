@@ -71,3 +71,36 @@ func TestTrackerAsyncDisplayTiming(t *testing.T) {
 		t.Errorf("expected omitted display label: %s", omitLine)
 	}
 }
+
+func TestSummaryMaxAndRunSummary(t *testing.T) {
+	const freq = 10_000_000
+	tr := New(4, freq) // rolling window smaller than the run
+	for i := 1; i <= 100; i++ {
+		tr.Add(Sample{
+			ArriveToPresentMS: float64(i) * 0.1,
+			ArriveToVBlankMS:  float64(i),
+			HasVBlank:         true,
+		}, int64(i)*(freq/60))
+	}
+	s := tr.Summary()
+	if math.Abs(s.ArriveToPresMax-10.0) > 1e-6 || math.Abs(s.ArriveToVblMax-100.0) > 1e-6 {
+		t.Fatalf("window max pres=%.2f vbl=%.2f, want 10 and 100", s.ArriveToPresMax, s.ArriveToVblMax)
+	}
+	if line := s.FormatLine("x", false); !strings.Contains(line, "max 10.00ms") || !strings.Contains(line, "max 100.00ms") {
+		t.Errorf("FormatLine missing max: %s", line)
+	}
+	r := tr.RunSummary()
+	if r.Pres.N != 100 || r.Vbl.N != 100 {
+		t.Fatalf("run N pres=%d vbl=%d, want 100", r.Pres.N, r.Vbl.N)
+	}
+	// rank int(99*0.5)=49 -> sample 50 -> 5.0 ms (pres) / 50 ms (vbl), 0.01 ms bins.
+	if math.Abs(r.Pres.P50-5.0) > 0.011 || math.Abs(r.Vbl.P50-50.0) > 0.011 {
+		t.Errorf("run p50 pres=%.3f vbl=%.3f", r.Pres.P50, r.Vbl.P50)
+	}
+	if math.Abs(r.Pres.P99-9.9) > 0.011 || math.Abs(r.Pres.Max-10.0) > 1e-9 || math.Abs(r.Vbl.Max-100.0) > 1e-9 {
+		t.Errorf("run p99/max: %+v", r)
+	}
+	if !strings.Contains(r.String(), "arr->pres n 100") {
+		t.Errorf("unexpected run line: %s", r)
+	}
+}

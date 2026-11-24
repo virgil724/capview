@@ -15,6 +15,8 @@ All notable changes to `capview` are documented in this file.
   - Latency note: compositors without tearing control (e.g. niri) add one repaint (~16–35 ms at 60 Hz); on compositors with tearing control Mesa offers `IMMEDIATE` and capview uses it.
 - **Vulkan renderer on Windows** (`-renderer vulkan`, opt-in; D3D11 stays the default). On an RX 9070 XT it reaches Independent Flip with tearing at +0.26 ms p50 vs D3D11; NVIDIA not yet validated.
 - `-source synthetic` test pattern and `-duration` for repeatable measurements.
+- **Audio mirror output (Windows)**: right-click **Audio Mirror Output** sends a second copy of the passthrough audio to another playback device (e.g. VB-Cable's *CABLE Input*, so Meet/Zoom can use *CABLE Output* as a microphone). Off by default; saved as `audio_mirror_id`; `-audio-mirror <id|name|off>` on the command line. The mirror is post-fader (follows mute and volume), runs on its own WASAPI thread with a 35 ms bounded ring, and stops on its own if the device is unplugged without affecting local playback.
+- `-stats` now prints `max` for arr->pres / arr->vbl and a whole-run summary line on exit (D3D11), plus audio ring overrun/underrun counters every 10 s.
 
 ## [0.1.1] - 2026-11-21
 

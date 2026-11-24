@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/virgil724/capview/internal/audio"
 	"github.com/virgil724/capview/internal/capture"
@@ -66,17 +67,17 @@ func runList() error {
 		fmt.Printf("  %s\n", n)
 	}
 
-	inEps, outEps, err := audio.ListEndpoints()
+	inEps, outEps, err := audio.ListEndpointInfos()
 	if err != nil {
 		return err
 	}
 	fmt.Println("\nWASAPI audio capture devices:")
-	for _, n := range inEps {
-		fmt.Printf("  %s\n", n)
+	for _, e := range inEps {
+		fmt.Printf("  %s\n", e.Name)
 	}
-	fmt.Println("\nWASAPI audio playback devices:")
-	for _, n := range outEps {
-		fmt.Printf("  %s\n", n)
+	fmt.Println("\nWASAPI audio playback devices (name  [endpoint id for -audio-mirror]):")
+	for _, e := range outEps {
+		fmt.Printf("  %s  [%s]\n", e.Name, e.ID)
 	}
 	return nil
 }
@@ -89,6 +90,7 @@ type appHost struct {
 	mailbox *capture.Mailbox
 	vid     *capture.Source
 	aud     *audio.Passthrough
+	diag    bool // print audio ring diagnostics (-stats)
 
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
@@ -146,6 +148,7 @@ func (h *appHost) startAudio() {
 		OutputDevice: h.cfg.AudioOut,
 		VideoHint:    hint,
 		Volume:       h.cfg.Volume,
+		MirrorID:     h.cfg.AudioMirrorID,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: audio passthrough disabled: %v\n", err)
@@ -155,13 +158,35 @@ func (h *appHost) startAudio() {
 		aud.ToggleMute()
 	}
 	h.aud = aud
+	if audio.MirrorIsMainOutput(h.cfg.AudioMirrorID, aud.OutputID) {
+		// The mirror target is now the main output (Start already refused
+		// it): drop the setting so the menu shows Off and config forgets it.
+		h.cfg.AudioMirrorID = ""
+	}
 	fmt.Printf("audio: %q (%d Hz) -> %q (%d Hz)\n", aud.InputName, aud.InputRate, aud.OutputName, aud.OutputRate)
+	if h.diag {
+		go func(a *audio.Passthrough) {
+			t := time.NewTicker(10 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-a.Done():
+					return
+				case <-t.C:
+					fmt.Println(a.DiagLine())
+				}
+			}
+		}(aud)
+	}
 }
 
 func (h *appHost) stopAudio() {
 	if h.aud != nil {
 		h.cfg.Volume = h.aud.Volume()
 		h.cfg.Muted = h.aud.Muted()
+		if h.diag {
+			fmt.Println(h.aud.DiagLine())
+		}
 		h.aud.Stop()
 		<-h.aud.Done()
 		h.aud = nil
@@ -241,7 +266,14 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 	}
 
 	// 3. Audio input & output submenus.
-	inEps, outEps, _ := audio.ListEndpoints()
+	inInfos, outInfos, _ := audio.ListEndpointInfos()
+	var inEps, outEps []string
+	for _, e := range inInfos {
+		inEps = append(inEps, e.Name)
+	}
+	for _, e := range outInfos {
+		outEps = append(outEps, e.Name)
+	}
 	var audInItems []render.MenuItem
 	audInItems = append(audInItems, render.MenuItem{
 		ID:      addAction(func() (bool, bool, bool) { h.switchAudioIn("", true); return false, false, false }),
@@ -277,6 +309,28 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 		})
 	}
 
+	// Audio mirror: second copy of the audio to another playback device.
+	mainOutID, curMirror := "", h.cfg.AudioMirrorID
+	audRunning := false
+	if h.aud != nil {
+		select {
+		case <-h.aud.Done(): // passthrough exited (device error); mirror can't start
+		default:
+			audRunning = true
+		}
+		mainOutID, curMirror = h.aud.OutputID, h.aud.MirrorID()
+	}
+	var mirrorItems []render.MenuItem
+	for _, c := range audio.MirrorChoices(outInfos, mainOutID, curMirror) {
+		id := c.ID
+		mirrorItems = append(mirrorItems, render.MenuItem{
+			ID:       addAction(func() (bool, bool, bool) { h.switchAudioMirror(id); return false, false, false }),
+			Label:    c.Label,
+			Checked:  c.Checked,
+			Disabled: c.Disabled || (id != "" && !audRunning),
+		})
+	}
+
 	muted := h.aud != nil && h.aud.Muted()
 
 	return []render.MenuItem{
@@ -284,6 +338,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 		{Label: "Resolution / FPS", Submenu: modeItems},
 		{Label: "Audio Input", Submenu: audInItems},
 		{Label: "Audio Output", Submenu: audOutItems},
+		{Label: "Audio Mirror Output", Submenu: mirrorItems},
 		{Separator: true},
 		{
 			ID:      addAction(func() (bool, bool, bool) { return true, false, false }),
@@ -375,6 +430,54 @@ func (h *appHost) switchAudioOut(dev string) {
 	_ = config.Save(h.cfgPath, h.cfg)
 }
 
+func (h *appHost) switchAudioMirror(id string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.AudioMirrorID = id
+	if h.aud != nil {
+		if err := h.aud.SetMirror(id); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: audio mirror: %v\n", err)
+			win.ShowErrorBox("capview", fmt.Sprintf("Failed to start audio mirror:\n%v", err))
+			h.cfg.AudioMirrorID = h.aud.MirrorID() // whatever is still running
+		}
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+// resolveMirror maps a -audio-mirror value (endpoint ID, name, name
+// substring, or "off") to an endpoint ID.
+func resolveMirror(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.EqualFold(v, "off") {
+		return "", nil
+	}
+	_, outs, err := audio.ListEndpointInfos()
+	if err != nil {
+		return "", err
+	}
+	return matchMirror(v, outs)
+}
+
+// matchMirror picks the playback endpoint for v: an exact (case-insensitive)
+// ID or name match wins over a name-substring match.
+func matchMirror(v string, outs []audio.EndpointInfo) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.EqualFold(v, "off") {
+		return "", nil
+	}
+	for _, e := range outs {
+		if strings.EqualFold(e.ID, v) || strings.EqualFold(e.Name, v) {
+			return e.ID, nil
+		}
+	}
+	for _, e := range outs {
+		if strings.Contains(strings.ToLower(e.Name), strings.ToLower(v)) {
+			return e.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no audio playback endpoint matching %q", v)
+}
+
 func runView(args []string) error {
 	cfgPath := config.DefaultPath()
 	cfg, _ := config.Load(cfgPath)
@@ -391,6 +494,7 @@ func runView(args []string) error {
 	noAudio := fs.Bool("no-audio", cfg.AudioDisabled, "disable WASAPI audio passthrough")
 	audioIn := fs.String("audio-in", cfg.AudioIn, "WASAPI audio capture device name, substring, or 'auto'")
 	audioOut := fs.String("audio-out", cfg.AudioOut, "WASAPI audio playback device name, substring, or 'default'")
+	audioMirror := fs.String("audio-mirror", "", "mirror audio to a second playback device: endpoint ID, name substring, or 'off' (default: saved config)")
 	volume := fs.Float64("volume", float64(cfg.Volume), "initial audio volume (0.0 to 1.0)")
 	renderer := fs.String("renderer", "d3d11", "render backend: d3d11 or vulkan")
 	source := fs.String("source", "mf", "video source: mf or synthetic")
@@ -450,6 +554,13 @@ func runView(args []string) error {
 	if setFlags["audio-out"] {
 		cfg.AudioOut = *audioOut
 	}
+	if setFlags["audio-mirror"] {
+		id, err := resolveMirror(*audioMirror)
+		if err != nil {
+			return err
+		}
+		cfg.AudioMirrorID = id
+	}
 	if setFlags["volume"] {
 		cfg.Volume = float32(*volume)
 	}
@@ -471,6 +582,7 @@ func runView(args []string) error {
 		cfgPath: cfgPath,
 		freq:    win.QPCFrequency(),
 		mailbox: capture.NewMailbox(),
+		diag:    *printStats,
 	}
 	if err := host.startVideo(srcKind); err != nil {
 		return err

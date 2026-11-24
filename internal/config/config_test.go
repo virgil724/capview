@@ -1,7 +1,9 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -35,5 +37,26 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	}
 	if got != cfg {
 		t.Fatalf("round-trip mismatch:\ngot:  %+v\nwant: %+v", got, cfg)
+	}
+}
+
+func TestAudioMirrorIDField(t *testing.T) {
+	if Default().AudioMirrorID != "" {
+		t.Fatal("mirror must default to off")
+	}
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"audio_mirror_id":"{0.0.0.00000000}.{abc}"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil || cfg.AudioMirrorID != "{0.0.0.00000000}.{abc}" {
+		t.Fatalf("Load audio_mirror_id = %q, %v", cfg.AudioMirrorID, err)
+	}
+	if err := Save(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	if !strings.Contains(string(data), `"audio_mirror_id": "{0.0.0.00000000}.{abc}"`) {
+		t.Fatalf("saved JSON missing snake_case field: %s", data)
 	}
 }

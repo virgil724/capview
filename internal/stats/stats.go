@@ -29,12 +29,14 @@ type Summary struct {
 	DevToArriveP50  float64
 	ArriveToPresP50 float64
 	ArriveToPresP99 float64
+	ArriveToPresMax float64
 	PresentCallP50  float64
 	PresentCallP99  float64
 	PresentCallMax  float64
 	HasPresentCall  bool
 	ArriveToVblP50  float64
 	ArriveToVblP99  float64
+	ArriveToVblMax  float64
 	HasVBlank       bool
 }
 
@@ -52,6 +54,10 @@ type Tracker struct {
 	dispBuf   []float64
 	dispIdx   int
 	dispCount int
+
+	// Whole-run latency histograms (bounded memory, 0.01 ms resolution).
+	runPres hist
+	runVbl  hist
 
 	windowFrames uint64
 	windowStart  int64 // QPC ticks
@@ -86,6 +92,10 @@ func (t *Tracker) Add(s Sample, nowQPC int64) {
 		t.count++
 	}
 	t.frames++
+	t.runPres.add(s.ArriveToPresentMS)
+	if s.HasVBlank {
+		t.runVbl.add(s.ArriveToVBlankMS)
+	}
 	if t.windowStart == 0 {
 		t.windowStart = nowQPC
 	}
@@ -103,6 +113,7 @@ func (t *Tracker) AddDisplayTiming(ms float64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.runVbl.add(ms)
 	t.dispBuf[t.dispIdx] = ms
 	t.dispIdx = (t.dispIdx + 1) % t.cap
 	if t.dispCount < t.cap {
@@ -154,6 +165,7 @@ func (t *Tracker) Summary() Summary {
 	s.DevToArriveP50 = percentile(devArr, 0.50)
 	s.ArriveToPresP50 = percentile(arrPres, 0.50)
 	s.ArriveToPresP99 = percentile(arrPres, 0.99)
+	s.ArriveToPresMax = arrPres[len(arrPres)-1]
 	if len(presCall) > 0 {
 		sort.Float64s(presCall)
 		s.HasPresentCall = true
@@ -166,6 +178,7 @@ func (t *Tracker) Summary() Summary {
 		s.HasVBlank = true
 		s.ArriveToVblP50 = percentile(arrVbl, 0.50)
 		s.ArriveToVblP99 = percentile(arrVbl, 0.99)
+		s.ArriveToVblMax = arrVbl[len(arrVbl)-1]
 	}
 	return s
 }
@@ -203,9 +216,92 @@ func (s Summary) FormatLineExt(mode, syncLabel, displayLabel string) string {
 	}
 	vblPart := ""
 	if s.HasVBlank && displayLabel != "" {
-		vblPart = fmt.Sprintf(" | %s p50 %.2fms p99 %.2fms",
-			displayLabel, s.ArriveToVblP50, s.ArriveToVblP99)
+		vblPart = fmt.Sprintf(" | %s p50 %.2fms p99 %.2fms max %.2fms",
+			displayLabel, s.ArriveToVblP50, s.ArriveToVblP99, s.ArriveToVblMax)
 	}
-	return fmt.Sprintf("%s | %.1f fps | %s | dev->arr %.2fms | arr->pres p50 %.2fms p99 %.2fms%s%s | drop %d",
-		mode, s.FPS, syncLabel, s.DevToArriveP50, s.ArriveToPresP50, s.ArriveToPresP99, presCallPart, vblPart, s.Dropped)
+	return fmt.Sprintf("%s | %.1f fps | %s | dev->arr %.2fms | arr->pres p50 %.2fms p99 %.2fms max %.2fms%s%s | drop %d",
+		mode, s.FPS, syncLabel, s.DevToArriveP50, s.ArriveToPresP50, s.ArriveToPresP99, s.ArriveToPresMax, presCallPart, vblPart, s.Dropped)
+}
+
+// RunSummary aggregates every sample since the tracker was created (not just
+// the rolling window), for end-of-run A/B measurements.
+type RunSummary struct {
+	Frames  uint64
+	Dropped uint64
+	Pres    Dist
+	Vbl     Dist
+}
+
+// Dist is a latency distribution summary in milliseconds.
+type Dist struct {
+	N             uint64
+	P50, P99, Max float64
+}
+
+// RunSummary returns whole-run arr->pres and arr->vbl percentiles and max.
+func (t *Tracker) RunSummary() RunSummary {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return RunSummary{Frames: t.frames, Dropped: t.dropped, Pres: t.runPres.dist(), Vbl: t.runVbl.dist()}
+}
+
+// String formats the run summary as one line.
+func (r RunSummary) String() string {
+	return fmt.Sprintf("run: frames %d drop %d | arr->pres n %d p50 %.2fms p99 %.2fms max %.2fms | arr->vbl n %d p50 %.2fms p99 %.2fms max %.2fms",
+		r.Frames, r.Dropped, r.Pres.N, r.Pres.P50, r.Pres.P99, r.Pres.Max, r.Vbl.N, r.Vbl.P50, r.Vbl.P99, r.Vbl.Max)
+}
+
+const (
+	histRes  = 0.01 // ms per bin
+	histBins = 50_000
+)
+
+// hist is a lazily allocated fixed-resolution histogram; samples beyond the
+// last bin land in it but Max stays exact.
+type hist struct {
+	bins []uint32
+	n    uint64
+	max  float64
+}
+
+func (h *hist) add(ms float64) {
+	if h.bins == nil {
+		h.bins = make([]uint32, histBins)
+	}
+	i := int(ms / histRes)
+	if i < 0 {
+		i = 0
+	}
+	if i >= histBins {
+		i = histBins - 1
+	}
+	h.bins[i]++
+	if h.n == 0 || ms > h.max {
+		h.max = ms
+	}
+	h.n++
+}
+
+func (h *hist) quantile(p float64) float64 {
+	// Same rank convention as percentile(): index int((n-1)*p).
+	rank := uint64(float64(h.n-1) * p)
+	var seen uint64
+	for i, c := range h.bins {
+		seen += uint64(c)
+		if seen > rank {
+			v := float64(i) * histRes
+			if v > h.max {
+				v = h.max
+			}
+			return v
+		}
+	}
+	return h.max
+}
+
+func (h *hist) dist() Dist {
+	if h.n == 0 {
+		return Dist{}
+	}
+	return Dist{N: h.n, P50: h.quantile(0.50), P99: h.quantile(0.99), Max: h.max}
 }

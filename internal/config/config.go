@@ -16,6 +16,7 @@ type Config struct {
 	Format        string  `json:"format"`
 	AudioIn       string  `json:"audio_in"`
 	AudioOut      string  `json:"audio_out"`
+	AudioMirrorID string  `json:"audio_mirror_id"` // playback endpoint ID for the mirror copy; "" = off
 	AudioDisabled bool    `json:"audio_disabled"`
 	Volume        float32 `json:"volume"`
 	Muted         bool    `json:"muted"`
