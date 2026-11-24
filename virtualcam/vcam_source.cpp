@@ -3,9 +3,30 @@
 #include <mfvirtualcamera.h>
 #include <algorithm>
 #include <array>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 
 namespace {
+
+void VcamTrace(const char* fmt, ...) {
+    if (GetFileAttributesW(L"C:\\ProgramData\\capview\\vcam_debug.enable") == INVALID_FILE_ATTRIBUTES) {
+        return;
+    }
+    static std::mutex traceMu;
+    std::lock_guard<std::mutex> lock(traceMu);
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, L"C:\\ProgramData\\capview\\vcam_dll_debug.log", L"a") != 0 || !f) {
+        return;
+    }
+    std::fprintf(f, "[pid=%lu tid=%lu] ", GetCurrentProcessId(), GetCurrentThreadId());
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', f);
+    std::fclose(f);
+}
 
 template <typename T>
 void SafeRelease(T*& p) {
@@ -75,14 +96,14 @@ HRESULT CreateNV12MediaType(const VideoModeSpec& spec, IMFMediaType** ppType) {
 CapviewMediaStream::CapviewMediaStream(CapviewMediaSource* parent, IMFStreamDescriptor* sd)
     : m_parent(parent), m_sd(sd) {
     g_comObjectCount.fetch_add(1, std::memory_order_relaxed);
-    if (m_parent) m_parent->AddRef();
+    // m_parent is a non-owning back-pointer cleared in Shutdown() to avoid a COM refcount cycle.
     if (m_sd) m_sd->AddRef();
 }
 
 CapviewMediaStream::~CapviewMediaStream() {
     Shutdown();
     SafeRelease(m_sd);
-    SafeRelease(m_parent);
+    m_parent = nullptr;
     g_comObjectCount.fetch_sub(1, std::memory_order_relaxed);
 }
 
@@ -194,10 +215,31 @@ STDMETHODIMP CapviewMediaStream::RequestSample(IUnknown* pToken) {
 }
 
 STDMETHODIMP CapviewMediaStream::SetStreamState(MF_STREAM_STATE value) {
+    VcamTrace("MediaStream::SetStreamState(%d)", static_cast<int>(value));
     if (value == MF_STREAM_STATE_RUNNING) {
         PROPVARIANT empty;
         PropVariantInit(&empty);
         return Start(&empty);
+    }
+    if (value == MF_STREAM_STATE_PAUSED) {
+        HANDLE threadH = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            if (m_shutdown) return MF_E_SHUTDOWN;
+            m_state = MF_STREAM_STATE_PAUSED;
+            threadH = m_thread;
+            m_thread = nullptr;
+        }
+        if (m_stopEvt) SetEvent(m_stopEvt);
+        if (threadH) {
+            WaitForSingleObject(threadH, 3000);
+            CloseHandle(threadH);
+        }
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (!m_shutdown && m_events) {
+            m_events->QueueEventParamVar(MEStreamPaused, GUID_NULL, S_OK, nullptr);
+        }
+        return S_OK;
     }
     if (value == MF_STREAM_STATE_STOPPED) {
         return Stop();
@@ -358,7 +400,7 @@ void CapviewMediaStream::Shutdown() {
     SafeRelease(m_allocEx);
     SafeRelease(m_alloc);
     SafeRelease(m_mediaType);
-    SafeRelease(m_parent);
+    m_parent = nullptr;
     if (m_wakeEvt) {
         CloseHandle(m_wakeEvt);
         m_wakeEvt = nullptr;
@@ -712,6 +754,10 @@ STDMETHODIMP CapviewMediaSource::QueryInterface(REFIID riid, void** ppv) {
     } else if (riid == IID_IMFSampleAllocatorControl) {
         *ppv = static_cast<IMFSampleAllocatorControl*>(this);
     } else {
+        VcamTrace("MediaSource::QI unsupported {%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                  riid.Data1, riid.Data2, riid.Data3,
+                  riid.Data4[0], riid.Data4[1], riid.Data4[2], riid.Data4[3],
+                  riid.Data4[4], riid.Data4[5], riid.Data4[6], riid.Data4[7]);
         *ppv = nullptr;
         return E_NOINTERFACE;
     }
@@ -764,6 +810,7 @@ STDMETHODIMP CapviewMediaSource::GetCharacteristics(DWORD* pdwCharacteristics) {
 }
 
 STDMETHODIMP CapviewMediaSource::CreatePresentationDescriptor(IMFPresentationDescriptor** ppPresentationDescriptor) {
+    VcamTrace("MediaSource::CreatePresentationDescriptor");
     if (!ppPresentationDescriptor) return E_POINTER;
     std::lock_guard<std::mutex> lock(m_mu);
     if (m_shutdown || !m_pd) return MF_E_SHUTDOWN;
@@ -771,8 +818,12 @@ STDMETHODIMP CapviewMediaSource::CreatePresentationDescriptor(IMFPresentationDes
 }
 
 STDMETHODIMP CapviewMediaSource::Start(IMFPresentationDescriptor* pPresentationDescriptor, const GUID* pguidTimeFormat, const PROPVARIANT* pvarStartPosition) {
-    if (!pPresentationDescriptor || !pvarStartPosition) return E_INVALIDARG;
+    VcamTrace("MediaSource::Start");
+    if (!pPresentationDescriptor) return E_INVALIDARG;
     if (pguidTimeFormat && *pguidTimeFormat != GUID_NULL) return MF_E_UNSUPPORTED_TIME_FORMAT;
+    PROPVARIANT emptyPos;
+    PropVariantInit(&emptyPos);
+    const PROPVARIANT* startPos = pvarStartPosition ? pvarStartPosition : &emptyPos;
 
     CapviewMediaStream* stream = nullptr;
     IMFMediaEventQueue* events = nullptr;
@@ -819,10 +870,10 @@ STDMETHODIMP CapviewMediaSource::Start(IMFPresentationDescriptor* pPresentationD
         S_OK,
         static_cast<IMFMediaStream2*>(stream));
     if (SUCCEEDED(hr)) {
-        hr = stream->Start(pvarStartPosition);
+        hr = stream->Start(startPos);
     }
     if (SUCCEEDED(hr)) {
-        hr = events->QueueEventParamVar(MESourceStarted, GUID_NULL, S_OK, pvarStartPosition);
+        hr = events->QueueEventParamVar(MESourceStarted, GUID_NULL, S_OK, startPos);
     }
     stream->Release();
     events->Release();
@@ -857,6 +908,7 @@ STDMETHODIMP CapviewMediaSource::Pause() {
 }
 
 STDMETHODIMP CapviewMediaSource::Shutdown() {
+    VcamTrace("MediaSource::Shutdown");
     CapviewMediaStream* stream = nullptr;
     IMFMediaEventQueue* events = nullptr;
     {
@@ -884,6 +936,7 @@ STDMETHODIMP CapviewMediaSource::Shutdown() {
 }
 
 STDMETHODIMP CapviewMediaSource::GetSourceAttributes(IMFAttributes** ppAttributes) {
+    VcamTrace("MediaSource::GetSourceAttributes");
     if (!ppAttributes) return E_POINTER;
     std::lock_guard<std::mutex> lock(m_mu);
     if (m_shutdown || !m_sourceAttrs) return MF_E_SHUTDOWN;
@@ -893,6 +946,7 @@ STDMETHODIMP CapviewMediaSource::GetSourceAttributes(IMFAttributes** ppAttribute
 }
 
 STDMETHODIMP CapviewMediaSource::GetStreamAttributes(DWORD dwStreamIdentifier, IMFAttributes** ppAttributes) {
+    VcamTrace("MediaSource::GetStreamAttributes(%lu)", dwStreamIdentifier);
     if (!ppAttributes) return E_POINTER;
     if (dwStreamIdentifier != 0) return MF_E_INVALIDSTREAMNUMBER;
     std::lock_guard<std::mutex> lock(m_mu);
@@ -903,7 +957,8 @@ STDMETHODIMP CapviewMediaSource::GetStreamAttributes(DWORD dwStreamIdentifier, I
 }
 
 STDMETHODIMP CapviewMediaSource::SetD3DManager(IUnknown*) {
-    return E_NOTIMPL;
+    VcamTrace("MediaSource::SetD3DManager");
+    return S_OK;
 }
 
 STDMETHODIMP CapviewMediaSource::GetService(REFGUID guidService, REFIID riid, LPVOID* ppvObject) {
@@ -931,6 +986,7 @@ STDMETHODIMP CapviewMediaSource::KsEvent(PKSEVENT, ULONG, LPVOID, ULONG, ULONG* 
 }
 
 STDMETHODIMP CapviewMediaSource::SetDefaultAllocator(DWORD dwOutputStreamID, IUnknown* pAllocator) {
+    VcamTrace("MediaSource::SetDefaultAllocator(%lu, %p)", dwOutputStreamID, pAllocator);
     if (dwOutputStreamID != 0) return MF_E_INVALIDSTREAMNUMBER;
     std::lock_guard<std::mutex> lock(m_mu);
     if (m_shutdown || !m_stream) return MF_E_SHUTDOWN;
@@ -938,6 +994,7 @@ STDMETHODIMP CapviewMediaSource::SetDefaultAllocator(DWORD dwOutputStreamID, IUn
 }
 
 STDMETHODIMP CapviewMediaSource::GetAllocatorUsage(DWORD dwOutputStreamID, DWORD* pdwInputStreamID, MFSampleAllocatorUsage* peUsage) {
+    VcamTrace("MediaSource::GetAllocatorUsage(%lu)", dwOutputStreamID);
     if (dwOutputStreamID != 0) return MF_E_INVALIDSTREAMNUMBER;
     if (!pdwInputStreamID || !peUsage) return E_POINTER;
     *pdwInputStreamID = 0;
@@ -973,7 +1030,8 @@ CapviewActivator::CapviewActivator() {
 }
 
 CapviewActivator::~CapviewActivator() {
-    ShutdownObject();
+    VcamTrace("~CapviewActivator");
+    SafeRelease(m_source);
     SafeRelease(m_attrs);
     g_comObjectCount.fetch_sub(1, std::memory_order_relaxed);
 }
@@ -1037,14 +1095,18 @@ STDMETHODIMP CapviewActivator::GetItemByIndex(UINT32 i, GUID* k, PROPVARIANT* v)
 STDMETHODIMP CapviewActivator::CopyAllItems(IMFAttributes* d) { return m_attrs->CopyAllItems(d); }
 
 STDMETHODIMP CapviewActivator::ActivateObject(REFIID riid, void** ppv) {
+    VcamTrace("CapviewActivator::ActivateObject");
     if (!ppv) return E_POINTER;
     *ppv = nullptr;
     std::lock_guard<std::mutex> lock(m_mu);
     if (!m_source) {
         HRESULT hr = CreateCapviewMediaSource(m_attrs, &m_source);
+        VcamTrace("CreateCapviewMediaSource hr=0x%08lX", hr);
         if (FAILED(hr)) return hr;
     }
-    return m_source->QueryInterface(riid, ppv);
+    HRESULT hr = m_source->QueryInterface(riid, ppv);
+    VcamTrace("ActivateObject QI hr=0x%08lX", hr);
+    return hr;
 }
 
 STDMETHODIMP CapviewActivator::ShutdownObject() {
