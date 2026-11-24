@@ -450,6 +450,16 @@ func resolveMirror(v string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return matchMirror(v, outs)
+}
+
+// matchMirror picks the playback endpoint for v: an exact (case-insensitive)
+// ID or name match wins over a name-substring match.
+func matchMirror(v string, outs []audio.EndpointInfo) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" || strings.EqualFold(v, "off") {
+		return "", nil
+	}
 	for _, e := range outs {
 		if strings.EqualFold(e.ID, v) || strings.EqualFold(e.Name, v) {
 			return e.ID, nil
