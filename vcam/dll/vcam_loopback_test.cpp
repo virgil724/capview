@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "dshow_filter.h"
 #include "placeholder.h"
 #include "shm_protocol.h"
 #include "shm_reader.h"
@@ -222,6 +223,10 @@ public:
 
     ~TestSinkPin() {
         Disconnect();
+        if (m_customAllocator) {
+            m_customAllocator->Release();
+            m_customAllocator = nullptr;
+        }
         if (m_doneEvt) CloseHandle(m_doneEvt);
     }
 
@@ -344,7 +349,15 @@ public:
     STDMETHODIMP NewSegment(REFERENCE_TIME, REFERENCE_TIME, double) override { return S_OK; }
 
     // IMemInputPin
-    STDMETHODIMP GetAllocator(IMemAllocator**) override { return VFW_E_NO_ALLOCATOR; }
+    STDMETHODIMP GetAllocator(IMemAllocator** ppAllocator) override {
+        if (!ppAllocator) return E_POINTER;
+        if (m_customAllocator) {
+            *ppAllocator = m_customAllocator;
+            (*ppAllocator)->AddRef();
+            return S_OK;
+        }
+        return VFW_E_NO_ALLOCATOR;
+    }
 
     STDMETHODIMP NotifyAllocator(IMemAllocator* pAllocator, BOOL) override {
         std::lock_guard<std::mutex> lock(m_mu);
@@ -357,7 +370,31 @@ public:
     STDMETHODIMP GetAllocatorRequirements(ALLOCATOR_PROPERTIES* pProps) override {
         if (!pProps) return E_POINTER;
         std::memset(pProps, 0, sizeof(*pProps));
+        if (m_minBufferBytes > 0) {
+            pProps->cBuffers = 3;
+            pProps->cbBuffer = m_minBufferBytes;
+            pProps->cbAlign = 1;
+            return S_OK;
+        }
         return E_NOTIMPL;
+    }
+
+    void SetCustomAllocator(IMemAllocator* alloc, long minBufferBytes) {
+        if (m_customAllocator) m_customAllocator->Release();
+        m_customAllocator = alloc;
+        if (m_customAllocator) m_customAllocator->AddRef();
+        m_minBufferBytes = minBufferBytes;
+    }
+
+    void ResetCounter(int targetFrames) {
+        std::lock_guard<std::mutex> lock(m_mu);
+        m_targetFrames = targetFrames;
+        m_received = 0;
+        m_lastRtStart = -1;
+        m_nonMonotonicTimestamps = 0;
+        m_missingSyncPoints = 0;
+        m_lastFrame.clear();
+        ResetEvent(m_doneEvt);
     }
 
     STDMETHODIMP Receive(IMediaSample* pSample) override {
@@ -433,6 +470,8 @@ private:
     std::mutex m_mu;
     IPin* m_connected = nullptr;
     IMemAllocator* m_allocator = nullptr;
+    IMemAllocator* m_customAllocator = nullptr;
+    long m_minBufferBytes = 0;
     AM_MEDIA_TYPE m_mt{};
     int m_targetFrames = 5;
     int m_received = 0;
@@ -442,6 +481,89 @@ private:
     std::vector<uint8_t> m_lastFrame;
     HANDLE m_doneEvt = nullptr;
 };
+
+// Wraps CLSID_MemoryAllocator and attaches a dynamic padded-stride AM_MEDIA_TYPE
+// (e.g. EVR/VMR biWidth=2048, rcTarget=1920x1080) to the first sample returned by GetBuffer.
+class DynamicPaddedAllocator final : public IMemAllocator {
+public:
+    DynamicPaddedAllocator(IMemAllocator* inner, const AM_MEDIA_TYPE& dynMt)
+        : m_inner(inner) {
+        if (m_inner) m_inner->AddRef();
+        m_dynMt = dynMt;
+        m_dynMt.pbFormat = nullptr;
+        m_dynMt.cbFormat = 0;
+        m_dynMt.pUnk = nullptr;
+        if (dynMt.cbFormat > 0 && dynMt.pbFormat) {
+            m_dynMt.pbFormat = static_cast<BYTE*>(CoTaskMemAlloc(dynMt.cbFormat));
+            if (m_dynMt.pbFormat) {
+                std::memcpy(m_dynMt.pbFormat, dynMt.pbFormat, dynMt.cbFormat);
+                m_dynMt.cbFormat = dynMt.cbFormat;
+            }
+        }
+    }
+
+    ~DynamicPaddedAllocator() {
+        FreeMT(m_dynMt);
+        if (m_inner) m_inner->Release();
+    }
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IMemAllocator) {
+            *ppv = static_cast<IMemAllocator*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return static_cast<ULONG>(m_ref.fetch_add(1, std::memory_order_relaxed) + 1);
+    }
+
+    STDMETHODIMP_(ULONG) Release() override {
+        long c = m_ref.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (c == 0) delete this;
+        return static_cast<ULONG>(c);
+    }
+
+    STDMETHODIMP SetProperties(ALLOCATOR_PROPERTIES* pRequest, ALLOCATOR_PROPERTIES* pActual) override {
+        return m_inner->SetProperties(pRequest, pActual);
+    }
+
+    STDMETHODIMP GetProperties(ALLOCATOR_PROPERTIES* pProps) override {
+        return m_inner->GetProperties(pProps);
+    }
+
+    STDMETHODIMP Commit() override { return m_inner->Commit(); }
+    STDMETHODIMP Decommit() override { return m_inner->Decommit(); }
+
+    STDMETHODIMP GetBuffer(IMediaSample** ppBuffer, REFERENCE_TIME* pStartTime,
+                           REFERENCE_TIME* pEndTime, DWORD dwFlags) override {
+        HRESULT hr = m_inner->GetBuffer(ppBuffer, pStartTime, pEndTime, dwFlags);
+        if (SUCCEEDED(hr) && ppBuffer && *ppBuffer) {
+            bool expected = false;
+            if (m_attachedOnce.compare_exchange_strong(expected, true)) {
+                (void)(*ppBuffer)->SetMediaType(&m_dynMt);
+            }
+        }
+        return hr;
+    }
+
+    STDMETHODIMP ReleaseBuffer(IMediaSample* pBuffer) override {
+        return m_inner->ReleaseBuffer(pBuffer);
+    }
+
+private:
+    std::atomic<long> m_ref{1};
+    std::atomic<bool> m_attachedOnce{false};
+    IMemAllocator* m_inner = nullptr;
+    AM_MEDIA_TYPE m_dynMt{};
+};
+
+bool VerifyDShowDynamicPaddedStride(const std::wstring& dllPath);
+bool VerifyDShowStopDetachesShmHandle();
 
 int RunDShowInprocTest(const std::wstring& dllPath, int numFrames, bool expectLive, uint8_t expectedLiveLuma) {
     HMODULE mod = LoadLibraryW(dllPath.c_str());
@@ -753,6 +875,11 @@ int RunDShowInprocTest(const std::wstring& dllPath, int numFrames, bool expectLi
             if (fnCanUnload && fnCanUnload() != S_OK) {
                 std::printf("FAIL: DllCanUnloadNow != S_OK after releasing all DirectShow COM objects\n");
                 break;
+            }
+            if (!expectLive) {
+                if (!VerifyDShowDynamicPaddedStride(dllPath) || !VerifyDShowStopDetachesShmHandle()) {
+                    break;
+                }
             }
             std::printf("PASS: DirectShow in-proc test succeeded (NV12 + YUY2 + RGB24, zero COM leaks)\n");
             rc = 0;
@@ -1278,6 +1405,307 @@ bool VerifyStopDetachesShmHandle() {
     src->Shutdown();
     src->Release();
     DeleteFileW(path.c_str());
+    return ok;
+}
+
+// Verifies PR #6 Fix 1: CapviewDShowPin::Inactive() (called by filter->Stop())
+// detaches SHM handles without releasing or disconnecting the filter, allowing
+// DeleteFileW + CREATE_NEW (no NTFS delete-pending) and clean re-attach on Run().
+bool VerifyDShowStopDetachesShmHandle() {
+    const std::wstring path = MakeTempShmPath(L"capview_dshow_stop_detach");
+    DeleteFileW(path.c_str());
+    if (!WriteTestShmFile(path, /*active=*/1, /*seq=*/1, /*populateSlot=*/true, 0x5A, /*createNew=*/true)) {
+        return false;
+    }
+
+    auto* filter = new CapviewDShowFilter();
+    filter->SetShmFilePathForTest(path.c_str());
+
+    IEnumPins* enumPins = nullptr;
+    IPin* outPin = nullptr;
+    ULONG fetched = 0;
+    if (FAILED(filter->EnumPins(&enumPins)) || enumPins->Next(1, &outPin, &fetched) != S_OK || !outPin) {
+        if (enumPins) enumPins->Release();
+        filter->Release();
+        DeleteFileW(path.c_str());
+        std::printf("FAIL [DShow-stop-detach]: failed to get output pin\n");
+        return false;
+    }
+    enumPins->Release();
+
+    auto* sink = new TestSinkPin(3);
+    bool ok = false;
+    do {
+        if (FAILED(outPin->Connect(static_cast<IPin*>(sink), nullptr))) {
+            std::printf("FAIL [DShow-stop-detach]: Connect failed\n");
+            break;
+        }
+        if (FAILED(filter->Pause()) || FAILED(filter->Run(0))) {
+            std::printf("FAIL [DShow-stop-detach]: first Run failed\n");
+            break;
+        }
+        if (!sink->WaitDone(4000)) {
+            std::printf("FAIL [DShow-stop-detach]: timed out waiting for initial frames\n");
+            break;
+        }
+        const auto f1 = sink->LastFrame();
+        if (f1.empty() || f1[0] != 0x5A) {
+            std::printf("FAIL [DShow-stop-detach]: first frame pixel0=0x%02X, want 0x5A\n",
+                        f1.empty() ? 0u : f1[0]);
+            break;
+        }
+
+        // Stop WITHOUT disconnecting or releasing the DirectShow filter.
+        if (FAILED(filter->Stop())) {
+            std::printf("FAIL [DShow-stop-detach]: Stop failed\n");
+            break;
+        }
+
+        if (!DeleteFileW(path.c_str())) {
+            std::printf("FAIL [DShow-stop-detach]: DeleteFileW after Stop failed: %lu\n", GetLastError());
+            break;
+        }
+        if (!WriteTestShmFile(path, /*active=*/1, /*seq=*/2, /*populateSlot=*/true, 0xA5, /*createNew=*/true)) {
+            std::printf("FAIL [DShow-stop-detach]: CREATE_NEW after Stop failed (SHM handle still held!)\n");
+            break;
+        }
+
+        sink->ResetCounter(3);
+        if (FAILED(filter->Pause()) || FAILED(filter->Run(0))) {
+            std::printf("FAIL [DShow-stop-detach]: second Run failed\n");
+            break;
+        }
+        if (!sink->WaitDone(4000)) {
+            std::printf("FAIL [DShow-stop-detach]: timed out waiting for re-attached frames\n");
+            break;
+        }
+        const auto f2 = sink->LastFrame();
+        if (f2.empty() || f2[0] != 0xA5) {
+            std::printf("FAIL [DShow-stop-detach]: re-attached frame pixel0=0x%02X, want 0xA5\n",
+                        f2.empty() ? 0u : f2[0]);
+            break;
+        }
+        std::printf("OK [DShow-stop-detach]: Inactive() released SHM handle (delete+recreate succeeded) and Run() re-attached (0x5A -> 0xA5)\n");
+        ok = true;
+    } while (false);
+
+    (void)filter->Stop();
+    (void)outPin->Disconnect();
+    (void)sink->Disconnect();
+    sink->Release();
+    outPin->Release();
+    filter->Release();
+    DeleteFileW(path.c_str());
+    return ok;
+}
+
+// Verifies PR #6 Fix 2: dynamic padded biWidth stride (e.g. EVR attaching
+// biWidth=2048 with rcTarget={0,0,1920,1080} via IMediaSample::GetMediaType)
+// across NV12, YUY2, and bottom-up RGB24.
+bool VerifyDShowDynamicPaddedStride(const std::wstring& dllPath) {
+    HMODULE mod = LoadLibraryW(dllPath.c_str());
+    if (!mod) {
+        std::wprintf(L"FAIL [DShow-padded]: LoadLibraryW(%ls) failed\n", dllPath.c_str());
+        return false;
+    }
+    auto fnGetClass = reinterpret_cast<FnDllGetClassObject>(GetProcAddress(mod, "DllGetClassObject"));
+    IClassFactory* factory = nullptr;
+    if (!fnGetClass || FAILED(fnGetClass(CLSID_CapviewVirtualCamDShow, IID_PPV_ARGS(&factory)))) {
+        std::printf("FAIL [DShow-padded]: DllGetClassObject failed\n");
+        FreeLibrary(mod);
+        return false;
+    }
+    IBaseFilter* filter = nullptr;
+    HRESULT hr = factory->CreateInstance(nullptr, IID_PPV_ARGS(&filter));
+    factory->Release();
+    if (FAILED(hr) || !filter) {
+        std::printf("FAIL [DShow-padded]: CreateInstance failed\n");
+        FreeLibrary(mod);
+        return false;
+    }
+
+    IEnumPins* enumPins = nullptr;
+    IPin* outPin = nullptr;
+    ULONG fetched = 0;
+    if (FAILED(filter->EnumPins(&enumPins)) || enumPins->Next(1, &outPin, &fetched) != S_OK || !outPin) {
+        if (enumPins) enumPins->Release();
+        filter->Release();
+        FreeLibrary(mod);
+        return false;
+    }
+    enumPins->Release();
+
+    IAMStreamConfig* cfg = nullptr;
+    if (FAILED(outPin->QueryInterface(IID_PPV_ARGS(&cfg)))) {
+        outPin->Release();
+        filter->Release();
+        FreeLibrary(mod);
+        return false;
+    }
+
+    const int activeW = 1920;
+    const int activeH = 1080;
+    const int paddedW = 2048;
+
+    struct PaddedCase {
+        const char* name;
+        GUID subtype;
+        WORD bitCount;
+        DWORD compression;
+        long paddedBytes;
+    };
+    const PaddedCase cases[3] = {
+        {"NV12",  kSubtypeNV12,       12, MAKEFOURCC('N', 'V', '1', '2'), paddedW * activeH * 3 / 2},
+        {"YUY2",  MEDIASUBTYPE_YUY2,  16, MAKEFOURCC('Y', 'U', 'Y', '2'), paddedW * activeH * 2},
+        {"RGB24", MEDIASUBTYPE_RGB24, 24, BI_RGB,                         (((paddedW * 3) + 3) & ~3) * activeH},
+    };
+
+    bool ok = true;
+    int capCount = 0, capSize = 0;
+    cfg->GetNumberOfCapabilities(&capCount, &capSize);
+
+    for (const auto& tc : cases) {
+        AM_MEDIA_TYPE* baseMt = nullptr;
+        for (int i = 0; i < capCount; ++i) {
+            AM_MEDIA_TYPE* mt = nullptr;
+            VIDEO_STREAM_CONFIG_CAPS scc{};
+            if (SUCCEEDED(cfg->GetStreamCaps(i, &mt, reinterpret_cast<BYTE*>(&scc))) && mt) {
+                const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(mt->pbFormat);
+                if (mt->subtype == tc.subtype &&
+                    vih->bmiHeader.biWidth == activeW &&
+                    vih->bmiHeader.biHeight == activeH &&
+                    vih->AvgTimePerFrame <= 170000) {
+                    baseMt = mt;
+                    break;
+                }
+                DeleteMT(mt);
+            }
+        }
+        if (!baseMt) {
+            std::printf("FAIL [DShow-padded-%s]: cap not found\n", tc.name);
+            ok = false;
+            break;
+        }
+
+        // Build dynamic media type with biWidth=2048 and rcSource/rcTarget=1920x1080.
+        AM_MEDIA_TYPE dynMt = *baseMt;
+        auto* dynVih = static_cast<VIDEOINFOHEADER*>(CoTaskMemAlloc(sizeof(VIDEOINFOHEADER)));
+        std::memcpy(dynVih, baseMt->pbFormat, sizeof(VIDEOINFOHEADER));
+        dynVih->rcSource = {0, 0, activeW, activeH};
+        dynVih->rcTarget = {0, 0, activeW, activeH};
+        dynVih->bmiHeader.biWidth = paddedW;
+        dynVih->bmiHeader.biHeight = activeH;
+        dynVih->bmiHeader.biBitCount = tc.bitCount;
+        dynVih->bmiHeader.biCompression = tc.compression;
+        dynVih->bmiHeader.biSizeImage = static_cast<DWORD>(tc.paddedBytes);
+        dynMt.lSampleSize = static_cast<ULONG>(tc.paddedBytes);
+        dynMt.pbFormat = reinterpret_cast<BYTE*>(dynVih);
+        dynMt.cbFormat = sizeof(VIDEOINFOHEADER);
+        dynMt.pUnk = nullptr;
+
+        IMemAllocator* innerAlloc = nullptr;
+        hr = CoCreateInstance(CLSID_MemoryAllocator, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&innerAlloc));
+        if (FAILED(hr) || !innerAlloc) {
+            FreeMT(dynMt);
+            DeleteMT(baseMt);
+            ok = false;
+            break;
+        }
+        auto* paddedAlloc = new DynamicPaddedAllocator(innerAlloc, dynMt);
+        innerAlloc->Release();
+        FreeMT(dynMt);
+
+        auto* sink = new TestSinkPin(4);
+        sink->SetCustomAllocator(paddedAlloc, tc.paddedBytes);
+        paddedAlloc->Release();
+
+        if (FAILED(cfg->SetFormat(baseMt)) ||
+            FAILED(outPin->Connect(static_cast<IPin*>(sink), nullptr)) ||
+            FAILED(filter->Pause()) ||
+            FAILED(filter->Run(0)) ||
+            !sink->WaitDone(4000)) {
+            std::printf("FAIL [DShow-padded-%s]: streaming with biWidth=2048 failed\n", tc.name);
+            ok = false;
+        }
+        (void)filter->Stop();
+        const auto frame = sink->LastFrame();
+        (void)outPin->Disconnect();
+        (void)sink->Disconnect();
+        sink->Release();
+        DeleteMT(baseMt);
+
+        if (!ok) break;
+        if (static_cast<long>(frame.size()) != tc.paddedBytes) {
+            std::printf("FAIL [DShow-padded-%s]: actual bytes=%zu, want %ld\n", tc.name, frame.size(), tc.paddedBytes);
+            ok = false;
+            break;
+        }
+
+        if (tc.subtype == kSubtypeNV12) {
+            ok = VerifyNV12PlaceholderPixels(frame.data(), paddedW, activeW, activeH, "DShow-padded-NV12-2048");
+            const uint8_t uvCorner = frame[static_cast<size_t>(paddedW) * activeH + 8];
+            if (ok && (uvCorner < 96 || uvCorner > 160)) {
+                std::printf("FAIL [DShow-padded-NV12-2048]: UV plane at offset %d*1080 has unexpected byte=%u\n", paddedW, uvCorner);
+                ok = false;
+            }
+        } else if (tc.subtype == MEDIASUBTYPE_YUY2) {
+            const int rowStride = paddedW * 2;
+            uint8_t cornerY = frame[static_cast<size_t>(8) * rowStride + 8 * 2];
+            uint8_t maxWordY = 0;
+            int brightPx = 0;
+            for (int y = static_cast<int>(activeH * 0.34); y < static_cast<int>(activeH * 0.56); ++y) {
+                const uint8_t* row = frame.data() + static_cast<size_t>(y) * rowStride;
+                for (int x = static_cast<int>(activeW * 0.25); x < static_cast<int>(activeW * 0.75); ++x) {
+                    uint8_t yv = row[static_cast<size_t>(x) * 2];
+                    if (yv > maxWordY) maxWordY = yv;
+                    if (yv >= 190) ++brightPx;
+                }
+            }
+            if (cornerY < 16 || cornerY > 45 || maxWordY < 200 || brightPx < 100) {
+                std::printf("FAIL [DShow-padded-YUY2-2048]: cornerY=%u maxWordY=%u brightPx=%d\n", cornerY, maxWordY, brightPx);
+                ok = false;
+            } else {
+                std::printf("OK [DShow-padded-YUY2-2048]: stride=%d cornerY=%u maxWordY=%u brightPx=%d\n", rowStride, cornerY, maxWordY, brightPx);
+            }
+        } else {
+            const int rowStride = ((paddedW * 3) + 3) & ~3;
+            auto pxAtTopDown = [&](int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) {
+                const int bufY = activeH - 1 - y;
+                const uint8_t* row = frame.data() + static_cast<size_t>(bufY) * rowStride;
+                b = row[static_cast<size_t>(x) * 3 + 0];
+                g = row[static_cast<size_t>(x) * 3 + 1];
+                r = row[static_cast<size_t>(x) * 3 + 2];
+            };
+            int wordPx = 0;
+            for (int y = static_cast<int>(activeH * 0.34); y < static_cast<int>(activeH * 0.56); ++y) {
+                for (int x = static_cast<int>(activeW * 0.25); x < static_cast<int>(activeW * 0.75); ++x) {
+                    uint8_t r, g, b;
+                    pxAtTopDown(x, y, r, g, b);
+                    if (r >= 200 && g >= 200 && b >= 200) ++wordPx;
+                }
+            }
+            int cyanBelow = 0;
+            for (int y = static_cast<int>(activeH * 0.51); y < static_cast<int>(activeH * 0.60); ++y) {
+                for (int x = static_cast<int>(activeW * 0.42); x < static_cast<int>(activeW * 0.58); ++x) {
+                    uint8_t r, g, b;
+                    pxAtTopDown(x, y, r, g, b);
+                    if (b > 180 && g > 140 && b > r + 100) ++cyanBelow;
+                }
+            }
+            if (wordPx < 100 || cyanBelow < 50) {
+                std::printf("FAIL [DShow-padded-RGB24-2048]: wordPx=%d cyanBelow=%d\n", wordPx, cyanBelow);
+                ok = false;
+            } else {
+                std::printf("OK [DShow-padded-RGB24-2048]: stride=%d wordPx=%d cyanBelow=%d (bottom-up verified)\n", rowStride, wordPx, cyanBelow);
+            }
+        }
+        if (!ok) break;
+    }
+
+    cfg->Release();
+    outPin->Release();
+    filter->Release();
+    FreeLibrary(mod);
     return ok;
 }
 

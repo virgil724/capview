@@ -35,6 +35,11 @@ struct DShowVideoFormat {
     int fpsNum = 60;
     int fpsDen = 1;
     bool topDown = false; // only relevant for RGB24 (false = bottom-up DIB, biHeight > 0)
+    int stridePixels = 0; // buffer row stride in pixels (0 => equals width; >= width for padded EVR/VMR buffers)
+
+    int StridePixels() const {
+        return (stridePixels > width) ? stridePixels : width;
+    }
 
     REFERENCE_TIME AvgTimePerFrame() const {
         if (fpsNum <= 0) return 166666;
@@ -47,13 +52,14 @@ struct DShowVideoFormat {
     }
 
     DWORD FrameBytes() const {
+        const int s = StridePixels();
         switch (pixelFormat) {
         case DShowPixelFormat::NV12:
-            return static_cast<DWORD>(width * height * 3 / 2);
+            return static_cast<DWORD>(s * height * 3 / 2);
         case DShowPixelFormat::YUY2:
-            return static_cast<DWORD>(width * height * 2);
+            return static_cast<DWORD>(s * height * 2);
         case DShowPixelFormat::RGB24: {
-            const int stride = ((width * 3) + 3) & ~3;
+            const int stride = ((s * 3) + 3) & ~3;
             return static_cast<DWORD>(stride * height);
         }
         }
@@ -119,6 +125,7 @@ public:
     HRESULT Run(REFERENCE_TIME tStart);
     HRESULT Pause();
     HRESULT Inactive();
+    void SetShmFilePathForTest(const wchar_t* path);
 
     std::vector<AM_MEDIA_TYPE> BuildOfferedMediaTypes();
 
@@ -196,6 +203,7 @@ public:
     bool IsStopped() const;
     IFilterGraph* Graph();
     IReferenceClock* GetClockAddRef();
+    void SetShmFilePathForTest(const wchar_t* path);
 
 private:
     std::atomic<long> m_ref{1};

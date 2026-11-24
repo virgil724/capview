@@ -184,9 +184,29 @@ bool ValidateMediaType(const AM_MEDIA_TYPE* pmt, DShowVideoFormat& outFmt) {
 
     const auto* vih = reinterpret_cast<const VIDEOINFOHEADER*>(pmt->pbFormat);
     const BITMAPINFOHEADER& bih = vih->bmiHeader;
-    const int w = bih.biWidth;
-    const int h = (bih.biHeight < 0) ? -bih.biHeight : bih.biHeight;
-    if (!((w == 1920 && h == 1080) || (w == 1280 && h == 720))) {
+    const int bufW = bih.biWidth;
+    const int bufH = (bih.biHeight < 0) ? -bih.biHeight : bih.biHeight;
+
+    // Downstream renderers (EVR/VMR) may attach a padded biWidth (e.g. 2048)
+    // while carrying the active image dimensions in rcTarget or rcSource.
+    int activeW = bufW;
+    int activeH = bufH;
+    const int tgtW = vih->rcTarget.right - vih->rcTarget.left;
+    const int tgtH = vih->rcTarget.bottom - vih->rcTarget.top;
+    const int srcW = vih->rcSource.right - vih->rcSource.left;
+    const int srcH = vih->rcSource.bottom - vih->rcSource.top;
+    if (tgtW > 0 && tgtH > 0) {
+        activeW = tgtW;
+        activeH = tgtH;
+    } else if (srcW > 0 && srcH > 0) {
+        activeW = srcW;
+        activeH = srcH;
+    }
+
+    if (!((activeW == 1920 && activeH == 1080) || (activeW == 1280 && activeH == 720))) {
+        return false;
+    }
+    if (bufW < activeW || (bufW & 1) != 0 || bufW > 4096 || bufH != activeH) {
         return false;
     }
 
@@ -230,11 +250,12 @@ bool ValidateMediaType(const AM_MEDIA_TYPE* pmt, DShowVideoFormat& outFmt) {
     }
 
     outFmt.pixelFormat = pf;
-    outFmt.width = w;
-    outFmt.height = h;
+    outFmt.width = activeW;
+    outFmt.height = activeH;
     outFmt.fpsNum = fpsNum;
     outFmt.fpsDen = fpsDen;
     outFmt.topDown = topDown;
+    outFmt.stridePixels = bufW;
     return true;
 }
 
@@ -1072,6 +1093,10 @@ HRESULT CapviewDShowPin::Inactive() {
         WaitForSingleObject(threadH, 5000);
         CloseHandle(threadH);
     }
+    // Detach SHM handles once the worker thread has stopped so an idle DirectShow
+    // filter does not keep vcam_frames.shm open (preventing NTFS delete-pending on
+    // uninstall/reinstall). WorkerLoop re-attaches cleanly on the next Run().
+    m_shm.Detach();
     if (connected) {
         (void)connected->EndFlush();
         connected->Release();
@@ -1081,6 +1106,10 @@ HRESULT CapviewDShowPin::Inactive() {
     }
     if (m_runEvt) ResetEvent(m_runEvt);
     return S_OK;
+}
+
+void CapviewDShowPin::SetShmFilePathForTest(const wchar_t* path) {
+    m_shm.SetFilePathOverride(path);
 }
 
 DWORD WINAPI CapviewDShowPin::WorkerThreadProc(LPVOID param) {
@@ -1096,6 +1125,7 @@ void CapviewDShowPin::FillSampleBuffer(
     uint64_t& outSeq, int64_t& outTsHns) {
     const int w = fmt.width;
     const int h = fmt.height;
+    const int stridePx = fmt.StridePixels();
     const DWORD needed = fmt.FrameBytes();
     if (bufSize < static_cast<long>(needed) || !dst) {
         outSeq = 0;
@@ -1105,8 +1135,8 @@ void CapviewDShowPin::FillSampleBuffer(
 
     if (fmt.pixelFormat == DShowPixelFormat::NV12) {
         uint8_t* dstY = dst;
-        uint8_t* dstUV = dst + static_cast<size_t>(w) * h;
-        m_shm.ReadLatestNV12(dstY, w, dstUV, w, w, h, outSeq, outTsHns);
+        uint8_t* dstUV = dst + static_cast<size_t>(stridePx) * h;
+        m_shm.ReadLatestNV12(dstY, stridePx, dstUV, stridePx, w, h, outSeq, outTsHns);
         return;
     }
 
@@ -1119,9 +1149,9 @@ void CapviewDShowPin::FillSampleBuffer(
     m_shm.ReadLatestNV12(srcY, w, srcUV, w, w, h, outSeq, outTsHns);
 
     if (fmt.pixelFormat == DShowPixelFormat::YUY2) {
-        ConvertNV12ToYUY2(srcY, srcUV, w, h, dst, w * 2);
+        ConvertNV12ToYUY2(srcY, srcUV, w, h, dst, stridePx * 2);
     } else {
-        const int dstStride = ((w * 3) + 3) & ~3;
+        const int dstStride = ((stridePx * 3) + 3) & ~3;
         ConvertNV12ToRGB24(srcY, srcUV, w, h, dst, dstStride, fmt.topDown);
     }
 }
@@ -1481,6 +1511,10 @@ IReferenceClock* CapviewDShowFilter::GetClockAddRef() {
     std::lock_guard<std::mutex> lock(m_mu);
     if (m_clock) m_clock->AddRef();
     return m_clock;
+}
+
+void CapviewDShowFilter::SetShmFilePathForTest(const wchar_t* path) {
+    m_pin.SetShmFilePathForTest(path);
 }
 
 // ============================================================================

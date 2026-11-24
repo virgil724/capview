@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	oldDLLPrefix = "capview_vcam.dll."
-	oldDLLSuffix = ".old"
+	oldDLLPrefix       = "capview_vcam.dll."
+	oldDLLSuffix       = ".old"
+	dshowCloseAppsHint = "close applications currently using capview Virtual Camera (such as OBS, Chrome, Zoom, or Discord) and retry"
 )
 
 // FileSHA256 returns the lowercase hex SHA-256 digest of the file at path.
@@ -67,7 +68,7 @@ type deployOps interface {
 	now() time.Time
 }
 
-func deployDLL(src, dst string, mode UpgradeMode, ops deployOps) (UpgradeResult, error) {
+func deployDLL(src, dst string, mode UpgradeMode, backend Backend, ops deployOps) (UpgradeResult, error) {
 	if mode == "" {
 		mode = UpgradeAuto
 	}
@@ -102,7 +103,11 @@ func deployDLL(src, dst string, mode UpgradeMode, ops deployOps) (UpgradeResult,
 		}, nil
 	}
 
-	if mode == UpgradeAuto || mode == UpgradeRename {
+	// DirectShow DLLs are loaded inside user apps (OBS, Chrome, Zoom, Discord),
+	// never inside Windows FrameServer; always use Tier 1 rename and never
+	// stop/start FrameServer for BackendDShow.
+	isDShow := backend == BackendDShow
+	if mode == UpgradeAuto || mode == UpgradeRename || isDShow {
 		ts := ops.now().UTC().Format("20060102T150405Z")
 		backup := fmt.Sprintf("%s.%s%s", dst, ts, oldDLLSuffix)
 		if err := ops.renameFile(dst, backup); err == nil {
@@ -119,12 +124,14 @@ func deployDLL(src, dst string, mode UpgradeMode, ops deployOps) (UpgradeResult,
 				NewSHA256:    newHash,
 				PendingClean: true,
 			}, nil
+		} else if isDShow {
+			return UpgradeResult{}, fmt.Errorf("replace locked DirectShow DLL %s (%s): %w", dst, dshowCloseAppsHint, err)
 		} else if mode == UpgradeRename {
 			return UpgradeResult{}, fmt.Errorf("tier-1 rename %s -> %s: %w", dst, backup, err)
 		}
 	}
 
-	// Tier 2 fallback (or forced UpgradeRestart): stop FrameServer, replace DLL, restart FrameServer.
+	// Tier 2 fallback (or forced UpgradeRestart on MF): stop FrameServer, replace DLL, restart FrameServer.
 	if err := ops.stopFrameServer(); err != nil {
 		return UpgradeResult{}, fmt.Errorf("tier-2 stop FrameServer: %w", err)
 	}
@@ -152,7 +159,7 @@ func deployDLL(src, dst string, mode UpgradeMode, ops deployOps) (UpgradeResult,
 	}, nil
 }
 
-func removeInstalledDLL(dst string, mode UpgradeMode, ops deployOps) (string, error) {
+func removeInstalledDLL(dst string, mode UpgradeMode, backend Backend, ops deployOps) (string, error) {
 	if mode == "" {
 		mode = UpgradeAuto
 	}
@@ -164,7 +171,8 @@ func removeInstalledDLL(dst string, mode UpgradeMode, ops deployOps) (string, er
 		return "absent", nil
 	}
 
-	if mode == UpgradeRestart {
+	isDShow := backend == BackendDShow
+	if mode == UpgradeRestart && !isDShow {
 		if err := ops.stopFrameServer(); err != nil {
 			return "", fmt.Errorf("stop FrameServer for uninstall: %w", err)
 		}
@@ -183,13 +191,15 @@ func removeInstalledDLL(dst string, mode UpgradeMode, ops deployOps) (string, er
 		return "removed", nil
 	}
 
-	if mode == UpgradeAuto || mode == UpgradeRename {
+	if mode == UpgradeAuto || mode == UpgradeRename || isDShow {
 		ts := ops.now().UTC().Format("20060102T150405Z")
 		backup := fmt.Sprintf("%s.%s%s", dst, ts, oldDLLSuffix)
 		if err := ops.renameFile(dst, backup); err == nil {
 			_ = ops.setOldACL(backup)
 			_ = ops.scheduleDeleteOnReboot(backup)
 			return "rename-deferred", nil
+		} else if isDShow {
+			return "", fmt.Errorf("remove locked DirectShow DLL %s (%s): %w", dst, dshowCloseAppsHint, err)
 		} else if mode == UpgradeRename {
 			return "", fmt.Errorf("remove/rename locked DLL %s: %w", dst, err)
 		}

@@ -152,12 +152,13 @@ func TestDShowControllerLifecycle(t *testing.T) {
 	defer win.UnmapView(obsAddr)
 	obsHdr := headerFromBytes(obsBuf)
 
-	if got := atomic.LoadUint32(&obsHdr.Active); got != 1 {
+	// Before the first WriteNV12, Active remains 0 to prevent 0-frame spin on reopen.
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 0 {
 		ctrl.Stop()
-		t.Fatalf("SHM Active after Start = %d, want 1", got)
+		t.Fatalf("SHM Active before first frame = %d, want 0", got)
 	}
 
-	// Push frames through capture.Tap and verify SHM writer receives them.
+	// Push frames through capture.Tap and verify SHM writer receives them and marks Active=1.
 	const w, h = 1280, 720
 	yPlane := make([]byte, w*h)
 	uvPlane := make([]byte, w*(h/2))
@@ -189,6 +190,10 @@ func TestDShowControllerLifecycle(t *testing.T) {
 	if ctrl.Stats().FramesWritten == 0 {
 		ctrl.Stop()
 		t.Fatal("expected DShow controller to write frames to SHM")
+	}
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 1 {
+		ctrl.Stop()
+		t.Fatalf("SHM Active after WriteNV12 = %d, want 1", got)
 	}
 
 	// Disable -> tap disabled, SHM Active transitions to 0 without touching MF.

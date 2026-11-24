@@ -884,7 +884,7 @@ func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 		fmt.Fprintf(log, "vcam-install: cleaned %d leftover .old DLL(s)\n", cleaned)
 	}
 
-	res, err := deployDLL(srcDLL, InstalledDLLPath, opts.UpgradeMode, winDeployOps{})
+	res, err := deployDLL(srcDLL, InstalledDLLPath, opts.UpgradeMode, targetBackend, winDeployOps{})
 	if err != nil {
 		return UpgradeResult{}, err
 	}
@@ -974,6 +974,19 @@ func Uninstall(opts UninstallOptions, log io.Writer) error {
 	if log == nil {
 		log = io.Discard
 	}
+	// Detect whether MF or DirectShow-only is registered before deleting keys so
+	// DirectShow-only uninstall never touches Windows FrameServer.
+	mfExists, _, _ := inspectInprocCLSID(clsidMFSubkey, clsidMFInprocSubkey)
+	dsExists, _, _ := inspectInprocCLSID(clsidDShowSubkey, clsidDShowInprocSubkey)
+	dsCatExists, _ := inspectDShowCategory()
+	_, _, osBackend := DetectOSBackend()
+	uninstallBackend := osBackend
+	if mfExists {
+		uninstallBackend = BackendMF
+	} else if dsExists || dsCatExists {
+		uninstallBackend = BackendDShow
+	}
+
 	if ok, _ := fileExists(InstalledDLLPath); ok {
 		if err := runRegsvr32("/s", "/u", "/n", "/i:all", InstalledDLLPath); err != nil {
 			fmt.Fprintf(log, "vcam-uninstall: regsvr32 /u /n /i:all warning: %v\n", err)
@@ -991,7 +1004,7 @@ func Uninstall(opts UninstallOptions, log io.Writer) error {
 	}
 	CleanupOldDLLs(InstallDir)
 
-	tier, err := removeInstalledDLL(InstalledDLLPath, opts.UpgradeMode, winDeployOps{})
+	tier, err := removeInstalledDLL(InstalledDLLPath, opts.UpgradeMode, uninstallBackend, winDeployOps{})
 	if err != nil {
 		return err
 	}

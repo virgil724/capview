@@ -46,7 +46,7 @@ cl.exe /nologo /std:c++20 /O2 /EHsc /W4 /DUNICODE /D_UNICODE /LD ^
   mfplat.lib mf.lib mfuuid.lib strmiids.lib ole32.lib advapi32.lib winmm.lib
 if errorlevel 1 exit /b 1
 cl.exe /nologo /std:c++20 /O2 /EHsc /W4 /DUNICODE /D_UNICODE ^
-  "$srcDir\vcam_loopback_test.cpp" "$srcDir\vcam_source.cpp" "$srcDir\shm_reader.cpp" "$srcDir\placeholder.cpp" ^
+  "$srcDir\vcam_loopback_test.cpp" "$srcDir\vcam_source.cpp" "$srcDir\dshow_filter.cpp" "$srcDir\shm_reader.cpp" "$srcDir\placeholder.cpp" ^
   /Fe:"$outDir\vcam_loopback_test.exe" /Fo:"$outDir\\" ^
   /link mfplat.lib mf.lib mfreadwrite.lib mfuuid.lib strmiids.lib ole32.lib oleaut32.lib advapi32.lib winmm.lib
 if errorlevel 1 exit /b 1
