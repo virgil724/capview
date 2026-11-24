@@ -82,10 +82,25 @@ type MirrorChoice struct {
 	Disabled bool
 }
 
+// MirrorIsMainOutput reports whether mirrorID names the main output device.
+func MirrorIsMainOutput(mirrorID, mainOutputID string) bool {
+	return mirrorID != "" && mainOutputID != "" && strings.EqualFold(mirrorID, mainOutputID)
+}
+
+// EffectiveMirrorID is the mirror setting that can actually apply with the
+// given main output: a mirror pointing at the main output is treated as Off.
+func EffectiveMirrorID(mirrorID, mainOutputID string) string {
+	if MirrorIsMainOutput(mirrorID, mainOutputID) {
+		return ""
+	}
+	return mirrorID
+}
+
 // MirrorChoices builds the mirror submenu: "Off" followed by every playback
 // endpoint. The endpoint currently used for the main output is disabled
 // (mirroring into the same device would double the audio).
 func MirrorChoices(outputs []EndpointInfo, mainOutputID, currentMirrorID string) []MirrorChoice {
+	currentMirrorID = EffectiveMirrorID(currentMirrorID, mainOutputID)
 	items := []MirrorChoice{{Label: "Off", Checked: currentMirrorID == ""}}
 	for _, ep := range outputs {
 		if ep.ID == "" {

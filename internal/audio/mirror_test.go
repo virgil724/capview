@@ -109,3 +109,35 @@ func TestMirrorTapPendingIsBounded(t *testing.T) {
 		t.Fatal("expected pending drops when the consumer stalls")
 	}
 }
+
+// A mirror setting that now points at the main output shows as Off.
+func TestMirrorChoicesMirrorIsMainOutput(t *testing.T) {
+	outs := []EndpointInfo{
+		{ID: "{id-speakers}", Name: "Speakers"},
+		{ID: "{id-cable}", Name: "CABLE Input"},
+	}
+	got := MirrorChoices(outs, "{id-cable}", "{ID-CABLE}")
+	if !got[0].Checked {
+		t.Errorf("Off must be checked: %+v", got[0])
+	}
+	if got[2].Checked || !got[2].Disabled {
+		t.Errorf("main-output entry must be unchecked and disabled: %+v", got[2])
+	}
+}
+
+func TestEffectiveMirrorID(t *testing.T) {
+	cases := []struct{ mirror, main, want string }{
+		{"{a}", "{A}", ""},
+		{"{a}", "{b}", "{a}"},
+		{"{a}", "", "{a}"},
+		{"", "{a}", ""},
+	}
+	for _, c := range cases {
+		if got := EffectiveMirrorID(c.mirror, c.main); got != c.want {
+			t.Errorf("EffectiveMirrorID(%q, %q) = %q, want %q", c.mirror, c.main, got, c.want)
+		}
+		if got := MirrorIsMainOutput(c.mirror, c.main); got != (c.mirror != "" && c.want == "") {
+			t.Errorf("MirrorIsMainOutput(%q, %q) = %v", c.mirror, c.main, got)
+		}
+	}
+}

@@ -104,7 +104,7 @@ func (p *Passthrough) setMirror(id string, start func(id string) (*mirrorState, 
 	if id != "" && p.mirClosed {
 		return ErrPassthroughStopped
 	}
-	if id != "" && p.OutputID != "" && strings.EqualFold(id, p.OutputID) {
+	if MirrorIsMainOutput(id, p.OutputID) {
 		return ErrMirrorIsMainOutput // leave any running mirror untouched
 	}
 	if cur := p.mir; cur != nil {

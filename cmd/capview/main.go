@@ -158,6 +158,11 @@ func (h *appHost) startAudio() {
 		aud.ToggleMute()
 	}
 	h.aud = aud
+	if audio.MirrorIsMainOutput(h.cfg.AudioMirrorID, aud.OutputID) {
+		// The mirror target is now the main output (Start already refused
+		// it): drop the setting so the menu shows Off and config forgets it.
+		h.cfg.AudioMirrorID = ""
+	}
 	fmt.Printf("audio: %q (%d Hz) -> %q (%d Hz)\n", aud.InputName, aud.InputRate, aud.OutputName, aud.OutputRate)
 	if h.diag {
 		go func(a *audio.Passthrough) {
