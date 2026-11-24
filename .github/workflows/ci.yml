@@ -41,22 +41,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build x64 COM Media Source DLL
+      - name: Build x64 COM Media Source & DirectShow DLL
         shell: pwsh
         run: |
-          $ver = "1.0.0.0"
+          $ver = "1.1.0.0"
           if ($env:GITHUB_REF -match '^refs/tags/v(\d+)\.(\d+)\.(\d+)') {
             $ver = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
           }
           pwsh -File vcam/dll/build.ps1 -Arch x64 -Version $ver
 
-      - name: Verify Placeholder & In-Proc COM Loopback
+      - name: Verify Placeholder, MF & DirectShow In-Proc Loopback
         shell: pwsh
         run: |
           .\vcam\dll\build\x64\vcam_loopback_test.exe `
             --dll .\vcam\dll\build\x64\capview_vcam.dll `
             --verify-placeholder `
             --frames 15
+          .\vcam\dll\build\x64\vcam_loopback_test.exe `
+            --dll .\vcam\dll\build\x64\capview_vcam.dll `
+            --dshow-inproc `
+            --frames 10
 
       - uses: actions/upload-artifact@v4
         with:

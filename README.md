@@ -99,19 +99,40 @@ Right-click → **Spout Output** (or `-spout`, saved as `spout_enabled`) publish
 
 The sender is pure Go (no Spout DLL): a separate thread with its own D3D11 device converts NV12/YUY2 to a BGRA legacy shared texture, fed by a drop-oldest copy of each captured frame, so the viewer never waits for it. `go run ./tools/spoutcheck` lists senders, measures the sender frame rate and saves a received frame as PNG without OBS.
 
-## Windows 11 x64 Virtual Camera
+## Windows x64 Virtual Camera (Windows 11 & Windows 10)
 
-`capview` can expose your live capture feed as **`capview Virtual Camera`** to Windows Camera, Google Meet, Chrome, OBS, Teams, and Zoom via `MFCreateVirtualCamera` (`MFVirtualCameraLifetime_Session` + `MFVirtualCameraAccess_CurrentUser`).
+`capview` can expose your live capture feed as **`capview Virtual Camera`** using a single bundled `capview_vcam.dll` (x64) that automatically selects the right backend for your Windows version:
 
-- **Supported platform**: **Windows 11 x64 (`windows/amd64`) only** (disabled/hidden on Windows ARM64 and Linux).
+| Operating System | Architecture | Backend | Registration | Enable / Disable Behavior | Supported Apps |
+| :--- | :---: | :--- | :--- | :--- | :--- |
+| **Windows 11** (`build >= 22000`) | `windows/amd64` | **Media Foundation** (`MFCreateVirtualCamera`, `Session` + `CurrentUser`) | `HKLM` MF CLSID only | Device appears on **Enable** and disappears on **Disable** / exit | Windows Camera, Chrome/Edge/Meet, Teams, Zoom, OBS, Discord, UWP apps |
+| **Windows 10** (`build < 22000`) | `windows/amd64` | **DirectShow** (`CLSID_VideoInputDeviceCategory`, `NV12` / `YUY2` / `RGB24`) | `HKLM` DirectShow filter only | Device stays registered; **Disable** / exit immediately switches to the dark `"capview"` placeholder frame (**Uninstall** removes it) | Chrome/Edge/Google Meet, Zoom, OBS, Discord, `ffmpeg -f dshow`, desktop Win32/x64 apps |
+| Windows ARM64 / Linux | `arm64`, `linux/*` | *Not supported* | — | Virtual Camera menu hidden / no-op | — |
+
+### Important Windows 10 Limitations
+- **Not visible to UWP / Windows Camera App**: DirectShow virtual cameras are desktop-API sources, so the built-in Windows 10 UWP Camera app does not enumerate them. Desktop browsers and meeting/streaming apps (**Chrome, Edge, Google Meet, Zoom, OBS Studio, Discord**) see `capview Virtual Camera` normally.
+- **64-bit (`x64`) apps only**: `capview` ships an x64-only `capview_vcam.dll` (no 32-bit `WOW6432Node` filter), so legacy 32-bit-only DirectShow applications will not list it.
+
+### Usage
 - **Bundle layout**: Keep `capview_vcam.dll` in the same directory as `capview.exe`.
-- **Usage**:
-  - Right-click the viewer window → **`Virtual Camera`** ▸ **`Enable`** / **`Disable`** / **`Uninstall`** (or pass `-vcam` on the CLI; saved as `"vcam_enabled"` in `config.json`, `false` by default).
-  - **One-time UAC elevation**: Enabling for the first time (or when the bundled `capview_vcam.dll` version/hash changes) prompts UAC once to run `capview.exe -vcam-install`, deploying the COM DLL to `C:\ProgramData\capview\`, setting `LocalService` ACLs, and registering the CLSID in `HKLM`. Everyday **Enable** / **Disable** afterwards runs with **zero admin privileges**.
-  - **Standby placeholder**: When capture is idle or paused, the COM source outputs a dark `"capview"` placeholder frame at the negotiated mode (`1080p60`, `1080p30`, `720p60`, `720p30`).
+- **Right-click menu**: Right-click the viewer window → **`Virtual Camera`** ▸ **`Enable`** / **`Disable`** / **`Uninstall`** (or pass `-vcam` on the CLI; saved as `"vcam_enabled"` in `config.json`, `false` by default).
+- **One-time UAC elevation & OS-change detection**:
+  - Enabling for the first time (or when the bundled `capview_vcam.dll` version/hash changes) prompts UAC once to run `capview.exe -vcam-install`, deploying `capview_vcam.dll` to `C:\ProgramData\capview\`, setting `LocalService` ACLs, and registering **only** the backend matching your OS (removing any stale registration from the other backend).
+  - If you upgrade from Windows 10 to Windows 11 (or vice versa), `capview` detects the OS-vs-registration mismatch and shows **`Reinstall (OS Changed)`** in the right-click menu so a single UAC click cleanly migrates registration.
+  - Everyday **Enable** / **Disable** runs with **zero admin privileges**.
+- **Standby placeholder**: When capture is idle, paused, or disabled (on Windows 10), the virtual camera outputs a dark `"capview"` placeholder frame at the negotiated resolution/FPS (`1080p60`, `1080p30`, `720p60`, `720p30`) and format (`NV12`, `YUY2`, or bottom-up `RGB24`).
+- **Backend override flag (testing/diagnostics)**: `-vcam-backend=auto|mf|dshow` (plus `both` for `-vcam-install` diagnostics) lets you explicitly test the DirectShow path on Windows 11 without changing the default single-backend behavior.
 - **TODO (Code Signing)**: Release binaries (`capview.exe` and `capview_vcam.dll`) are not yet Authenticode-signed. Adding an Authenticode signing step to the release workflow is tracked before public distribution to avoid Microsoft Defender SmartScreen prompts and WDAC/HVCI `svchost.exe` load restrictions.
 
-### Audience A/V Sync
+### Windows 10 Manual Verification Checklist
+1. Place `capview.exe`, `capview-cli.exe`, and `capview_vcam.dll` in the same folder on a Windows 10 x64 machine.
+2. Run `.\capview-cli.exe -vcam-install` (or right-click → **Virtual Camera** → **Enable**) and approve the single UAC prompt. Verify the log reports `backend=dshow` and `registered DirectShow filter {7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A04}`.
+3. Open **OBS Studio** (Video Capture Device), **Chrome/Edge** (`https://webcamtests.com` or Google Meet), **Zoom**, or **Discord** and select **`capview Virtual Camera`**.
+4. Confirm live capture frames stream smoothly while enabled (test `NV12`, `YUY2`, and `RGB24` / `1080p60` / `720p30` in OBS).
+5. Click **Virtual Camera → Disable** (or quit `capview`) while OBS/Chrome is still viewing the camera — verify the feed immediately switches to the dark **`capview / WAITING FOR SIGNAL`** placeholder with no freeze or error.
+6. Click **Virtual Camera → Uninstall** (or run `.\capview-cli.exe -vcam-uninstall`) — verify `capview Virtual Camera` disappears from DirectShow device lists and `C:\ProgramData\capview\` is cleaned up.
+
+## Audience A/V Sync
 
 When sharing gameplay to an audience (Virtual Camera / Spout2 + Audio Mirror such as VB-Cable), `capview` automatically aligns the audience video and audio paths on a common QPC clock without adding any buffering or delay to your local monitor or local speakers/headphones:
 
