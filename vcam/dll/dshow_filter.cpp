@@ -928,9 +928,8 @@ STDMETHODIMP CapviewDShowPin::GetStreamCaps(int iIndex, AM_MEDIA_TYPE** ppmt, BY
     scc->StretchTapsY = 0;
     scc->ShrinkTapsX = 0;
     scc->ShrinkTapsY = 0;
-    const REFERENCE_TIME frameTime = fmt.AvgTimePerFrame();
-    scc->MinFrameInterval = frameTime;
-    scc->MaxFrameInterval = frameTime;
+    scc->MinFrameInterval = fmt.AvgTimePerFrame();
+    scc->MaxFrameInterval = fmt.MaxFrameInterval();
     const LONG bps = static_cast<LONG>(
         (static_cast<uint64_t>(fmt.FrameBytes()) * 8ULL * static_cast<uint64_t>(fmt.fpsNum)) /
         static_cast<uint64_t>(fmt.fpsDen > 0 ? fmt.fpsDen : 1));

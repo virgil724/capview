@@ -595,6 +595,18 @@ int RunDShowInprocTest(const std::wstring& dllPath, int numFrames, bool expectLi
                         vih->bmiHeader.biWidth == tc.width &&
                         vih->bmiHeader.biHeight == tc.height &&
                         vih->AvgTimePerFrame <= 170000) {
+                        if (vih->AvgTimePerFrame != 166666 ||
+                            scc.MinFrameInterval > 166666 ||
+                            scc.MaxFrameInterval < 166667) {
+                            std::printf("FAIL [%s]: 60fps interval avg=%lld min=%lld max=%lld (want avg=166666, range covering [166666..166667])\n",
+                                        tc.name,
+                                        static_cast<long long>(vih->AvgTimePerFrame),
+                                        static_cast<long long>(scc.MinFrameInterval),
+                                        static_cast<long long>(scc.MaxFrameInterval));
+                            DeleteMT(mt);
+                            allOk = false;
+                            break;
+                        }
                         chosenMt = mt;
                         break;
                     }

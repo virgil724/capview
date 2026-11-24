@@ -37,8 +37,13 @@ struct DShowVideoFormat {
     bool topDown = false; // only relevant for RGB24 (false = bottom-up DIB, biHeight > 0)
 
     REFERENCE_TIME AvgTimePerFrame() const {
+        if (fpsNum <= 0) return 166666;
+        return static_cast<REFERENCE_TIME>((10000000LL * fpsDen) / fpsNum);
+    }
+
+    REFERENCE_TIME MaxFrameInterval() const {
         if (fpsNum <= 0) return 166667;
-        return static_cast<REFERENCE_TIME>((10000000LL * fpsDen + fpsNum / 2) / fpsNum);
+        return static_cast<REFERENCE_TIME>((10000000LL * fpsDen + fpsNum - 1) / fpsNum);
     }
 
     DWORD FrameBytes() const {
