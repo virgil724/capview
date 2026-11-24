@@ -61,6 +61,7 @@ public:
     HRESULT Start(const PROPVARIANT* pvarStartPosition);
     HRESULT Stop();
     void Shutdown();
+    void SetShmFilePathForTest(const wchar_t* path);
 
 private:
     static DWORD WINAPI WorkerThreadProc(LPVOID param);
@@ -102,6 +103,7 @@ public:
     ~CapviewMediaSource();
 
     HRESULT Initialize();
+    void SetShmFilePathForTest(const wchar_t* path);
 
     // IUnknown
     STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override;

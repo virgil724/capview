@@ -8,6 +8,7 @@
 #include <mferror.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,10 @@
 
 #include "placeholder.h"
 #include "shm_protocol.h"
+#include "shm_reader.h"
+#include "vcam_source.h"
+
+std::atomic<long> g_comObjectCount{0};
 
 namespace {
 
@@ -94,7 +99,7 @@ bool VerifyNV12PlaceholderPixels(const uint8_t* yPlane, int yStride, int w, int 
 }
 
 int RunReader(IMFMediaSource* source, int targetW, int targetH, double targetFPS, int numFrames,
-              bool verifyPlaceholder) {
+              bool verifyPlaceholder, double* outP50Ms = nullptr) {
     IMFAttributes* attrs = nullptr;
     HRESULT hr = MFCreateAttributes(&attrs, 2);
     if (FAILED(hr)) {
@@ -196,13 +201,370 @@ int RunReader(IMFMediaSource* source, int targetW, int targetH, double targetFPS
                 targetW, targetH, targetFPS, frames, totalSec, fps, p50, p99, maxV,
                 static_cast<unsigned>(firstMarker), static_cast<unsigned>(lastMarker), markerChanges);
 
+    if (outP50Ms) {
+        *outP50Ms = p50;
+    }
     reader->Release();
     return placeholderOk ? 0 : 1;
+}
+
+std::wstring MakeTempShmPath(const wchar_t* tag) {
+    wchar_t tmpDir[MAX_PATH]{};
+    DWORD n = GetTempPathW(MAX_PATH, tmpDir);
+    if (n == 0 || n >= MAX_PATH) {
+        wcscpy_s(tmpDir, L".\\");
+    }
+    wchar_t full[MAX_PATH]{};
+    swprintf_s(full, L"%ls%ls_%lu.shm", tmpDir, tag, GetCurrentProcessId());
+    return full;
+}
+
+bool WriteTestShmFile(const std::wstring& path, uint32_t active, uint64_t seq,
+                      bool populateSlot, uint8_t yFill, bool createNew) {
+    HANDLE f = CreateFileW(
+        path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        createNew ? CREATE_NEW : CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (f == INVALID_HANDLE_VALUE) {
+        std::wprintf(L"FAIL: CreateFileW(%ls, createNew=%d) failed: %lu\n",
+                     path.c_str(), createNew ? 1 : 0, GetLastError());
+        return false;
+    }
+
+    LARGE_INTEGER sz{};
+    sz.QuadPart = static_cast<LONGLONG>(CAPVIEW_SHM_TOTAL_SIZE);
+    if (!SetFilePointerEx(f, sz, nullptr, FILE_BEGIN) || !SetEndOfFile(f)) {
+        std::printf("FAIL: SetEndOfFile failed: %lu\n", GetLastError());
+        CloseHandle(f);
+        return false;
+    }
+
+    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READWRITE, 0, CAPVIEW_SHM_TOTAL_SIZE, nullptr);
+    if (!m) {
+        std::printf("FAIL: CreateFileMappingW failed: %lu\n", GetLastError());
+        CloseHandle(f);
+        return false;
+    }
+    void* view = MapViewOfFile(m, FILE_MAP_ALL_ACCESS, 0, 0, CAPVIEW_SHM_TOTAL_SIZE);
+    if (!view) {
+        std::printf("FAIL: MapViewOfFile failed: %lu\n", GetLastError());
+        CloseHandle(m);
+        CloseHandle(f);
+        return false;
+    }
+
+    auto* base = static_cast<uint8_t*>(view);
+    std::memset(base, 0, CAPVIEW_SHM_HEADER_SIZE);
+    auto* hdr = reinterpret_cast<CapviewShmHeader*>(base);
+    hdr->magic = CAPVIEW_SHM_MAGIC;
+    hdr->version = CAPVIEW_SHM_VERSION;
+    hdr->slotCount = CAPVIEW_SHM_SLOT_COUNT;
+    hdr->slotStride = CAPVIEW_SHM_SLOT_STRIDE;
+    hdr->dataOffset = CAPVIEW_SHM_HEADER_SIZE;
+    hdr->producerPid = GetCurrentProcessId();
+    hdr->format = CAPVIEW_FORMAT_NV12;
+    hdr->fpsNum = 60;
+    hdr->fpsDen = 1;
+    hdr->seq = seq;
+    hdr->active = active;
+
+    if (populateSlot && seq > 0) {
+        const uint32_t slot = static_cast<uint32_t>(seq % CAPVIEW_SHM_SLOT_COUNT);
+        const uint32_t w = 64, h = 32;
+        const uint32_t payloadBytes = w * h * 3u / 2u;
+        uint8_t* dst = base + CAPVIEW_SHM_HEADER_SIZE + static_cast<size_t>(slot) * CAPVIEW_SHM_SLOT_STRIDE;
+        std::memset(dst, yFill, static_cast<size_t>(w) * h);
+        std::memset(dst + static_cast<size_t>(w) * h, 128, static_cast<size_t>(w) * (h / 2));
+        hdr->slots[slot].width = w;
+        hdr->slots[slot].height = h;
+        hdr->slots[slot].payloadBytes = payloadBytes;
+        hdr->slots[slot].timestampHns = 123456;
+        hdr->slots[slot].seq = seq * 2u;
+        hdr->latestSlot = slot;
+        hdr->width = w;
+        hdr->height = h;
+    }
+
+    UnmapViewOfFile(view);
+    CloseHandle(m);
+    CloseHandle(f);
+    return true;
+}
+
+bool WaitForEventType(IMFMediaEventGenerator* gen, MediaEventType want, IMFMediaEvent** ppOut = nullptr) {
+    for (int i = 0; i < 32; ++i) {
+        IMFMediaEvent* ev = nullptr;
+        HRESULT hr = gen->GetEvent(0, &ev);
+        if (FAILED(hr) || !ev) {
+            std::printf("FAIL: GetEvent failed: 0x%08lX\n", hr);
+            return false;
+        }
+        MediaEventType met = MEUnknown;
+        ev->GetType(&met);
+        if (met == want) {
+            if (ppOut) {
+                *ppOut = ev;
+            } else {
+                ev->Release();
+            }
+            return true;
+        }
+        ev->Release();
+    }
+    std::printf("FAIL: did not receive expected MF event %lu\n", static_cast<unsigned long>(want));
+    return false;
+}
+
+bool ReadOneSamplePixel0(IMFMediaStream* stream, uint8_t& outPixel0) {
+    HRESULT hr = stream->RequestSample(nullptr);
+    if (FAILED(hr)) {
+        std::printf("FAIL: RequestSample failed: 0x%08lX\n", hr);
+        return false;
+    }
+    IMFMediaEvent* ev = nullptr;
+    if (!WaitForEventType(stream, MEMediaSample, &ev)) {
+        return false;
+    }
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    hr = ev->GetValue(&pv);
+    ev->Release();
+    if (FAILED(hr) || pv.vt != VT_UNKNOWN || !pv.punkVal) {
+        PropVariantClear(&pv);
+        std::printf("FAIL: MEMediaSample missing sample object\n");
+        return false;
+    }
+    IMFSample* sample = nullptr;
+    hr = pv.punkVal->QueryInterface(IID_PPV_ARGS(&sample));
+    PropVariantClear(&pv);
+    if (FAILED(hr) || !sample) {
+        std::printf("FAIL: QI(IMFSample) failed: 0x%08lX\n", hr);
+        return false;
+    }
+    IMFMediaBuffer* buf = nullptr;
+    hr = sample->ConvertToContiguousBuffer(&buf);
+    sample->Release();
+    if (FAILED(hr) || !buf) {
+        std::printf("FAIL: ConvertToContiguousBuffer failed: 0x%08lX\n", hr);
+        return false;
+    }
+    BYTE* ptr = nullptr;
+    DWORD len = 0;
+    hr = buf->Lock(&ptr, nullptr, &len);
+    if (FAILED(hr) || !ptr || len == 0) {
+        buf->Release();
+        std::printf("FAIL: buffer Lock failed: 0x%08lX\n", hr);
+        return false;
+    }
+    outPixel0 = ptr[0];
+    buf->Unlock();
+    buf->Release();
+    return true;
+}
+
+// Verifies Fix 1: reopening an existing SHM (prevSeq > 0) with zeroed slots
+// (whether active==0 or active==1) reports IsStreamLive()==false and paces at
+// ~60fps placeholder mode instead of spinning at 0ms for 500ms.
+bool VerifyReopenedShmPlaceholderPacing() {
+    const std::wstring path = MakeTempShmPath(L"capview_test_reopen");
+    DeleteFileW(path.c_str());
+
+    // Case A: active==0, prevSeq=101, empty slots.
+    if (!WriteTestShmFile(path, /*active=*/0, /*seq=*/101, /*populateSlot=*/false, 0, /*createNew=*/true)) {
+        return false;
+    }
+    {
+        ShmReader reader;
+        reader.SetFilePathOverride(path.c_str());
+        if (!reader.EnsureAttached()) {
+            std::printf("FAIL [reopen-inactive]: EnsureAttached failed\n");
+            DeleteFileW(path.c_str());
+            return false;
+        }
+        if (reader.IsStreamLive()) {
+            std::printf("FAIL [reopen-inactive]: IsStreamLive() returned true with active=0\n");
+            DeleteFileW(path.c_str());
+            return false;
+        }
+    }
+
+    // Case B: active==1, prevSeq=101, empty slots (defense-in-depth in DLL).
+    if (!WriteTestShmFile(path, /*active=*/1, /*seq=*/101, /*populateSlot=*/false, 0, /*createNew=*/false)) {
+        DeleteFileW(path.c_str());
+        return false;
+    }
+    {
+        ShmReader reader;
+        reader.SetFilePathOverride(path.c_str());
+        if (!reader.EnsureAttached()) {
+            std::printf("FAIL [reopen-empty-slots]: EnsureAttached failed\n");
+            DeleteFileW(path.c_str());
+            return false;
+        }
+        if (reader.IsStreamLive()) {
+            std::printf("FAIL [reopen-empty-slots]: IsStreamLive() returned true with empty slots\n");
+            DeleteFileW(path.c_str());
+            return false;
+        }
+    }
+
+    // Drive full CapviewMediaSource through IMFSourceReader at 1080p60 and
+    // verify 60fps placeholder pacing (~16.67ms, not 0ms spin).
+    auto* src = new CapviewMediaSource(nullptr);
+    HRESULT hr = src->Initialize();
+    if (FAILED(hr)) {
+        src->Release();
+        DeleteFileW(path.c_str());
+        std::printf("FAIL [reopen-pacing]: CapviewMediaSource::Initialize failed: 0x%08lX\n", hr);
+        return false;
+    }
+    src->SetShmFilePathForTest(path.c_str());
+
+    double p50Ms = 0.0;
+    int rc = RunReader(src, 1920, 1080, 60.0, 15, /*verifyPlaceholder=*/true, &p50Ms);
+    src->Shutdown();
+    src->Release();
+    DeleteFileW(path.c_str());
+
+    if (rc != 0) {
+        std::printf("FAIL [reopen-pacing]: RunReader returned %d\n", rc);
+        return false;
+    }
+    if (p50Ms < 12.0) {
+        std::printf("FAIL [reopen-pacing]: dt p50=%.2fms indicates spin-flood (want >= 12.0ms for 60fps)\n", p50Ms);
+        return false;
+    }
+    std::printf("OK [reopen-pacing]: reopened SHM with empty slots paced cleanly at p50=%.2fms\n", p50Ms);
+    return true;
+}
+
+// Verifies Fix 2: CapviewMediaStream::Stop() calls m_shm.Detach() so the SHM
+// file handle is released without shutting down or destroying the MediaSource,
+// allowing DeleteFileW + CREATE_NEW without NTFS delete-pending ERROR_ACCESS_DENIED,
+// and subsequent Start()/RequestSample() cleanly re-attaches.
+bool VerifyStopDetachesShmHandle() {
+    const std::wstring path = MakeTempShmPath(L"capview_test_stop_detach");
+    DeleteFileW(path.c_str());
+
+    if (!WriteTestShmFile(path, /*active=*/1, /*seq=*/1, /*populateSlot=*/true, 0x5A, /*createNew=*/true)) {
+        return false;
+    }
+
+    auto* src = new CapviewMediaSource(nullptr);
+    HRESULT hr = src->Initialize();
+    if (FAILED(hr)) {
+        src->Release();
+        DeleteFileW(path.c_str());
+        std::printf("FAIL [stop-detach]: Initialize failed: 0x%08lX\n", hr);
+        return false;
+    }
+    src->SetShmFilePathForTest(path.c_str());
+
+    IMFPresentationDescriptor* pd = nullptr;
+    hr = src->CreatePresentationDescriptor(&pd);
+    if (FAILED(hr) || !pd) {
+        src->Shutdown();
+        src->Release();
+        DeleteFileW(path.c_str());
+        std::printf("FAIL [stop-detach]: CreatePresentationDescriptor failed: 0x%08lX\n", hr);
+        return false;
+    }
+
+    PROPVARIANT emptyPos;
+    PropVariantInit(&emptyPos);
+    bool ok = false;
+    IMFMediaStream* stream = nullptr;
+
+    do {
+        hr = src->Start(pd, &GUID_NULL, &emptyPos);
+        if (FAILED(hr)) {
+            std::printf("FAIL [stop-detach]: first Start failed: 0x%08lX\n", hr);
+            break;
+        }
+        IMFMediaEvent* newStreamEv = nullptr;
+        if (!WaitForEventType(src, MENewStream, &newStreamEv)) break;
+        PROPVARIANT sv;
+        PropVariantInit(&sv);
+        hr = newStreamEv->GetValue(&sv);
+        newStreamEv->Release();
+        if (FAILED(hr) || sv.vt != VT_UNKNOWN || !sv.punkVal) {
+            PropVariantClear(&sv);
+            std::printf("FAIL [stop-detach]: MENewStream missing stream\n");
+            break;
+        }
+        hr = sv.punkVal->QueryInterface(IID_PPV_ARGS(&stream));
+        PropVariantClear(&sv);
+        if (FAILED(hr) || !stream) {
+            std::printf("FAIL [stop-detach]: QI(IMFMediaStream) failed: 0x%08lX\n", hr);
+            break;
+        }
+        if (!WaitForEventType(src, MESourceStarted)) break;
+        if (!WaitForEventType(stream, MEStreamStarted)) break;
+
+        uint8_t px1 = 0;
+        if (!ReadOneSamplePixel0(stream, px1)) break;
+        if (px1 != 0x5A) {
+            std::printf("FAIL [stop-detach]: first sample pixel0=0x%02X, want 0x5A\n", px1);
+            break;
+        }
+
+        // Stop WITHOUT calling Shutdown() or releasing src/stream.
+        hr = src->Stop();
+        if (FAILED(hr)) {
+            std::printf("FAIL [stop-detach]: Stop failed: 0x%08lX\n", hr);
+            break;
+        }
+        if (!WaitForEventType(src, MESourceStopped)) break;
+        if (!WaitForEventType(stream, MEStreamStopped)) break;
+
+        // Delete and recreate the exact same SHM path with CREATE_NEW.
+        // Any leaked handle in m_shm would leave the file delete-pending and
+        // fail CREATE_NEW with ERROR_ACCESS_DENIED (5).
+        if (!DeleteFileW(path.c_str())) {
+            std::printf("FAIL [stop-detach]: DeleteFileW after Stop failed: %lu\n", GetLastError());
+            break;
+        }
+        if (!WriteTestShmFile(path, /*active=*/1, /*seq=*/2, /*populateSlot=*/true, 0xA5, /*createNew=*/true)) {
+            std::printf("FAIL [stop-detach]: CREATE_NEW after Stop failed (SHM handle still held!)\n");
+            break;
+        }
+
+        // Restart the SAME MediaSource and confirm RequestSample re-attaches cleanly.
+        hr = src->Start(pd, &GUID_NULL, &emptyPos);
+        if (FAILED(hr)) {
+            std::printf("FAIL [stop-detach]: second Start failed: 0x%08lX\n", hr);
+            break;
+        }
+        if (!WaitForEventType(src, MEUpdatedStream)) break;
+        if (!WaitForEventType(src, MESourceStarted)) break;
+        if (!WaitForEventType(stream, MEStreamStarted)) break;
+
+        uint8_t px2 = 0;
+        if (!ReadOneSamplePixel0(stream, px2)) break;
+        if (px2 != 0xA5) {
+            std::printf("FAIL [stop-detach]: re-attached sample pixel0=0x%02X, want 0xA5\n", px2);
+            break;
+        }
+        std::printf("OK [stop-detach]: Stop() released SHM handle (delete+recreate succeeded) and Start() re-attached (0x5A -> 0xA5)\n");
+        ok = true;
+    } while (false);
+
+    if (stream) stream->Release();
+    pd->Release();
+    src->Shutdown();
+    src->Release();
+    DeleteFileW(path.c_str());
+    return ok;
 }
 
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     bool useFrameServer = false;
     bool verifyPlaceholder = false;
     int numFrames = 120;
@@ -339,6 +701,11 @@ int wmain(int argc, wchar_t** argv) {
                 }
             }
             FreeLibrary(mod);
+        }
+        if (rc == 0 && verifyPlaceholder) {
+            if (!VerifyReopenedShmPlaceholderPacing() || !VerifyStopDetachesShmHandle()) {
+                rc = 1;
+            }
         }
     }
 

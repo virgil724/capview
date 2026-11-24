@@ -160,27 +160,57 @@ STDMETHODIMP_(ULONG) CapviewMediaStream::Release() {
 }
 
 STDMETHODIMP CapviewMediaStream::GetEvent(DWORD dwFlags, IMFMediaEvent** ppEvent) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->GetEvent(dwFlags, ppEvent);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    // Never hold m_mu across GetEvent: blocking calls (dwFlags == 0) wait for
+    // the worker thread to queue MEMediaSample, which acquires m_mu.
+    HRESULT hr = events->GetEvent(dwFlags, ppEvent);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaStream::BeginGetEvent(IMFAsyncCallback* pCallback, IUnknown* punkState) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->BeginGetEvent(pCallback, punkState);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    HRESULT hr = events->BeginGetEvent(pCallback, punkState);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaStream::EndGetEvent(IMFAsyncResult* pResult, IMFMediaEvent** ppEvent) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->EndGetEvent(pResult, ppEvent);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    HRESULT hr = events->EndGetEvent(pResult, ppEvent);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaStream::QueueEvent(MediaEventType met, REFGUID guidExtendedType, HRESULT hrStatus, const PROPVARIANT* pvValue) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->QueueEventParamVar(met, guidExtendedType, hrStatus, pvValue);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    HRESULT hr = events->QueueEventParamVar(met, guidExtendedType, hrStatus, pvValue);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaStream::GetMediaSource(IMFMediaSource** ppMediaSource) {
@@ -234,9 +264,17 @@ STDMETHODIMP CapviewMediaStream::SetStreamState(MF_STREAM_STATE value) {
             WaitForSingleObject(threadH, 3000);
             CloseHandle(threadH);
         }
-        std::lock_guard<std::mutex> lock(m_mu);
-        if (!m_shutdown && m_events) {
-            m_events->QueueEventParamVar(MEStreamPaused, GUID_NULL, S_OK, nullptr);
+        IMFMediaEventQueue* events = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mu);
+            if (!m_shutdown && m_events) {
+                events = m_events;
+                events->AddRef();
+            }
+        }
+        if (events) {
+            events->QueueEventParamVar(MEStreamPaused, GUID_NULL, S_OK, nullptr);
+            events->Release();
         }
         return S_OK;
     }
@@ -314,14 +352,24 @@ HRESULT CapviewMediaStream::SetFormat(IMFMediaType* pType) {
 
 HRESULT CapviewMediaStream::Start(const PROPVARIANT* pvarStartPosition) {
     HANDLE oldThread = nullptr;
+    IMFMediaEventQueue* alreadyRunningEvents = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_mu);
         if (m_shutdown) return MF_E_SHUTDOWN;
         if (m_state == MF_STREAM_STATE_RUNNING) {
-            return m_events ? m_events->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, pvarStartPosition) : S_OK;
+            if (m_events) {
+                alreadyRunningEvents = m_events;
+                alreadyRunningEvents->AddRef();
+            }
+        } else {
+            oldThread = m_thread;
+            m_thread = nullptr;
         }
-        oldThread = m_thread;
-        m_thread = nullptr;
+    }
+    if (alreadyRunningEvents) {
+        HRESULT hr = alreadyRunningEvents->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, pvarStartPosition);
+        alreadyRunningEvents->Release();
+        return hr;
     }
     if (oldThread) {
         SetEvent(m_stopEvt);
@@ -329,6 +377,7 @@ HRESULT CapviewMediaStream::Start(const PROPVARIANT* pvarStartPosition) {
         CloseHandle(oldThread);
     }
 
+    IMFMediaEventQueue* events = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_mu);
         if (m_shutdown) return MF_E_SHUTDOWN;
@@ -341,8 +390,13 @@ HRESULT CapviewMediaStream::Start(const PROPVARIANT* pvarStartPosition) {
             return HRESULT_FROM_WIN32(GetLastError());
         }
         if (m_events) {
-            m_events->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, pvarStartPosition);
+            events = m_events;
+            events->AddRef();
         }
+    }
+    if (events) {
+        events->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, pvarStartPosition);
+        events->Release();
     }
     return S_OK;
 }
@@ -365,11 +419,28 @@ HRESULT CapviewMediaStream::Stop() {
         WaitForSingleObject(threadH, 3000);
         CloseHandle(threadH);
     }
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (!m_shutdown && m_events) {
-        m_events->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        // Detach SHM handles on Stop() so vcam_frames.shm is not held open while
+        // stopped (preventing NTFS delete-pending on Uninstall -> Enable). Start()
+        // / RequestSample() cleanly re-attaches via m_shm.EnsureAttached().
+        m_shm.Detach();
+        if (!m_shutdown && m_events) {
+            events = m_events;
+            events->AddRef();
+        }
+    }
+    if (events) {
+        events->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
+        events->Release();
     }
     return S_OK;
+}
+
+void CapviewMediaStream::SetShmFilePathForTest(const wchar_t* path) {
+    std::lock_guard<std::mutex> lock(m_mu);
+    m_shm.SetFilePathOverride(path);
 }
 
 void CapviewMediaStream::Shutdown() {
@@ -391,24 +462,29 @@ void CapviewMediaStream::Shutdown() {
         WaitForSingleObject(threadH, 3000);
         CloseHandle(threadH);
     }
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_events) {
-        m_events->Shutdown();
-        SafeRelease(m_events);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        events = m_events;
+        m_events = nullptr;
+        SafeRelease(m_allocEx);
+        SafeRelease(m_alloc);
+        SafeRelease(m_mediaType);
+        m_parent = nullptr;
+        if (m_wakeEvt) {
+            CloseHandle(m_wakeEvt);
+            m_wakeEvt = nullptr;
+        }
+        if (m_stopEvt) {
+            CloseHandle(m_stopEvt);
+            m_stopEvt = nullptr;
+        }
+        m_shm.Detach();
     }
-    SafeRelease(m_allocEx);
-    SafeRelease(m_alloc);
-    SafeRelease(m_mediaType);
-    m_parent = nullptr;
-    if (m_wakeEvt) {
-        CloseHandle(m_wakeEvt);
-        m_wakeEvt = nullptr;
+    if (events) {
+        events->Shutdown();
+        events->Release();
     }
-    if (m_stopEvt) {
-        CloseHandle(m_stopEvt);
-        m_stopEvt = nullptr;
-    }
-    m_shm.Detach();
 }
 
 DWORD WINAPI CapviewMediaStream::WorkerThreadProc(LPVOID param) {
@@ -661,11 +737,17 @@ HRESULT CapviewMediaStream::ProduceAndQueueSample(
         sample->SetUnknown(MFSampleExtension_Token, pToken);
     }
 
+    IMFMediaEventQueue* events = nullptr;
     {
         std::lock_guard<std::mutex> lock(m_mu);
         if (!m_shutdown && m_state == MF_STREAM_STATE_RUNNING && m_events) {
-            hr = m_events->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample);
+            events = m_events;
+            events->AddRef();
         }
+    }
+    if (events) {
+        hr = events->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, sample);
+        events->Release();
     }
     sample->Release();
     return hr;
@@ -746,6 +828,13 @@ HRESULT CapviewMediaSource::Initialize() {
     return hr;
 }
 
+void CapviewMediaSource::SetShmFilePathForTest(const wchar_t* path) {
+    std::lock_guard<std::mutex> lock(m_mu);
+    if (m_stream) {
+        m_stream->SetShmFilePathForTest(path);
+    }
+}
+
 STDMETHODIMP CapviewMediaSource::QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     if (riid == IID_IUnknown || riid == IID_IMFMediaEventGenerator ||
@@ -782,27 +871,57 @@ STDMETHODIMP_(ULONG) CapviewMediaSource::Release() {
 }
 
 STDMETHODIMP CapviewMediaSource::GetEvent(DWORD dwFlags, IMFMediaEvent** ppEvent) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->GetEvent(dwFlags, ppEvent);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    // Never hold m_mu across GetEvent: blocking calls (dwFlags == 0) wait for
+    // Start/Stop/Shutdown on another thread, which acquire m_mu.
+    HRESULT hr = events->GetEvent(dwFlags, ppEvent);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaSource::BeginGetEvent(IMFAsyncCallback* pCallback, IUnknown* punkState) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->BeginGetEvent(pCallback, punkState);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    HRESULT hr = events->BeginGetEvent(pCallback, punkState);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaSource::EndGetEvent(IMFAsyncResult* pResult, IMFMediaEvent** ppEvent) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->EndGetEvent(pResult, ppEvent);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    HRESULT hr = events->EndGetEvent(pResult, ppEvent);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaSource::QueueEvent(MediaEventType met, REFGUID guidExtendedType, HRESULT hrStatus, const PROPVARIANT* pvValue) {
-    std::lock_guard<std::mutex> lock(m_mu);
-    if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
-    return m_events->QueueEventParamVar(met, guidExtendedType, hrStatus, pvValue);
+    IMFMediaEventQueue* events = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(m_mu);
+        if (m_shutdown || !m_events) return MF_E_SHUTDOWN;
+        events = m_events;
+        events->AddRef();
+    }
+    HRESULT hr = events->QueueEventParamVar(met, guidExtendedType, hrStatus, pvValue);
+    events->Release();
+    return hr;
 }
 
 STDMETHODIMP CapviewMediaSource::GetCharacteristics(DWORD* pdwCharacteristics) {

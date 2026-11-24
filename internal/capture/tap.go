@@ -38,14 +38,21 @@ func prepareFanOut(f *Frame, tap *Tap) *fanJob {
 	orig := f.release
 	var refs atomic.Int32
 	refs.Store(2)
-	job.release = func() {
+	releaseRef := func() {
 		if refs.Add(-1) == 0 && orig != nil {
 			orig()
 		}
 	}
+	var fanOnce sync.Once
+	job.release = func() {
+		fanOnce.Do(releaseRef)
+	}
+	var displayOnce sync.Once
 	f.release = func() {
-		close(job.shown)
-		job.release()
+		displayOnce.Do(func() {
+			close(job.shown)
+			releaseRef()
+		})
 	}
 	return job
 }

@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <cstdint>
+#include <string>
 #include "placeholder.h"
 #include "shm_protocol.h"
 
@@ -12,6 +13,10 @@ public:
 
     ShmReader(const ShmReader&) = delete;
     ShmReader& operator=(const ShmReader&) = delete;
+
+    // Test-only override: when non-empty, EnsureAttached attaches exclusively
+    // to this file path (skipping Global\ and Local\ mappings).
+    void SetFilePathOverride(const wchar_t* path);
 
     // Ensures shared memory and notification event are attached when available.
     bool EnsureAttached();
@@ -42,5 +47,6 @@ private:
     ULONGLONG m_inactiveSinceMs = 0;
     uint64_t m_lastObservedSeq = 0;
     ULONGLONG m_lastSeqAdvanceMs = 0;
+    std::wstring m_filePathOverride;
     PlaceholderFrame m_placeholder;
 };

@@ -55,35 +55,86 @@ func TestTrackerRollingPercentiles(t *testing.T) {
 	}
 }
 
-func TestTrackerSessionSummary(t *testing.T) {
+func TestSummaryMaxAndRunSummary(t *testing.T) {
 	const freq = 10_000_000
-	tr := New(2, freq) // rolling window smaller than total samples
-	tr.EnableSessionStats()
-	for i := 1; i <= 5; i++ {
+	tr := New(4, freq) // rolling window smaller than the run
+	for i := 1; i <= 100; i++ {
 		tr.Add(Sample{
-			DevToArriveMS:     float64(i),
-			ArriveToPresentMS: float64(i) * 0.5,
-			ArriveToVBlankMS:  float64(i) * 3.0,
+			ArriveToPresentMS: float64(i) * 0.1,
+			ArriveToVBlankMS:  float64(i),
 			HasVBlank:         true,
 		}, int64(i)*(freq/60))
 	}
-	rolling := tr.Summary()
-	if rolling.Frames != 5 {
-		t.Fatalf("rolling.Frames = %d, want 5", rolling.Frames)
+	s := tr.Summary()
+	if math.Abs(s.ArriveToPresMax-10.0) > 1e-6 || math.Abs(s.ArriveToVblMax-100.0) > 1e-6 {
+		t.Fatalf("window max pres=%.2f vbl=%.2f, want 10 and 100", s.ArriveToPresMax, s.ArriveToVblMax)
 	}
-	sess := tr.SessionSummary()
-	if sess.Frames != 5 {
-		t.Fatalf("sess.Frames = %d, want 5", sess.Frames)
+	if line := s.FormatLine("x", false); !strings.Contains(line, "max 10.00ms") || !strings.Contains(line, "max 100.00ms") {
+		t.Errorf("FormatLine missing max: %s", line)
 	}
-	// Session includes sample 1..5 even though rolling window is 2.
-	if math.Abs(sess.ArriveToPresP50-1.5) > 1e-6 || math.Abs(sess.ArriveToPresMax-2.5) > 1e-6 {
-		t.Errorf("unexpected session arr->pres: p50=%.2f max=%.2f", sess.ArriveToPresP50, sess.ArriveToPresMax)
+	r := tr.RunSummary()
+	if r.Frames != 100 || r.Pres.N != 100 || r.Vbl.N != 100 {
+		t.Fatalf("run frames=%d N pres=%d vbl=%d, want 100", r.Frames, r.Pres.N, r.Vbl.N)
 	}
-	if math.Abs(sess.ArriveToVblP50-9.0) > 1e-6 || math.Abs(sess.ArriveToVblMax-15.0) > 1e-6 {
-		t.Errorf("unexpected session arr->vbl: p50=%.2f max=%.2f", sess.ArriveToVblP50, sess.ArriveToVblMax)
+	// rank int(99*0.5)=49 -> sample 50 -> 5.0 ms (pres) / 50 ms (vbl), 0.01 ms bins.
+	if math.Abs(r.Pres.P50-5.0) > 0.011 || math.Abs(r.Vbl.P50-50.0) > 0.011 {
+		t.Errorf("run p50 pres=%.3f vbl=%.3f", r.Pres.P50, r.Vbl.P50)
 	}
-	if sess.FPS <= 0 {
-		t.Errorf("expected positive session FPS, got %.2f", sess.FPS)
+	// rank int(99*0.99)=98 -> sample 99 -> 9.9 ms (pres) / 99 ms (vbl).
+	if math.Abs(r.Pres.P99-9.9) > 0.011 || math.Abs(r.Vbl.P99-99.0) > 0.011 ||
+		math.Abs(r.Pres.Max-10.0) > 1e-9 || math.Abs(r.Vbl.Max-100.0) > 1e-9 {
+		t.Errorf("run p99/max: %+v", r)
+	}
+	if !strings.Contains(r.String(), "arr->pres n 100") || !strings.Contains(r.String(), "arr->vbl n 100") {
+		t.Errorf("unexpected run line: %s", r)
+	}
+}
+
+func TestTrackerRunHistogramBoundedAndExactMax(t *testing.T) {
+	const freq = 10_000_000
+	tr := New(8, freq)
+
+	// Warm up histogram bin allocation with one sample, then verify Add() does
+	// zero heap allocations over thousands of samples (fixed memory, no slice growth).
+	tr.Add(Sample{
+		DevToArriveMS:     1.0,
+		ArriveToPresentMS: 0.45,
+		ArriveToVBlankMS:  8.50,
+		HasVBlank:         true,
+	}, freq/120)
+
+	allocs := testing.AllocsPerRun(5000, func() {
+		tr.Add(Sample{
+			DevToArriveMS:     1.0,
+			ArriveToPresentMS: 0.45,
+			ArriveToVBlankMS:  8.50,
+			HasVBlank:         true,
+		}, freq/120)
+	})
+	if allocs != 0 {
+		t.Fatalf("Tracker.Add allocated %.2f allocs/op after histogram init, want 0", allocs)
+	}
+
+	// Outlier beyond the 500 ms last histogram bin must still preserve exact Max.
+	tr.Add(Sample{
+		DevToArriveMS:     2.0,
+		ArriveToPresentMS: 777.25,
+		ArriveToVBlankMS:  912.50,
+		HasVBlank:         true,
+	}, 2*freq)
+
+	r := tr.RunSummary()
+	if math.Abs(r.Pres.P50-0.45) > 0.011 {
+		t.Errorf("Pres.P50 = %.3f, want ~0.45", r.Pres.P50)
+	}
+	if math.Abs(r.Pres.Max-777.25) > 1e-6 {
+		t.Errorf("Pres.Max = %.3f, want exact 777.25", r.Pres.Max)
+	}
+	if math.Abs(r.Vbl.P50-8.50) > 0.011 {
+		t.Errorf("Vbl.P50 = %.3f, want ~8.50", r.Vbl.P50)
+	}
+	if math.Abs(r.Vbl.Max-912.50) > 1e-6 {
+		t.Errorf("Vbl.Max = %.3f, want exact 912.50", r.Vbl.Max)
 	}
 }
 
@@ -101,6 +152,10 @@ func TestTrackerAsyncDisplayTiming(t *testing.T) {
 	s := tr.Summary()
 	if !s.HasVBlank || math.Abs(s.ArriveToVblP50-3.0) > 1e-6 {
 		t.Fatalf("unexpected async display timing: %+v", s)
+	}
+	r := tr.RunSummary()
+	if r.Vbl.N != 5 || math.Abs(r.Vbl.P50-3.0) > 0.011 || math.Abs(r.Vbl.Max-5.0) > 1e-6 {
+		t.Fatalf("unexpected RunSummary async display timing: %+v", r)
 	}
 	pwLine := s.FormatLineExt("NV12", "IMMEDIATE", "arr->presentwait")
 	if !strings.Contains(pwLine, "arr->presentwait p50 3.00ms") {

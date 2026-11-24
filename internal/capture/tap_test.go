@@ -393,6 +393,37 @@ func TestMailboxFanOutConcurrentNoRaceNoLeak(t *testing.T) {
 	}
 }
 
+func TestPrepareFanOutReleaseIdempotentEvenOnFrameCopy(t *testing.T) {
+	tap := NewTap()
+	tap.SetEnabled(true)
+
+	var origReleased atomic.Int32
+	f := mkTestNV12Frame(t, 7, func() { origReleased.Add(1) })
+	job := prepareFanOut(&f, tap)
+
+	// Calling Release on two shallow copies of f must not panic on double-close
+	// of job.shown and must decrement the display reference only once.
+	fCopy := f
+	f.Release()
+	fCopy.Release()
+
+	select {
+	case <-job.shown:
+	default:
+		t.Fatal("expected job.shown to be closed after f.Release()")
+	}
+	if origReleased.Load() != 0 {
+		t.Fatalf("orig released prematurely before fan-out finished: %d", origReleased.Load())
+	}
+
+	// Fan-out release is also idempotent and triggers orig exactly once.
+	job.release()
+	job.release()
+	if origReleased.Load() != 1 {
+		t.Fatalf("origReleased = %d, want 1", origReleased.Load())
+	}
+}
+
 func BenchmarkTapWriteNV12_1080p(b *testing.B) {
 	const w, h = 1920, 1080
 	const stride = 2048 // typical MF padded stride

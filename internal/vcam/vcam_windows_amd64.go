@@ -157,7 +157,9 @@ func OpenShmWriter(mode string, fps float64) (*ShmWriter, error) {
 	w.hdr.FPSDen = den
 	w.seq = prevSeq
 	atomic.StoreUint64(&w.hdr.Seq, prevSeq)
-	atomic.StoreUint32(&w.hdr.Active, 1)
+	// Leave Active = 0 until WriteNV12 publishes the first valid slot payload
+	// so the DLL stays in 60 fps placeholder pacing on reopen with no signal.
+	atomic.StoreUint32(&w.hdr.Active, 0)
 
 	w.initEvent(sa, m == "local")
 	return w, nil
@@ -242,7 +244,7 @@ func (w *ShmWriter) WriteNV12(data []byte, width, height int, timestampHNS int64
 	meta.TimestampHNS = timestampHNS
 	atomic.StoreUint64(&meta.Seq, nextSeq*2)
 
-	w.hdr.LatestSlot = slot
+	atomic.StoreUint32(&w.hdr.LatestSlot, slot)
 	w.hdr.Width = uint32(width)
 	w.hdr.Height = uint32(height)
 	w.hdr.FPSNum = w.fpsNum.Load()

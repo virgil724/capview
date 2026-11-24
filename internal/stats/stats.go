@@ -3,6 +3,7 @@ package stats
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 )
@@ -21,7 +22,7 @@ type Sample struct {
 	HasPresentCall bool
 }
 
-// Summary is a snapshot of recent or whole-session performance.
+// Summary is a snapshot of recent performance over a rolling window.
 type Summary struct {
 	FPS             float64
 	Frames          uint64
@@ -40,8 +41,23 @@ type Summary struct {
 	HasVBlank       bool
 }
 
+// Dist is a latency distribution summary in milliseconds.
+type Dist struct {
+	N             uint64
+	P50, P99, Max float64
+}
+
+// RunSummary aggregates every sample since the tracker was created (not just
+// the rolling window), for end-of-run A/B measurements.
+type RunSummary struct {
+	Frames  uint64
+	Dropped uint64
+	Pres    Dist
+	Vbl     Dist
+}
+
 // Tracker maintains a fixed-size ring buffer of recent frame samples and
-// optionally records all samples across the session for final summary reporting.
+// bounded-memory whole-run latency histograms (0.01 ms resolution).
 type Tracker struct {
 	mu sync.Mutex
 
@@ -56,19 +72,14 @@ type Tracker struct {
 	dispIdx   int
 	dispCount int
 
+	// Whole-run latency histograms (fixed bounded memory, 0.01 ms resolution).
+	runPres hist
+	runVbl  hist
+
 	windowFrames uint64
 	windowStart  int64 // QPC ticks
 	qpcFreq      int64
 	lastFPS      float64
-
-	recordSession bool
-	sessStartQPC  int64
-	sessLastQPC   int64
-	sessDevArr    []float64
-	sessArrPres   []float64
-	sessArrVbl    []float64
-	sessDispBuf   []float64
-	sessPresCall  []float64
 }
 
 // New creates a Tracker keeping the last windowSize samples.
@@ -87,15 +98,6 @@ func New(windowSize int, qpcFreq int64) *Tracker {
 	}
 }
 
-// EnableSessionStats opts into recording every sample across the full session
-// so SessionSummary can report whole-run p50/p99/max (used for bounded-duration
-// benchmarks).
-func (t *Tracker) EnableSessionStats() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.recordSession = true
-}
-
 // Add records a rendered frame at QPC timestamp nowQPC.
 func (t *Tracker) Add(s Sample, nowQPC int64) {
 	t.mu.Lock()
@@ -107,6 +109,10 @@ func (t *Tracker) Add(s Sample, nowQPC int64) {
 		t.count++
 	}
 	t.frames++
+	t.runPres.add(s.ArriveToPresentMS)
+	if s.HasVBlank {
+		t.runVbl.add(s.ArriveToVBlankMS)
+	}
 	if t.windowStart == 0 {
 		t.windowStart = nowQPC
 	}
@@ -116,21 +122,6 @@ func (t *Tracker) Add(s Sample, nowQPC int64) {
 		t.windowFrames = 0
 		t.windowStart = nowQPC
 	}
-
-	if t.recordSession {
-		if t.sessStartQPC == 0 {
-			t.sessStartQPC = nowQPC
-		}
-		t.sessLastQPC = nowQPC
-		t.sessDevArr = append(t.sessDevArr, s.DevToArriveMS)
-		t.sessArrPres = append(t.sessArrPres, s.ArriveToPresentMS)
-		if s.HasVBlank {
-			t.sessArrVbl = append(t.sessArrVbl, s.ArriveToVBlankMS)
-		}
-		if s.HasPresentCall {
-			t.sessPresCall = append(t.sessPresCall, s.PresentCallMS)
-		}
-	}
 }
 
 // AddDisplayTiming records an asynchronous display/present-wait completion
@@ -139,13 +130,11 @@ func (t *Tracker) AddDisplayTiming(ms float64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.runVbl.add(ms)
 	t.dispBuf[t.dispIdx] = ms
 	t.dispIdx = (t.dispIdx + 1) % t.cap
 	if t.dispCount < t.cap {
 		t.dispCount++
-	}
-	if t.recordSession {
-		t.sessDispBuf = append(t.sessDispBuf, ms)
 	}
 }
 
@@ -161,12 +150,13 @@ func (t *Tracker) Summary() Summary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	s := Summary{
+		FPS:     t.lastFPS,
+		Frames:  t.frames,
+		Dropped: t.dropped,
+	}
 	if t.count == 0 {
-		return Summary{
-			FPS:     t.lastFPS,
-			Frames:  t.frames,
-			Dropped: t.dropped,
-		}
+		return s
 	}
 	devArr := make([]float64, 0, t.count)
 	arrPres := make([]float64, 0, t.count)
@@ -186,60 +176,13 @@ func (t *Tracker) Summary() Summary {
 	if len(arrVbl) == 0 && t.dispCount > 0 {
 		arrVbl = append(arrVbl, t.dispBuf[:t.dispCount]...)
 	}
-	return computeSummary(t.lastFPS, t.frames, t.dropped, devArr, arrPres, arrVbl, presCall)
-}
 
-// SessionSummary computes percentiles and max over all samples recorded since
-// EnableSessionStats was called. If EnableSessionStats was not called, it falls
-// back to the rolling Summary.
-func (t *Tracker) SessionSummary() Summary {
-	t.mu.Lock()
-	recordSession := t.recordSession
-	if !recordSession {
-		t.mu.Unlock()
-		return t.Summary()
-	}
-	frames := t.frames
-	dropped := t.dropped
-	fps := t.lastFPS
-	if frames > 1 && t.sessLastQPC > t.sessStartQPC {
-		fps = float64(frames-1) * float64(t.qpcFreq) / float64(t.sessLastQPC-t.sessStartQPC)
-	}
-	devArr := append([]float64(nil), t.sessDevArr...)
-	arrPres := append([]float64(nil), t.sessArrPres...)
-	arrVbl := append([]float64(nil), t.sessArrVbl...)
-	if len(arrVbl) == 0 && len(t.sessDispBuf) > 0 {
-		arrVbl = append([]float64(nil), t.sessDispBuf...)
-	}
-	presCall := append([]float64(nil), t.sessPresCall...)
-	t.mu.Unlock()
-
-	if len(arrPres) == 0 {
-		return Summary{
-			FPS:     fps,
-			Frames:  frames,
-			Dropped: dropped,
-		}
-	}
-	return computeSummary(fps, frames, dropped, devArr, arrPres, arrVbl, presCall)
-}
-
-func computeSummary(fps float64, frames, dropped uint64, devArr, arrPres, arrVbl, presCall []float64) Summary {
-	s := Summary{
-		FPS:     fps,
-		Frames:  frames,
-		Dropped: dropped,
-	}
-	if len(devArr) > 0 {
-		sort.Float64s(devArr)
-		s.DevToArriveP50 = percentile(devArr, 0.50)
-	}
-	if len(arrPres) > 0 {
-		sort.Float64s(arrPres)
-		s.ArriveToPresP50 = percentile(arrPres, 0.50)
-		s.ArriveToPresP99 = percentile(arrPres, 0.99)
-		s.ArriveToPresMax = arrPres[len(arrPres)-1]
-	}
+	sort.Float64s(devArr)
+	sort.Float64s(arrPres)
+	s.DevToArriveP50 = percentile(devArr, 0.50)
+	s.ArriveToPresP50 = percentile(arrPres, 0.50)
+	s.ArriveToPresP99 = percentile(arrPres, 0.99)
+	s.ArriveToPresMax = arrPres[len(arrPres)-1]
 	if len(presCall) > 0 {
 		sort.Float64s(presCall)
 		s.HasPresentCall = true
@@ -257,6 +200,25 @@ func computeSummary(fps float64, frames, dropped uint64, devArr, arrPres, arrVbl
 	return s
 }
 
+// RunSummary returns whole-run arr->pres and arr->vbl percentiles and max
+// from the fixed-memory histograms.
+func (t *Tracker) RunSummary() RunSummary {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return RunSummary{
+		Frames:  t.frames,
+		Dropped: t.dropped,
+		Pres:    t.runPres.dist(),
+		Vbl:     t.runVbl.dist(),
+	}
+}
+
+// String formats the run summary as one line.
+func (r RunSummary) String() string {
+	return fmt.Sprintf("run: frames %d drop %d | arr->pres n %d p50 %.2fms p99 %.2fms max %.2fms | arr->vbl n %d p50 %.2fms p99 %.2fms max %.2fms",
+		r.Frames, r.Dropped, r.Pres.N, r.Pres.P50, r.Pres.P99, r.Pres.Max, r.Vbl.N, r.Vbl.P50, r.Vbl.P99, r.Vbl.Max)
+}
+
 func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
@@ -269,6 +231,61 @@ func percentile(sorted []float64, p float64) float64 {
 		i = len(sorted) - 1
 	}
 	return sorted[i]
+}
+
+const (
+	histRes  = 0.01 // ms per bin
+	histBins = 50_000
+)
+
+// hist is a lazily allocated fixed-resolution histogram; samples beyond the
+// last bin land in it but Max stays exact.
+type hist struct {
+	bins []uint32
+	n    uint64
+	max  float64
+}
+
+func (h *hist) add(ms float64) {
+	if h.bins == nil {
+		h.bins = make([]uint32, histBins)
+	}
+	i := int(math.Round(ms / histRes))
+	if i < 0 {
+		i = 0
+	}
+	if i >= histBins {
+		i = histBins - 1
+	}
+	h.bins[i]++
+	if h.n == 0 || ms > h.max {
+		h.max = ms
+	}
+	h.n++
+}
+
+func (h *hist) quantile(p float64) float64 {
+	// Same rank convention as percentile(): index int((n-1)*p).
+	rank := uint64(float64(h.n-1) * p)
+	var seen uint64
+	for i, c := range h.bins {
+		seen += uint64(c)
+		if seen > rank {
+			v := float64(i) * histRes
+			if v > h.max {
+				v = h.max
+			}
+			return v
+		}
+	}
+	return h.max
+}
+
+func (h *hist) dist() Dist {
+	if h.n == 0 {
+		return Dist{}
+	}
+	return Dist{N: h.n, P50: h.quantile(0.50), P99: h.quantile(0.99), Max: h.max}
 }
 
 // FormatLine formats a compact one-line status string for the window title or stdout.

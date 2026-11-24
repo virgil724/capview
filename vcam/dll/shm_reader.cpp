@@ -71,6 +71,11 @@ ShmReader::~ShmReader() {
     Detach();
 }
 
+void ShmReader::SetFilePathOverride(const wchar_t* path) {
+    Detach();
+    m_filePathOverride = path ? path : L"";
+}
+
 void ShmReader::Detach() {
     if (m_base) {
         UnmapViewOfFile(m_base);
@@ -89,6 +94,7 @@ void ShmReader::Detach() {
         CloseHandle(m_event);
         m_event = nullptr;
     }
+    m_lastRetryMs = 0;
     m_inactiveSinceMs = 0;
     m_lastObservedSeq = 0;
     m_lastSeqAdvanceMs = 0;
@@ -100,6 +106,12 @@ bool ShmReader::IsStreamLive() const {
     if (active == 0) return false;
     const uint64_t seq = std::atomic_ref<const uint64_t>(m_hdr->seq).load(std::memory_order_acquire);
     if (seq == 0) return false;
+    const uint32_t slot =
+        std::atomic_ref<const uint32_t>(m_hdr->latestSlot).load(std::memory_order_acquire) %
+        CAPVIEW_SHM_SLOT_COUNT;
+    const uint64_t slotSeq =
+        std::atomic_ref<const uint64_t>(m_hdr->slots[slot].seq).load(std::memory_order_acquire);
+    if (slotSeq == 0) return false;
     if (m_lastObservedSeq == 0 || m_lastSeqAdvanceMs == 0) return true;
     return (GetTickCount64() - m_lastSeqAdvanceMs) <= kStaleFrameThresholdMs;
 }
@@ -151,11 +163,15 @@ bool ShmReader::EnsureAttached() {
     }
     m_lastRetryMs = nowMs;
 
-    HANDLE mapH = OpenFileMappingW(FILE_MAP_READ, FALSE, CAPVIEW_SHM_GLOBAL_NAME);
+    HANDLE mapH = nullptr;
     HANDLE fileH = INVALID_HANDLE_VALUE;
+    if (m_filePathOverride.empty()) {
+        mapH = OpenFileMappingW(FILE_MAP_READ, FALSE, CAPVIEW_SHM_GLOBAL_NAME);
+    }
     if (!mapH) {
+        const wchar_t* shmPath = m_filePathOverride.empty() ? CAPVIEW_SHM_FILE_PATH : m_filePathOverride.c_str();
         fileH = CreateFileW(
-            CAPVIEW_SHM_FILE_PATH,
+            shmPath,
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -170,7 +186,7 @@ bool ShmReader::EnsureAttached() {
             }
         }
     }
-    if (!mapH) {
+    if (!mapH && m_filePathOverride.empty()) {
         mapH = OpenFileMappingW(FILE_MAP_READ, FALSE, CAPVIEW_SHM_LOCAL_NAME);
     }
     if (!mapH) {
@@ -218,7 +234,14 @@ void ShmReader::WaitForFrame(uint64_t lastSeq, DWORD timeoutMs, HANDLE stopEvt) 
             uint64_t curSeq = std::atomic_ref<const uint64_t>(m_hdr->seq).load(std::memory_order_acquire);
             uint32_t active = std::atomic_ref<const uint32_t>(m_hdr->active).load(std::memory_order_acquire);
             if (active != 0 && curSeq != lastSeq && curSeq != 0) {
-                return;
+                const uint32_t slot =
+                    std::atomic_ref<const uint32_t>(m_hdr->latestSlot).load(std::memory_order_acquire) %
+                    CAPVIEW_SHM_SLOT_COUNT;
+                const uint64_t slotSeq =
+                    std::atomic_ref<const uint64_t>(m_hdr->slots[slot].seq).load(std::memory_order_acquire);
+                if (slotSeq != 0) {
+                    return;
+                }
             }
         }
         const ULONGLONG now = GetTickCount64();
@@ -267,7 +290,9 @@ bool ShmReader::ReadLatestNV12(
                         if (hdrSeq == 0) {
                             break;
                         }
-                        const uint32_t slot = m_hdr->latestSlot % CAPVIEW_SHM_SLOT_COUNT;
+                        const uint32_t slot =
+                            std::atomic_ref<const uint32_t>(m_hdr->latestSlot).load(std::memory_order_acquire) %
+                            CAPVIEW_SHM_SLOT_COUNT;
                         const CapviewShmSlotMeta& meta = m_hdr->slots[slot];
                         const uint64_t s1 = std::atomic_ref<const uint64_t>(meta.seq).load(std::memory_order_acquire);
                         if ((s1 & 1u) != 0 || s1 == 0) {
@@ -291,6 +316,9 @@ bool ShmReader::ReadLatestNV12(
                         CopyOrScaleNV12(srcPtr, static_cast<int>(srcW), static_cast<int>(srcH),
                                         dstY, dstYStride, dstUV, dstUVStride, dstW, dstH);
 
+                        // Acquire fence prevents the compiler/CPU from reordering payload or
+                        // metadata reads past the closing seqlock read s2.
+                        std::atomic_thread_fence(std::memory_order_acquire);
                         const uint64_t s2 = std::atomic_ref<const uint64_t>(meta.seq).load(std::memory_order_acquire);
                         if (s1 == s2) {
                             outSeq = s1 / 2u;

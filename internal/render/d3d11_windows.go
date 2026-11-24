@@ -326,8 +326,8 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		black    = [4]float32{0, 0, 0, 1}
 		tracker  = stats.New(120, cfg.Freq)
 	)
-	if cfg.Duration > 0 {
-		tracker.EnableSessionStats()
+	if cfg.PrintStats {
+		defer func() { fmt.Println(tracker.RunSummary()) }()
 	}
 
 	statsTicker := time.NewTicker(time.Second)
@@ -469,6 +469,14 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 					return FinalState{}, err
 				}
 			}
+			// Under VSync, sc.Present(1, 0) can block 8-16 ms waiting for vblank,
+			// so release the capture buffer right after upload to avoid holding
+			// the driver IMFSample across vblank. Under VRR/LowLat (!useVSync),
+			// Present returns immediately, so defer Release until after Present
+			// so the tap's memcpy does not contend with draw and present.
+			if useVSync {
+				f.Release()
+			}
 
 			// Draw full-screen triangle with aspect-preserving viewport.
 			ctx.OMSetRenderTargets(rtv)
@@ -500,10 +508,12 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				pErr = sc.Present(1, 0)
 			}
 			presentQPC := win.QPC()
-			// Hand the capture buffer back only now: secondary outputs (Virtual Camera)
-			// copy it once the viewer releases it, and their copy must not compete
-			// with this frame's draw and present.
-			f.Release()
+			if !useVSync {
+				// Hand the capture buffer back only now: secondary outputs (Virtual Camera)
+				// copy it once the viewer releases it, and their copy must not compete
+				// with this frame's draw and present.
+				f.Release()
+			}
 			if pErr != nil && !errors.Is(pErr, win.ErrOccluded) {
 				return FinalState{}, fmt.Errorf("present: %w", pErr)
 			}
@@ -540,10 +550,6 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 
 	if !borderless {
 		savedWinRect = win.GetWindowRect(hwnd)
-	}
-	if cfg.Duration > 0 && cfg.PrintStats {
-		tearingActive := !useVSync && supportsTear
-		fmt.Println("session | " + tracker.SessionSummary().FormatLine(getModeLabel(), tearingActive))
 	}
 	return FinalState{
 		Fullscreen: borderless,
