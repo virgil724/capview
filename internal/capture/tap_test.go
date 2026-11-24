@@ -2,8 +2,10 @@ package capture
 
 import (
 	"bytes"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestTapNV12StripStride(t *testing.T) {
@@ -82,21 +84,48 @@ func TestTapYUY2ToNV12(t *testing.T) {
 	}
 }
 
+// takeWithin waits for tap to stage a frame from the fan-out goroutine.
+func takeWithin(t *testing.T, tap *Tap) *TapFrame {
+	t.Helper()
+	select {
+	case <-tap.Notify():
+	case <-time.After(time.Second):
+		t.Fatal("tap never received a frame")
+	}
+	return tap.Take()
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(time.Second); !cond(); {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func mkTestNV12Frame(t *testing.T, id int, release func()) Frame {
+	t.Helper()
+	buf := make([]byte, 4*2+4*1)
+	buf[0] = byte(id)
+	f, ok := lockedBuffer{FourCC: "NV12", Width: 4, Height: 2, Data: buf, Pitch: 4, ArriveQPC: int64(id)}.
+		view(release)
+	if !ok {
+		t.Fatal("view failed")
+	}
+	return f
+}
+
 func TestMailboxTapDropOldestAndImmediateSampleRelease(t *testing.T) {
 	mb := NewMailbox()
+	defer mb.Close()
 	tap := NewTap()
 	mb.SetTap(tap)
 
 	var released [10]atomic.Int32
 	mkFrame := func(id int) Frame {
-		buf := make([]byte, 4*2+4*1)
-		buf[0] = byte(id)
-		f, ok := lockedBuffer{FourCC: "NV12", Width: 4, Height: 2, Data: buf, Pitch: 4, ArriveQPC: int64(id)}.
-			view(func() { released[id].Add(1) })
-		if !ok {
-			t.Fatal("view failed")
-		}
-		return f
+		return mkTestNV12Frame(t, id, func() { released[id].Add(1) })
 	}
 
 	// While tap is disabled, zero copies occur and release works as before.
@@ -113,38 +142,39 @@ func TestMailboxTapDropOldestAndImmediateSampleRelease(t *testing.T) {
 		t.Fatalf("released[0] = %d, want 1", released[0].Load())
 	}
 
-	// Enable tap: consumer takes frame 1 and holds it without calling Release.
+	// Enable tap: display consumes and releases frame 1, which signals the
+	// fan-out goroutine to copy frame 1 into tap and release the IMFSample.
 	tap.SetEnabled(true)
 	mb.publish(mkFrame(1))
-	tf1 := tap.Take()
-	if tf1 == nil || tf1.Data[0] != 1 {
-		t.Fatalf("unexpected tf1: %+v", tf1)
-	}
-	// Display consumes frame 1 and releases it immediately. Even though tap
-	// consumer still holds tf1, frame 1's IMFSample must already be released!
 	df1 := mb.Take()
 	if df1 == nil {
 		t.Fatal("expected df1")
 	}
 	df1.Release()
-	if released[1].Load() != 1 {
-		t.Fatalf("IMFSample for frame 1 was held while tap consumer held Take(): released[1]=%d", released[1].Load())
-	}
 
-	// Publish frames 2, 3, 4 while tap still holds tf1: frames 2 and 3 are
-	// dropped-oldest in tap without blocking display or holding IMFSample.
-	mb.publish(mkFrame(2))
-	mb.publish(mkFrame(3))
-	mb.publish(mkFrame(4))
-	df4 := mb.Take()
-	if df4 == nil || df4.Plane0[0] != 4 {
-		t.Fatalf("expected display frame 4, got %+v", df4)
+	tf1 := takeWithin(t, tap)
+	if tf1 == nil || tf1.Data[0] != 1 {
+		t.Fatalf("unexpected tf1: %+v", tf1)
 	}
-	df4.Release()
+	// Even though tap consumer still holds tf1, frame 1's IMFSample must be
+	// released right after the fan-out copy completes.
+	eventually(t, "IMFSample for frame 1 must be released while tap consumer holds Take()", func() bool {
+		return released[1].Load() == 1
+	})
+
+	// Publish frames 2, 3, 4 while tap still holds tf1; display takes and
+	// releases each one so the fan-out worker stages them in order into the
+	// other two ring slots, dropping oldest in tap without blocking display.
 	for id := 2; id <= 4; id++ {
-		if released[id].Load() != 1 {
-			t.Fatalf("released[%d] = %d, want 1", id, released[id].Load())
+		mb.publish(mkFrame(id))
+		df := mb.Take()
+		if df == nil || df.Plane0[0] != byte(id) {
+			t.Fatalf("expected display frame %d, got %+v", id, df)
 		}
+		df.Release()
+		eventually(t, "frame released after display+fanout", func() bool {
+			return released[id].Load() == 1
+		})
 	}
 	if tap.Dropped() != 2 {
 		t.Fatalf("tap.Dropped() = %d, want 2", tap.Dropped())
@@ -162,6 +192,205 @@ func TestMailboxTapDropOldestAndImmediateSampleRelease(t *testing.T) {
 		t.Fatalf("expected latest tap frame 4, got %+v", tf4)
 	}
 	tap.Release()
+}
+
+func TestMailboxDeferredFanOutPostReleaseAndTimeout(t *testing.T) {
+	mb := NewMailbox()
+	defer mb.Close()
+	tap := NewTap()
+	tap.SetEnabled(true)
+	mb.SetTap(tap)
+
+	var released [4]atomic.Int32
+	pub := func(id int) {
+		mb.publish(mkTestNV12Frame(t, id, func() { released[id].Add(1) }))
+	}
+
+	// 1. Timeout fallback: display never takes frame 1; fan-out copies after
+	// fanOutWait, while keeping the buffer alive until display drops/releases it.
+	start := time.Now()
+	pub(1)
+	tf1 := takeWithin(t, tap)
+	elapsed := time.Since(start)
+	if tf1 == nil || tf1.Data[0] != 1 {
+		t.Fatalf("unexpected tf1: %+v", tf1)
+	}
+	tap.Release()
+	if elapsed < fanOutWait/2 {
+		t.Fatalf("fan-out copied too early before display release: %v < %v", elapsed, fanOutWait/2)
+	}
+	// Display still holds frame 1 in pending, so orig release must not have fired.
+	if released[1].Load() != 0 {
+		t.Fatalf("frame 1 released while display still holds it: %d", released[1].Load())
+	}
+	// Once display takes and releases frame 1, orig release fires exactly once.
+	mb.Take().Release()
+	eventually(t, "frame 1 released exactly once", func() bool { return released[1].Load() == 1 })
+
+	// 2. Post-Release immediate wakeup: display takes and releases frame 2
+	// immediately, waking fan-out via job.shown.
+	pub(2)
+	df2 := mb.Take()
+	if df2 == nil {
+		t.Fatal("expected df2")
+	}
+	df2.Release()
+	tf2 := takeWithin(t, tap)
+	if tf2 == nil || tf2.Data[0] != 2 {
+		t.Fatalf("unexpected tf2: %+v", tf2)
+	}
+	tap.Release()
+	eventually(t, "frame 2 released exactly once", func() bool { return released[2].Load() == 1 })
+
+	// 3. Disabling tap stops further staging while still releasing frames.
+	tap.SetEnabled(false)
+	pub(3)
+	mb.Take().Release()
+	eventually(t, "frame 3 released", func() bool { return released[3].Load() == 1 })
+	time.Sleep(2 * fanOutWait)
+	if tap.Take() != nil {
+		t.Fatal("disabled tap must not receive frames")
+	}
+}
+
+func TestMailboxFanOutDropOldestQueueAndOnceRelease(t *testing.T) {
+	mb := NewMailbox()
+	tap := NewTap()
+	tap.SetEnabled(true)
+	mb.SetTap(tap)
+
+	const total = 16
+	var released [total]atomic.Int32
+	pub := func(id int) {
+		mb.publish(mkTestNV12Frame(t, id, func() { released[id].Add(1) }))
+	}
+
+	// Publish frame 0 and let display hold it (taken, not released), so the
+	// fan-out worker pulls job 0 and waits up to fanOutWait on job0.shown.
+	pub(0)
+	held := mb.Take()
+	if held == nil {
+		t.Fatal("expected frame 0")
+	}
+	// Give the fan-out worker a moment to pick up job 0 from the 1-slot channel.
+	time.Sleep(200 * time.Microsecond)
+
+	// Burst frames 1..total-1 while job 0 is waiting on shown: publish must not
+	// block, and the 1-slot drop-oldest fan-out queue must drop and release
+	// superseded jobs.
+	for id := 1; id < total; id++ {
+		pub(id)
+	}
+	// Release the held frame 0 and the latest pending frame.
+	held.Release()
+	if latest := mb.Take(); latest != nil {
+		latest.Release()
+	}
+
+	mb.Close()
+
+	for id := 0; id < total; id++ {
+		if got := released[id].Load(); got != 1 {
+			t.Fatalf("released[%d] = %d, want 1", id, got)
+		}
+	}
+	if mb.fan.dropped.Load() == 0 {
+		t.Fatalf("expected fan-out 1-slot queue to drop superseded jobs during burst, got 0")
+	}
+}
+
+func TestMailboxCloseIdempotentAndPostCloseSafe(t *testing.T) {
+	mb := NewMailbox()
+	tap := NewTap()
+	tap.SetEnabled(true)
+	mb.SetTap(tap)
+
+	var r1, r2 atomic.Int32
+	mb.publish(mkTestNV12Frame(t, 1, func() { r1.Add(1) }))
+	mb.Close()
+	mb.Close() // idempotent
+
+	if r1.Load() != 1 {
+		t.Fatalf("r1 = %d, want 1 after Close", r1.Load())
+	}
+
+	// Publishing after Close must not panic or leak the capture buffer.
+	mb.publish(mkTestNV12Frame(t, 2, func() { r2.Add(1) }))
+	mb.Discard()
+	if r2.Load() != 1 {
+		t.Fatalf("r2 = %d, want 1 after post-Close Discard", r2.Load())
+	}
+}
+
+func TestMailboxFanOutConcurrentNoRaceNoLeak(t *testing.T) {
+	mb := NewMailbox()
+	tap := NewTap()
+	tap.SetEnabled(true)
+	mb.SetTap(tap)
+
+	const total = 200
+	var released [total]atomic.Int32
+
+	stopConsumers := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Display consumer goroutine.
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-mb.Notify():
+				if f := mb.Take(); f != nil {
+					f.Release()
+				}
+			case <-stopConsumers:
+				if f := mb.Take(); f != nil {
+					f.Release()
+				}
+				return
+			}
+		}
+	}()
+
+	// Tap consumer goroutine.
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-tap.Notify():
+				if tf := tap.Take(); tf != nil {
+					_ = tf.Data[0]
+					tap.Release()
+				}
+			case <-stopConsumers:
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < total; i++ {
+		if i%40 == 20 {
+			tap.SetEnabled(false)
+		} else if i%40 == 30 {
+			tap.SetEnabled(true)
+		}
+		id := i
+		mb.publish(mkTestNV12Frame(t, id, func() { released[id].Add(1) }))
+		if i%7 == 0 {
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
+
+	close(stopConsumers)
+	wg.Wait()
+	mb.Close()
+
+	for i := 0; i < total; i++ {
+		if got := released[i].Load(); got != 1 {
+			t.Fatalf("released[%d] = %d, want 1", i, got)
+		}
+	}
 }
 
 func BenchmarkTapWriteNV12_1080p(b *testing.B) {

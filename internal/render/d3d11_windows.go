@@ -447,6 +447,7 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				var err error
 				tex0, srv0, tex1, srv1, err = createVideoTextures(dev, f.FourCC, f.Width, f.Height)
 				if err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 				texW, texH, texFmt = f.Width, f.Height, f.FourCC
@@ -455,17 +456,19 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			// Upload CPU frame -> GPU dynamic texture(s).
 			if f.FourCC == "NV12" {
 				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width, f.Height); err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 				if err := uploadPlane(ctx, tex1, f.Plane1, f.Stride1, f.Width, f.Height/2); err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 			} else {
 				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width*2, f.Height); err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 			}
-			f.Release() // hand the capture buffer back to Media Foundation
 
 			// Draw full-screen triangle with aspect-preserving viewport.
 			ctx.OMSetRenderTargets(rtv)
@@ -497,6 +500,10 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				pErr = sc.Present(1, 0)
 			}
 			presentQPC := win.QPC()
+			// Hand the capture buffer back only now: secondary outputs (Virtual Camera)
+			// copy it once the viewer releases it, and their copy must not compete
+			// with this frame's draw and present.
+			f.Release()
 			if pErr != nil && !errors.Is(pErr, win.ErrOccluded) {
 				return FinalState{}, fmt.Errorf("present: %w", pErr)
 			}

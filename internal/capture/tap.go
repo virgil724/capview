@@ -3,7 +3,135 @@ package capture
 import (
 	"sync"
 	"sync/atomic"
+	"time"
 )
+
+// fanOutWait bounds how long the fan-out goroutine waits for the display
+// path to finish with a frame before copying it anyway.
+const fanOutWait = 2 * time.Millisecond
+
+// fanJob is one published frame waiting to be copied by the tap.
+type fanJob struct {
+	view    Frame         // planes only; release is nil
+	tap     *Tap          // tap at publish time
+	shown   chan struct{} // closed when the display path releases the frame
+	release func()        // drops the fan-out's reference to the buffer
+}
+
+// fanWorker copies frames to the tap off the capture thread, after the
+// display path is done with them: a concurrent 3 MB copy measurably slows
+// the viewer's own upload (memory bandwidth), so the tap goes second.
+type fanWorker struct {
+	mu      sync.Mutex
+	started bool
+	closed  bool
+	jobs    chan *fanJob // capacity 1, drop-oldest
+	done    chan struct{}
+	dropped atomic.Uint64
+}
+
+// prepareFanOut splits f's buffer reference between the display path and
+// the fan-out: the capture buffer is released when both are done.
+func prepareFanOut(f *Frame, tap *Tap) *fanJob {
+	job := &fanJob{view: *f, tap: tap, shown: make(chan struct{})}
+	job.view.release = nil
+	orig := f.release
+	var refs atomic.Int32
+	refs.Store(2)
+	job.release = func() {
+		if refs.Add(-1) == 0 && orig != nil {
+			orig()
+		}
+	}
+	f.release = func() {
+		close(job.shown)
+		job.release()
+	}
+	return job
+}
+
+// submit queues job without blocking, replacing (and releasing) a job the
+// worker has not started yet.
+func (w *fanWorker) submit(job *fanJob) {
+	var dropped *fanJob
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		job.release()
+		return
+	}
+	if !w.started {
+		w.started = true
+		w.jobs = make(chan *fanJob, 1)
+		w.done = make(chan struct{})
+		go w.run()
+	}
+	for {
+		select {
+		case w.jobs <- job:
+			w.mu.Unlock()
+			if dropped != nil {
+				dropped.release()
+			}
+			return
+		default:
+		}
+		select {
+		case old := <-w.jobs:
+			w.dropped.Add(1)
+			if dropped != nil {
+				dropped.release()
+			}
+			dropped = old
+		default:
+		}
+	}
+}
+
+func (w *fanWorker) run() {
+	defer close(w.done)
+	wait := time.NewTimer(fanOutWait)
+	defer wait.Stop()
+	for job := range w.jobs {
+		wait.Reset(fanOutWait)
+		select {
+		case <-job.shown:
+			wait.Stop()
+		case <-wait.C:
+		}
+		if job.tap.Enabled() {
+			job.tap.WriteFrame(job.view)
+		}
+		job.release()
+	}
+}
+
+// close stops the fan-out worker, releases any queued unstarted job, and
+// waits for an in-flight job (if any) to finish. Safe to call more than once.
+func (w *fanWorker) close() {
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		return
+	}
+	w.closed = true
+	if !w.started {
+		w.mu.Unlock()
+		return
+	}
+	var old *fanJob
+	select {
+	case old = <-w.jobs:
+	default:
+	}
+	close(w.jobs)
+	done := w.done
+	w.mu.Unlock()
+	if old != nil {
+		old.release()
+	}
+	<-done
+}
 
 // TapFrame holds one tightly-packed NV12 frame inside the Tap's pre-allocated
 // staging ring.
@@ -16,9 +144,10 @@ type TapFrame struct {
 }
 
 // Tap is a non-blocking, bounded (3-slot, drop-oldest) secondary output branch
-// fed off Mailbox.publish. It converts YUY2->NV12 and strips MF stride padding
-// into its own pre-allocated staging buffers so the capture IMFSample can be
-// released immediately and the display path never waits.
+// fed from Mailbox.publish via the mailbox's fan-out goroutine after the
+// display path releases each frame. It converts YUY2->NV12 and strips MF stride
+// padding into its own pre-allocated staging buffers so the capture IMFSample
+// is released right after the copy and the display path never waits.
 type Tap struct {
 	mu      sync.Mutex
 	slots   [3]TapFrame

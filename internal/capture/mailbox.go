@@ -63,6 +63,7 @@ type Mailbox struct {
 	dropped atomic.Uint64
 	notify  chan struct{}
 	tap     atomic.Pointer[Tap]
+	fan     fanWorker // copies frames to the tap off the capture thread
 }
 
 // NewMailbox creates a latest-frame mailbox.
@@ -105,29 +106,20 @@ func (m *Mailbox) Discard() {
 	}
 }
 
-func (m *Mailbox) publish(f Frame) {
-	tap := m.tap.Load()
-	tapEnabled := tap != nil && tap.Enabled()
+// Close discards any pending frame and shuts down the fan-out worker,
+// releasing any queued fan-out job. Safe to call more than once.
+func (m *Mailbox) Close() {
+	m.Discard()
+	m.fan.close()
+}
 
-	var tapView Frame
-	var releaseForTap func()
-	if tapEnabled {
-		// Copy slice descriptors before handing f to the display path, which
-		// clears its own slice fields on Frame.Release().
-		tapView = f
-		tapView.release = nil
-		if f.release != nil {
-			origRelease := f.release
-			var refs atomic.Int32
-			refs.Store(2)
-			sharedRelease := func() {
-				if refs.Add(-1) == 0 {
-					origRelease()
-				}
-			}
-			f.release = sharedRelease
-			releaseForTap = sharedRelease
-		}
+func (m *Mailbox) publish(f Frame) {
+	// Fan-out: enabled tap copies the frame on the fan-out goroutine once the
+	// display path has released it (see fanWorker). The capture buffer is
+	// reference-counted so whichever side finishes last releases it.
+	var job *fanJob
+	if tap := m.tap.Load(); tap != nil && tap.Enabled() {
+		job = prepareFanOut(&f, tap)
 	}
 
 	m.mu.Lock()
@@ -143,11 +135,8 @@ func (m *Mailbox) publish(f Frame) {
 	default:
 	}
 
-	if tapEnabled {
-		tap.WriteFrame(tapView)
-	}
-	if releaseForTap != nil {
-		releaseForTap()
+	if job != nil {
+		m.fan.submit(job)
 	}
 }
 
