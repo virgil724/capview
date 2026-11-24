@@ -17,6 +17,7 @@ All notable changes to `capview` are documented in this file.
 - `-source synthetic` test pattern and `-duration` for repeatable measurements.
 - **Audio mirror output (Windows)**: right-click **Audio Mirror Output** sends a second copy of the passthrough audio to another playback device (e.g. VB-Cable's *CABLE Input*, so Meet/Zoom can use *CABLE Output* as a microphone). Off by default; saved as `audio_mirror_id`; `-audio-mirror <id|name|off>` on the command line. The mirror is post-fader (follows mute and volume), runs on its own WASAPI thread with a 35 ms bounded ring, and stops on its own if the device is unplugged without affecting local playback.
 - `-stats` now prints `max` for arr->pres / arr->vbl and a whole-run summary line on exit (D3D11), plus audio ring overrun/underrun counters every 10 s.
+- **Spout2 output** for OBS (Windows): right-click **Spout Output** / `-spout` / `spout_enabled`. Pure-Go Spout 2.007-compatible sender on its own D3D11 device, fed by a new capture fan-out (`Mailbox.AddSink`, independent drop-oldest taps). `tools/spoutcheck` verifies a sender without OBS.
 
 ## [0.1.1] - 2026-11-21
 

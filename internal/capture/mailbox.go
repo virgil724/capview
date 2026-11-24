@@ -62,6 +62,8 @@ type Mailbox struct {
 	taken   Frame // frame handed to the consumer by the last Take
 	dropped atomic.Uint64
 	notify  chan struct{}
+	sinks   sinkSet   // secondary consumers (see tap.go)
+	fan     fanWorker // copies frames to the sinks
 }
 
 // NewMailbox creates a latest-frame mailbox.
@@ -100,6 +102,14 @@ func (m *Mailbox) Discard() {
 }
 
 func (m *Mailbox) publish(f Frame) {
+	// Fan-out: enabled sinks copy the frame on the fan-out goroutine once
+	// the display path has released it (see fanWorker). The capture buffer
+	// is reference-counted so whichever side finishes last releases it.
+	var job *fanJob
+	if sinks := m.fanOut(); len(sinks) > 0 {
+		job = prepareFanOut(&f, sinks)
+	}
+
 	m.mu.Lock()
 	if m.hasNew {
 		m.dropped.Add(1)
@@ -111,6 +121,10 @@ func (m *Mailbox) publish(f Frame) {
 	select {
 	case m.notify <- struct{}{}:
 	default:
+	}
+
+	if job != nil {
+		m.fan.submit(job)
 	}
 }
 

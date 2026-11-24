@@ -60,3 +60,29 @@ func TestAudioMirrorIDField(t *testing.T) {
 		t.Fatalf("saved JSON missing snake_case field: %s", data)
 	}
 }
+
+func TestSpoutEnabledKey(t *testing.T) {
+	if Default().SpoutEnabled {
+		t.Fatal("Spout output must default to off")
+	}
+	p := filepath.Join(t.TempDir(), "config.json")
+	cfg := Default()
+	cfg.SpoutEnabled = true
+	if err := Save(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"spout_enabled": true`) {
+		t.Fatalf("missing snake_case key: %s", data)
+	}
+	if err := os.WriteFile(p, []byte(`{"spout_enabled": true}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil || !got.SpoutEnabled {
+		t.Fatalf("Load spout_enabled = %v, %v", got.SpoutEnabled, err)
+	}
+}

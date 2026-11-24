@@ -12,6 +12,7 @@ const (
 	vtDeviceCreateVertexShader       = 12
 	vtDeviceCreatePixelShader        = 15
 	vtDeviceCreateSamplerState       = 23
+	vtDeviceOpenSharedResource       = 28
 
 	vtContextPSSetShaderResources   = 8
 	vtContextPSSetShader            = 9
@@ -23,6 +24,7 @@ const (
 	vtContextIASetPrimitiveTopology = 24
 	vtContextOMSetRenderTargets     = 33
 	vtContextRSSetViewports         = 44
+	vtContextCopyResource           = 47
 	vtContextClearRenderTargetView  = 50
 	vtContextFlush                  = 111
 )
@@ -35,11 +37,18 @@ const (
 
 	D3D11_USAGE_DEFAULT = 0
 	D3D11_USAGE_DYNAMIC = 2
+	D3D11_USAGE_STAGING = 3
 
 	D3D11_BIND_SHADER_RESOURCE = 0x8
+	D3D11_BIND_RENDER_TARGET   = 0x20
+
+	// D3D11_RESOURCE_MISC_SHARED: legacy (non-NT) DXGI shared handle.
+	D3D11_RESOURCE_MISC_SHARED = 0x2
 
 	D3D11_CPU_ACCESS_WRITE = 0x10000
+	D3D11_CPU_ACCESS_READ  = 0x20000
 
+	D3D11_MAP_READ          = 1
 	D3D11_MAP_WRITE_DISCARD = 4
 
 	D3D11_SRV_DIMENSION_TEXTURE2D = 4
@@ -234,6 +243,49 @@ func (c Context) ClearRenderTargetView(view Object, rgba *[4]float32) {
 // Draw issues a non-indexed draw call.
 func (c Context) Draw(vertexCount, startVertex uint32) {
 	c.call(vtContextDraw, uintptr(vertexCount), uintptr(startVertex))
+}
+
+// IID_IDXGIResource is the DXGI view of a D3D11 resource.
+var IID_IDXGIResource = guid(0x035f3ab4, 0x482e, 0x4e50, 0xb4, 0x1f, 0x8a, 0x7f, 0x8b, 0xd8, 0x96, 0x0b)
+
+// IDXGIResource::GetSharedHandle (IUnknown 0-2, IDXGIObject 3-6,
+// IDXGIDeviceSubObject::GetDevice 7).
+const vtDXGIResourceGetSharedHandle = 8
+
+// GetSharedHandle returns the legacy shared handle of a texture created with
+// D3D11_RESOURCE_MISC_SHARED. The handle is not an NT handle: it is never
+// closed and stays valid while the texture lives.
+func GetSharedHandle(tex Object) (uintptr, error) {
+	res, err := tex.QueryInterface(&IID_IDXGIResource)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Release()
+	var h uintptr
+	if err := hr(res.call(vtDXGIResourceGetSharedHandle, uintptr(unsafe.Pointer(&h)))); err != nil {
+		return 0, err
+	}
+	return h, nil
+}
+
+// OpenSharedResource opens a legacy shared texture handle from another
+// device as an ID3D11Texture2D.
+func (d Device) OpenSharedResource(handle uintptr) (Object, error) {
+	var tex Object
+	err := hr(d.call(vtDeviceOpenSharedResource, handle, uintptr(unsafe.Pointer(&IID_ID3D11Texture2D)), uintptr(unsafe.Pointer(&tex))))
+	return tex, err
+}
+
+// GetTexture2DDesc returns a texture's description (ID3D11Texture2D::GetDesc, slot 10).
+func GetTexture2DDesc(tex Object) Texture2DDesc {
+	var d Texture2DDesc
+	tex.call(10, uintptr(unsafe.Pointer(&d)))
+	return d
+}
+
+// CopyResource copies a whole resource on the GPU.
+func (c Context) CopyResource(dst, src Object) {
+	c.call(vtContextCopyResource, uintptr(dst), uintptr(src))
 }
 
 // Flush submits queued commands to the GPU immediately.

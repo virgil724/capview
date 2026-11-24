@@ -82,16 +82,22 @@ go build -ldflags="-s -w" -o capview-cli.exe ./cmd/capview
 .\capview.exe
 ```
 
-Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
+Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, Spout output, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
 
 ### Controls
 
-- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Fullscreen, VRR/VSync, Mute, Quit)
+- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Fullscreen, VRR/VSync, Mute, Spout Output, Quit)
 - `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s; engages Independent Flip / VRR for <1 ms display latency)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
 - `M`: Mute / unmute audio
 - `Up` / `Down` / Mouse Wheel: Volume +/- 5%
 - `ESC` / `Q`: Quit
+
+### Spout2 output (OBS)
+
+Right-click → **Spout Output** (or `-spout`, saved as `spout_enabled`) publishes the video as a Spout2 sender named `capview` (`-spout-name` to change it). In OBS add a **Spout2 Capture** source ([obs-spout2-plugin](https://github.com/Off-World-Live/obs-spout2-plugin)) and pick `capview`. Off by default; turning it off unregisters the sender and the OBS source goes blank.
+
+The sender is pure Go (no Spout DLL): a separate thread with its own D3D11 device converts NV12/YUY2 to a BGRA legacy shared texture, fed by a drop-oldest copy of each captured frame, so the viewer never waits for it. `go run ./tools/spoutcheck` lists senders, measures the sender frame rate and saves a received frame as PNG without OBS.
 
 ## Roadmap
 
