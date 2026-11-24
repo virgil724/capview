@@ -1,9 +1,11 @@
 # Batch 2 Feasibility Report: Windows 11 Virtual Camera (`MFCreateVirtualCamera`) Spike
 
 - **Target OS / Build tested**: Windows 11 Pro `26H2` (`10.0.26300.9974`, `mfsensorgroup.dll` `10.0.26100.9818`)
-- **CPU / GPU**: AMD Ryzen 7 9800X3D 8-Core / AMD Radeon RX 9070 XT (`capview list` also detects `Live Gamer Ultra-Video`)
+- **CPU / GPU / Capture Card**: AMD Ryzen 7 9800X3D 8-Core / AMD Radeon RX 9070 XT / AVerMedia `Live Gamer Ultra-Video` (`VID_07CA&PID_0553`, confirmed live `1920x1080 @ 60fps` in `NV12` & `YUY2`)
+- **Installed Target Apps**: OBS Studio `31.1.0`, Google Chrome `157.0.8103.80`, Windows Camera App (`Microsoft.WindowsCamera` `2026.2608.1.0`)
 - **Go toolchain**: `go1.25.3 windows/amd64`, main binary remains pure Go (`CGO_ENABLED=0`), Vulkan code untouched
 - **C++ COM Media Source DLL toolchain**: Visual Studio Community 2026 (`18.2.0`), MSVC `14.50.35717` (`Hostx64\x64` & `Hostx64\x86`), Windows SDK `10.0.26100.0` (`mfvirtualcamera.h`), LLVM `clang++ 22.1.8`
+- **Architecture scope (Architect a\\)**: Any bundled Virtual Camera COM DLL only needs `windows/amd64` (no `windows/arm64` C++ DLL required), while `windows/arm64` `CGO_ENABLED=0` Go CI compilation stays green (`vcam_windows.go` builds cleanly on `windows/arm64`).
 - **Spike status**: Prototype implemented, built (`x64` COM DLL `159,232` bytes + `CGO_ENABLED=0` binaries for all 4 CI targets), and verified end-to-end via in-process Media Foundation `IMFSourceReader` loopback (`1080p60` & `720p30`). Machine-wide `HKLM` COM registration and live third-party app / FrameServer verification require an elevated Administrator prompt (`IsAdmin: False` in current worker session) and are ready for turnkey execution by `入門工程師-google` using the exact instructions below.
 
 ---
@@ -41,10 +43,10 @@ Then run `.\virtualcam\build\x64\vcam_loopback_test.exe --frameserver --frames 1
 | Consumer App | Visible as `capview Virtual Camera`? | Negotiated Mode & Actual FPS | Observed Visual / Latency Notes | Screenshot |
 |---|---|---|---|---|
 | `vcam_loopback_test.exe --frameserver` | `[PENDING: Admin HKLM run]` | `[PENDING]` | `[PENDING]` | N/A |
-| Windows Camera App (`UWP` / MF-only) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| Windows Camera App (`Microsoft.WindowsCamera` `2026.2608.1.0`, UWP/MF-only) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
 | OBS Studio `31.1.0` (Video Capture Device) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
-| Google Chrome (`getUserMedia` test page) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
-| Google Meet (Chrome) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| Google Chrome `157.0.8103.80` (`getUserMedia` test page) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| Google Meet (Chrome `157.0.8103.80`) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
 
 ---
 
@@ -142,38 +144,36 @@ Exact command for `入門工程師-google` after HKLM registration (run with act
 
 ## 6. Alternatives Comparison
 
-### 6.1 OBS Virtual Camera (`OBS 31.1.0`) Local Inspection
-- Installed locally at `C:\Program Files\obs-studio\bin\64bit\obs64.exe` (`31.1.0`).
-- **Mechanism**: Registered strictly as legacy **DirectShow filters** (`AVVCamFilter` in `obs-virtualcam-module64.dll` and `obs-virtualcam-module32.dll`) under `HKLM\SOFTWARE\Classes\CLSID\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}` (+ `WOW6432Node`) and DirectShow Video Capture Category `{860BB310-5D01-11d0-BD3B-00A0C911CE86}`.
-- **Empirical confirmation**: `capview list` (calling `MFEnumDeviceSources`) lists `Live Gamer Ultra-Video` and `Pixel 10 Pro (Windows 虛擬攝影機)`, and does **NOT** enumerate `OBS Virtual Camera`, confirming OBS Virtual Camera is absent from Media Foundation / UWP capture pipelines (e.g. Windows Camera App).
-- **Shared memory**: Uses named mapping `OBSVirtualCamVideo` (`video_queue` triple-buffered NV12 header `write_idx`, `read_idx`, `state`, `offsets[3]`, `cx`, `cy`, `interval`). Writing directly to `OBSVirtualCamVideo` is technically possible only if OBS's `obs-virtualcam-module64/32.dll` is installed & HKLM-registered, **and** fails if OBS itself runs concurrently (single-writer conflict on `OBSVirtualCamVideo`) or is upgraded/uninstalled, **and** still cannot serve UWP/MF-only apps.
-- **Admin requirement**: `C:\Program Files\obs-studio\data\obs-plugins\win-dshow\virtualcam-install.bat` explicitly checks `net session` and exits with `"Administrative rights are required"` if non-admin, then runs `regsvr32` in `HKLM`.
+### 6.1 OBS Virtual Camera (`OBS 31.1.0`) Local Inspection (Control Group B)
+- **Install & registration**: Installed at `C:\Program Files\obs-studio\bin\64bit\obs64.exe` (`31.1.0`), registered in **`HKLM` only** (`HKCU` empty) under CLSID `{A3FCE0F5-3493-419F-958A-ABA1250EC20B}` (`OBS Virtual Camera`): 64-bit `obs-virtualcam-module64.dll` (`ThreadingModel=Both`), 32-bit `obs-virtualcam-module32.dll`, and DirectShow Video Input Category `{860BB310-5D01-11d0-BD3B-00A0C911CE86}`.
+- **Mechanism & Media Foundation visibility**: Pure **DirectShow COM Source Filter** (no `MFCreateVirtualCamera` usage anywhere in `C:\Program Files\obs-studio`). Confirmed via `capview list` (`MFEnumDeviceSources`): `OBS Virtual Camera` does **not** appear in Media Foundation enumeration. Consequently, DirectShow-only virtual cameras are **invisible to UWP / Packaged apps such as Windows Camera App (`Microsoft.WindowsCamera` `2026.2608.1.0`) unless bridged**, whereas Win11 `MFCreateVirtualCamera` **is** natively visible to UWP/MF-only apps.
+- **Shared memory & formats**: Uses a session-local UTF-16LE file mapping **`OBSVirtualCamVideo`** (**no `Global\` prefix**) paired with `%APPDATA%\obs-virtualcam.txt` (observed locally as `1280x720x166666`, i.e., `WxHxinterval_100ns`; renders `placeholder.png` when inactive). Pin `"Video Output"` exposes `nv12`, `yuv420p`, and `yuyv422`.
+- **Privilege & runtime model**: Initial registration (`C:\Program Files\obs-studio\data\obs-plugins\win-dshow\virtualcam-install.bat` -> `regsvr32 /i /s`) **requires Administrator** (`net session` check) and writes to `HKLM`, which is already completed when a user installs OBS. Once registered, **writing to `OBSVirtualCamVideo` does NOT require Admin**, and **the OBS main app (`obs64.exe`) does NOT need to be running** for DirectShow consumers to open `OBS Virtual Camera` and read frames fed into `OBSVirtualCamVideo`. However, this approach depends on OBS Studio already being installed, breaks if OBS is absent/updated, and collides with OBS if the user enables OBS's own Virtual Camera.
 
 ### 6.2 Local Build Toolchain Inventory
-- **Installed**: VS Community 2026 (`18.2.0`), MSVC `14.50.35717` (`x64` & `x86` `cl.exe`), Windows SDK `10.0.26100.0` (`mfvirtualcamera.h` + `mfsensorgroup.lib` for `x64`, `x86`, **`arm64`**), CMake, LLVM `clang++ 22.1.8`, Go `1.25.3`.
-- **Missing locally**: MSVC `arm64` C++ compiler (`Hostx64\arm64\cl.exe`) is not installed (note Windows SDK `arm64` `.lib`s *are* present, and `clang++ --target=aarch64-pc-windows-msvc` or VS ARM64 build tools would be needed to compile `capview_vcam.dll` for `windows/arm64`).
+- **Installed**: VS Community 2026 (`18.2.0`), MSVC `14.50.35717` (`x64` & `x86` `cl.exe`), Windows SDK `10.0.26100.0` (`mfvirtualcamera.h` + `mfsensorgroup.lib` for `x64`, `x86`, `arm64`), CMake, LLVM `clang++ 22.1.8`, Go `1.25.3`.
+- **ARM64 scope (Architect a\\)**: MSVC `arm64` `cl.exe` is not installed locally, and per Architect a\\'s decision **any bundled Virtual Camera COM DLL only needs `windows/amd64`** (no ARM64 COM DLL required). Cross-compiling the `windows/arm64` `CGO_ENABLED=0` Go binary continues to pass cleanly.
 
 ### 6.3 Comprehensive Comparison Table
 
 | Dimension | **(a) `MFCreateVirtualCamera` + Bundled COM DLL** | **(b) Direct Write to OBS VirtualCam SHM (`OBSVirtualCamVideo`)** | **(c) Spout / NDI -> OBS -> OBS Virtual Camera** | **(d) Custom DirectShow Filter (`IBaseFilter`)** |
 |---|---|---|---|---|
 | **OS Support** | **Windows 11 22000+ only** (`mfsensorgroup.dll`) | Windows 10 & 11 (requires OBS 30/31+ installed) | Windows 10 & 11 (requires running OBS Studio) | Windows 10 & 11 |
-| **App Compatibility** | **Universal**: UWP/MF-only (Win Camera App), Chrome/Meet, Zoom, Teams, OBS | Desktop DirectShow apps (Chrome, OBS, Zoom); **invisible to MF-only / UWP** (verified via `capview list`) | Same as OBS VirtualCam (DirectShow-only) | DirectShow apps only; **invisible to MF-only / UWP**; legacy 32+64 bit |
-| **`windows/amd64` vs `arm64`** | `amd64` built & tested; `arm64` needs ARM64 C++ DLL (ARM64 SDK libs present; MSVC ARM64 toolchain not installed locally) | Depends on OBS ARM64 availability (OBS x64/x86 DLLs only on this PC) | Depends on OBS + Spout/NDI plugins | Needs **both** `x64` + `x86` (and `arm64` if native) COM DLLs |
-| **Install Privileges** | **Admin once** (`HKLM` COM registration + `ProgramData` ACL); non-admin runtime | **Admin once** (OBS `virtualcam-install.bat` runs `regsvr32` in `HKLM` with `net session` check) | **Admin once** (OBS virtualcam) + plugin installs | **Admin once** (`HKLM` COM + DirectShow filter category) |
-| **Extra Files** | 1 small DLL (`capview_vcam.dll`, **159 KB**) + `register.ps1` | External dependency on OBS Studio install (or redistributing OBS DLLs) | Full OBS Studio + `obs-spout2`/`obs-ndi` + Spout/NDI runtime | 2 DLLs (64-bit + 32-bit filter DLLs) |
-| **Added Latency** | **Low**: ~0.04 ms tap + ~0.04 ms SHM + FrameServer copy (16.67 ms cadence) | Low (~1 frame SHM + DirectShow copy), no FrameServer | **High**: extra GPU readback/IPC -> OBS compositor -> VirtualCam | Low-Medium (~1 frame) |
-| **Maintenance Risk** | Medium-Low (uses official Win11 API; FrameServer IPC & COM DLL owned by `capview`) | **High**: relies on undocumented internal OBS SHM layout (`queue_header`), breaks on OBS updates, collides if OBS VirtualCam is used | **High**: heavy multi-process dependency, poor UX, user must run & configure OBS | **High**: DirectShow deprecated, 32-bit/64-bit dual registration, misses UWP/Win11 Camera |
-| **Build Toolchain** | MSVC (`14.50`) or `clang++` + Win11 SDK `10.0.22000+` (`10.0.26100.0` installed locally) | Pure Go if writing SHM directly (no C++ DLL if piggybacking on installed OBS) | Spout2/NDI SDK + OBS plugin setup | Windows SDK DirectShow / ATL/COM C++ (`x86` + `x64`) |
+| **App Compatibility** | **Universal**: UWP/MF-only (`Microsoft.WindowsCamera`), Chrome/Meet, Zoom, Teams, OBS | Desktop DirectShow apps (Chrome, OBS, Zoom); **invisible to UWP/Packaged apps (Windows Camera App)** | Same as OBS VirtualCam (DirectShow-only) | DirectShow apps only; **invisible to UWP/MF-only apps**; 32+64 bit |
+| **`windows/amd64` vs `arm64`** | `amd64` built & tested; **only `windows/amd64` DLL needed** (`windows/arm64` Go CI stays green) | `amd64`/`x86` via installed OBS DLLs (`arm64` N/A) | Depends on OBS + Spout/NDI plugins (`amd64`) | Needs `x64` + `x86` COM DLLs (`arm64` out of scope) |
+| **Install Privileges** | **Admin once** (`HKLM` COM registration + `ProgramData` ACL); non-admin runtime | **Admin once** (OBS installer already registered `HKLM`); **non-admin SHM write**, no running OBS needed | **Admin once** (OBS virtualcam) + plugin installs | **Admin once** (`HKLM` COM + DirectShow filter category) |
+| **Extra Files** | 1 small `x64` DLL (`capview_vcam.dll`, **159 KB**) + `register.ps1` | External dependency on installed OBS (`obs-virtualcam-module64/32.dll`) | Full OBS Studio + `obs-spout2`/`obs-ndi` + runtime | 2 DLLs (64-bit + 32-bit filter DLLs) |
+| **Added Latency** | **Low**: ~0.04 ms tap + ~0.04 ms SHM + FrameServer copy (16.67 ms cadence) | Low (~1 frame SHM + DirectShow copy, no FrameServer) | **High**: extra GPU readback/IPC -> OBS compositor -> VirtualCam | Low-Medium (~1 frame) |
+| **Maintenance Risk** | Medium-Low (official Win11 API; FrameServer IPC & COM DLL owned by `capview`) | **High**: undocumented internal OBS SHM + `%APPDATA%\obs-virtualcam.txt`; requires OBS installed; single-writer collision with OBS; misses UWP | **High**: heavy multi-process dependency, poor UX, user must run & configure OBS | **High**: DirectShow deprecated, dual 32/64-bit registration, misses UWP/Win11 Camera |
+| **Build Toolchain** | MSVC `14.50` `x64` (or `clang++`) + Win11 SDK `10.0.22000+` (`10.0.26100.0` installed locally) | Pure Go (`CGO_ENABLED=0`) writer if reusing installed OBS DLL | Spout2/NDI SDK + OBS plugin setup | Windows SDK DirectShow / ATL/COM C++ (`x86` + `x64`) |
 | **Impact on Main Binary `cgo`** | **Zero** (`CGO_ENABLED=0` preserved; COM DLL built separately) | Zero (`CGO_ENABLED=0`) | Zero or external NDI/Spout DLL load | **Zero** if separate COM DLL |
 
 ---
 
 ## 7. Conclusions & Recommendations
 
-1. **Recommendation**: **Proceed with Option (a) (`MFCreateVirtualCamera` + standalone C++ COM Media Source DLL `capview_vcam.dll`)** as the Windows 11 Virtual Camera architecture.
-   - It preserves `CGO_ENABLED=0` on the main Go binary, keeps the display render path untouched and non-blocking (`0.042 ms` NV12 tap, `0.040 ms` SHM write, immediate `IMFSample` release), achieves locked `60.44 fps` (`1080p60`) / `30.48 fps` (`720p30`) through Media Foundation `IMFSourceReader`, and avoids DirectShow's UWP/MF invisibility and OBS's external-dependency/single-writer collision risks.
+1. **Recommendation**: **Proceed with Option (a) (`MFCreateVirtualCamera` + standalone `x64` C++ COM Media Source DLL `capview_vcam.dll`)** as the Windows 11 Virtual Camera architecture (with Option (b) noted as a fallback only for Win10 users who already have OBS installed and do not need UWP/Windows Camera App visibility).
+   - Option (a) preserves `CGO_ENABLED=0` on the main Go binary, limits native DLL scope cleanly to `windows/amd64` (while keeping `windows/arm64` Go CI green), keeps the display render path untouched and non-blocking (`0.042 ms` NV12 tap, `0.040 ms` SHM write, immediate `IMFSample` release), achieves locked `60.44 fps` (`1080p60`) / `30.48 fps` (`720p30`) through Media Foundation `IMFSourceReader`, and supports UWP/Windows Camera App alongside Chrome/Meet/OBS without requiring OBS to be installed.
 2. **Next Steps before Shipping / Finalizing PR**:
    - Have `入門工程師-google` run elevated `.\virtualcam\register.ps1 -Scope Machine`, execute `vcam_loopback_test.exe --frameserver`, `.\tools\spike\test-vcam-lifecycle.ps1`, `.\tools\spike\bench-vcam.ps1 -Source mf -Seconds 60` on `Live Gamer Ultra-Video`, and fill in the live OBS / Chrome / Meet / Windows Camera App screenshots in Section 1.3, Section 3, and Section 4.3.
-   - For `windows/arm64`: install VS ARM64 C++ build tools (or compile `capview_vcam.dll` via `clang++ --target=aarch64-pc-windows-msvc` against existing SDK `10.0.26100.0\Lib\...\um\arm64`) if native ARM64 virtual camera support is required alongside the `windows/arm64` Go binary.
    - Sign `capview.exe` and `capview_vcam.dll` with Authenticode for release builds, and bundle `HKLM` COM registration + `C:\ProgramData\capview` ACL setup into an installer / elevated setup action (with clear UX guidance when unprivileged users toggle Virtual Camera before registering).
