@@ -35,15 +35,55 @@ func TestTrackerRollingPercentiles(t *testing.T) {
 	if math.Abs(s.ArriveToPresP50-2.5) > 1e-6 {
 		t.Errorf("ArriveToPresP50 = %.2f, want 2.5", s.ArriveToPresP50)
 	}
+	if math.Abs(s.ArriveToPresMax-5.0) > 1e-6 {
+		t.Errorf("ArriveToPresMax = %.2f, want 5.0", s.ArriveToPresMax)
+	}
 	if math.Abs(s.ArriveToVblP50-10.0) > 1e-6 {
 		t.Errorf("ArriveToVblP50 = %.2f, want 10.0", s.ArriveToVblP50)
+	}
+	if math.Abs(s.ArriveToVblMax-20.0) > 1e-6 {
+		t.Errorf("ArriveToVblMax = %.2f, want 20.0", s.ArriveToVblMax)
 	}
 	if math.Abs(s.PresentCallMax-1.0) > 1e-6 {
 		t.Errorf("PresentCallMax = %.2f, want 1.0", s.PresentCallMax)
 	}
 	line := s.FormatLine("NV12 1920x1080@60", true)
-	if !strings.Contains(line, "VRR/LowLat") || !strings.Contains(line, "arr->vbl") || !strings.Contains(line, "pres_call") {
+	if !strings.Contains(line, "VRR/LowLat") || !strings.Contains(line, "arr->vbl") || !strings.Contains(line, "pres_call") ||
+		!strings.Contains(line, "arr->pres p50 2.50ms p99 4.50ms max 5.00ms") ||
+		!strings.Contains(line, "arr->vbl p50 10.00ms p99 18.00ms max 20.00ms") {
 		t.Errorf("unexpected FormatLine: %s", line)
+	}
+}
+
+func TestTrackerSessionSummary(t *testing.T) {
+	const freq = 10_000_000
+	tr := New(2, freq) // rolling window smaller than total samples
+	tr.EnableSessionStats()
+	for i := 1; i <= 5; i++ {
+		tr.Add(Sample{
+			DevToArriveMS:     float64(i),
+			ArriveToPresentMS: float64(i) * 0.5,
+			ArriveToVBlankMS:  float64(i) * 3.0,
+			HasVBlank:         true,
+		}, int64(i)*(freq/60))
+	}
+	rolling := tr.Summary()
+	if rolling.Frames != 5 {
+		t.Fatalf("rolling.Frames = %d, want 5", rolling.Frames)
+	}
+	sess := tr.SessionSummary()
+	if sess.Frames != 5 {
+		t.Fatalf("sess.Frames = %d, want 5", sess.Frames)
+	}
+	// Session includes sample 1..5 even though rolling window is 2.
+	if math.Abs(sess.ArriveToPresP50-1.5) > 1e-6 || math.Abs(sess.ArriveToPresMax-2.5) > 1e-6 {
+		t.Errorf("unexpected session arr->pres: p50=%.2f max=%.2f", sess.ArriveToPresP50, sess.ArriveToPresMax)
+	}
+	if math.Abs(sess.ArriveToVblP50-9.0) > 1e-6 || math.Abs(sess.ArriveToVblMax-15.0) > 1e-6 {
+		t.Errorf("unexpected session arr->vbl: p50=%.2f max=%.2f", sess.ArriveToVblP50, sess.ArriveToVblMax)
+	}
+	if sess.FPS <= 0 {
+		t.Errorf("expected positive session FPS, got %.2f", sess.FPS)
 	}
 }
 

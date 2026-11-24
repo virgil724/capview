@@ -2,3 +2,11 @@
 *.exe~
 *.test
 *.out
+dist/
+vcam/dll/build/
+*.dll
+*.res
+*.obj
+*.lib
+*.exp
+*.pdb

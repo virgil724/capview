@@ -62,11 +62,17 @@ type Mailbox struct {
 	taken   Frame // frame handed to the consumer by the last Take
 	dropped atomic.Uint64
 	notify  chan struct{}
+	tap     atomic.Pointer[Tap]
 }
 
 // NewMailbox creates a latest-frame mailbox.
 func NewMailbox() *Mailbox {
 	return &Mailbox{notify: make(chan struct{}, 1)}
+}
+
+// SetTap attaches (or clears with nil) a secondary non-blocking frame tap.
+func (m *Mailbox) SetTap(t *Tap) {
+	m.tap.Store(t)
 }
 
 // Notify returns a channel signalled whenever a new frame is published.
@@ -100,6 +106,30 @@ func (m *Mailbox) Discard() {
 }
 
 func (m *Mailbox) publish(f Frame) {
+	tap := m.tap.Load()
+	tapEnabled := tap != nil && tap.Enabled()
+
+	var tapView Frame
+	var releaseForTap func()
+	if tapEnabled {
+		// Copy slice descriptors before handing f to the display path, which
+		// clears its own slice fields on Frame.Release().
+		tapView = f
+		tapView.release = nil
+		if f.release != nil {
+			origRelease := f.release
+			var refs atomic.Int32
+			refs.Store(2)
+			sharedRelease := func() {
+				if refs.Add(-1) == 0 {
+					origRelease()
+				}
+			}
+			f.release = sharedRelease
+			releaseForTap = sharedRelease
+		}
+	}
+
 	m.mu.Lock()
 	if m.hasNew {
 		m.dropped.Add(1)
@@ -111,6 +141,13 @@ func (m *Mailbox) publish(f Frame) {
 	select {
 	case m.notify <- struct{}{}:
 	default:
+	}
+
+	if tapEnabled {
+		tap.WriteFrame(tapView)
+	}
+	if releaseForTap != nil {
+		releaseForTap()
 	}
 }
 

@@ -1,7 +1,9 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -13,7 +15,7 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load missing: %v", err)
 	}
-	if cfg.Width != 1920 || cfg.Height != 1080 || cfg.Device != "auto" {
+	if cfg.Width != 1920 || cfg.Height != 1080 || cfg.Device != "auto" || cfg.VcamEnabled {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 
@@ -23,10 +25,19 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	cfg.Volume = 0.65
 	cfg.Muted = true
 	cfg.VSync = true
+	cfg.VcamEnabled = true
 	cfg.WinW = 1440
 	cfg.WinH = 810
 	if err := Save(p, cfg); err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"vcam_enabled": true`) {
+		t.Fatalf("expected snake_case vcam_enabled in JSON, got:\n%s", string(raw))
 	}
 
 	got, err := Load(p)

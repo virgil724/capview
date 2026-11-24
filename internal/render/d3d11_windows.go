@@ -326,6 +326,9 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		black    = [4]float32{0, 0, 0, 1}
 		tracker  = stats.New(120, cfg.Freq)
 	)
+	if cfg.Duration > 0 {
+		tracker.EnableSessionStats()
+	}
 
 	statsTicker := time.NewTicker(time.Second)
 	defer statsTicker.Stop()
@@ -530,6 +533,10 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 
 	if !borderless {
 		savedWinRect = win.GetWindowRect(hwnd)
+	}
+	if cfg.Duration > 0 && cfg.PrintStats {
+		tearingActive := !useVSync && supportsTear
+		fmt.Println("session | " + tracker.SessionSummary().FormatLine(getModeLabel(), tearingActive))
 	}
 	return FinalState{
 		Fullscreen: borderless,

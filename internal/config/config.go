@@ -22,6 +22,7 @@ type Config struct {
 	VSync         bool    `json:"vsync"`
 	Fullscreen    bool    `json:"fullscreen"`
 	Display       string  `json:"display"`
+	VcamEnabled   bool    `json:"vcam_enabled"`
 	WinX          int32   `json:"win_x,omitempty"`
 	WinY          int32   `json:"win_y,omitempty"`
 	WinW          int32   `json:"win_w,omitempty"`
