@@ -2,7 +2,9 @@ package capture
 
 import (
 	"bytes"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func nv12Frame(t *testing.T, id byte, pitch int, release func()) Frame {
@@ -105,6 +107,27 @@ func TestRawTapDisabledIgnoresFrames(t *testing.T) {
 	}
 }
 
+// takeWithin waits for tap to stage a frame from the fan-out goroutine.
+func takeWithin(t *testing.T, tap *RawTap) *TapFrame {
+	t.Helper()
+	select {
+	case <-tap.Notify():
+	case <-time.After(time.Second):
+		t.Fatal("sink never received a frame")
+	}
+	return tap.Take()
+}
+
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(time.Second); !cond(); {
+		if time.Now().After(deadline) {
+			t.Fatal(what)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestMailboxFanOutIndependentSinks(t *testing.T) {
 	mb := NewMailbox()
 	a, b := NewRawTap(), NewRawTap()
@@ -114,51 +137,58 @@ func TestMailboxFanOutIndependentSinks(t *testing.T) {
 	mb.AddSink(b)
 	mb.AddSink(a) // duplicate add is a no-op
 
-	released := map[byte]int{}
-	pub := func(id byte) { mb.publish(nv12Frame(t, id, 4, func() { released[id]++ })) }
+	var released [8]atomic.Int32
+	pub := func(id byte) { mb.publish(nv12Frame(t, id, 4, func() { released[id].Add(1) })) }
 
+	// Sinks copy only after the display path is done (or after fanOutWait):
+	// release the displayed frame right away and both sinks get it.
 	pub(1)
-	// The display path still owns frame 1, so it is not released yet.
-	if released[1] != 0 {
-		t.Fatalf("frame released while display holds it")
-	}
-	// Sink a consumes, sink b does not: they drop independently.
-	if f := a.Take(); f == nil || f.Data[0] != 1 {
+	mb.Take().Release()
+	if f := takeWithin(t, a); f == nil || f.Data[0] != 1 {
 		t.Fatalf("sink a: %+v", f)
 	}
 	a.Release()
-	pub(2) // display drops frame 1 -> released exactly once
-	if released[1] != 1 {
-		t.Fatalf("released[1] = %d, want 1", released[1])
+	if f := takeWithin(t, b); f == nil || f.Data[0] != 1 {
+		t.Fatalf("sink b: %+v", f)
 	}
-	if a.Dropped() != 0 || b.Dropped() != 1 {
-		t.Fatalf("drops a=%d b=%d, want 0 and 1", a.Dropped(), b.Dropped())
+	b.Release()
+	eventually(t, "frame 1 must be released exactly once after display and sinks", func() bool { return released[1].Load() == 1 })
+
+	// A frame the display never takes still reaches the sinks after
+	// fanOutWait, and the buffer stays alive until the display drops it.
+	pub(2)
+	if f := takeWithin(t, a); f == nil || f.Data[0] != 2 {
+		t.Fatalf("sink a frame 2: %+v", f)
 	}
-	if f := b.Take(); f == nil || f.Data[0] != 2 {
+	a.Release()
+	if released[2].Load() != 0 {
+		t.Fatal("frame released while the display path still holds it")
+	}
+	// Sink b never consumed frame 2: publishing 3 makes b drop it, a not.
+	pub(3)
+	eventually(t, "frame 2 released once the display overwrote it", func() bool { return released[2].Load() == 1 })
+	mb.Take().Release()
+	if f := takeWithin(t, a); f == nil || f.Data[0] != 3 {
+		t.Fatalf("sink a frame 3: %+v", f)
+	}
+	a.Release()
+	eventually(t, "sink b drops the frame it did not take", func() bool { return b.Dropped() == 1 })
+	if a.Dropped() != 0 {
+		t.Fatalf("sink a dropped %d", a.Dropped())
+	}
+	if f := b.Take(); f == nil || f.Data[0] != 3 {
 		t.Fatalf("sink b newest: %+v", f)
 	}
 	b.Release()
 
-	// Display consumes frame 2 and releases: sample freed (sinks already copied).
-	f := mb.Take()
-	f.Release()
-	if released[2] != 1 {
-		t.Fatalf("released[2] = %d, want 1", released[2])
-	}
-
-	// Removing a sink stops its feed; a disabled sink is skipped.
-	if f := a.Take(); f == nil || f.Data[0] != 2 {
-		t.Fatalf("sink a newest: %+v", f)
-	}
-	a.Release()
+	// Removed or disabled sinks get nothing, and the frame is still released.
 	mb.RemoveSink(a)
 	b.SetEnabled(false)
-	pub(3)
+	pub(4)
+	mb.Take().Release()
+	eventually(t, "frame 4 released", func() bool { return released[4].Load() == 1 })
+	time.Sleep(3 * fanOutWait)
 	if a.Take() != nil || b.Take() != nil {
 		t.Fatal("removed/disabled sinks must not receive frames")
-	}
-	mb.Take().Release()
-	if released[3] != 1 {
-		t.Fatalf("released[3] = %d, want 1", released[3])
 	}
 }

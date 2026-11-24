@@ -4,16 +4,95 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // Sink is a secondary consumer fed from Mailbox.publish (Spout output,
 // virtual camera, ...). Each sink is independent: WriteFrame runs on the
-// capture thread right after the frame was handed to the display path, must
-// copy what it needs into its own buffers and return without blocking. The
-// frame's planes are only valid during the call.
+// mailbox's fan-out goroutine, must copy what it needs into its own buffers
+// and return without blocking. The frame's planes are only valid during the
+// call.
 type Sink interface {
 	Enabled() bool
 	WriteFrame(f Frame)
+}
+
+// fanOutWait bounds how long the fan-out goroutine waits for the display
+// path to finish with a frame before copying it anyway.
+const fanOutWait = 2 * time.Millisecond
+
+// fanJob is one published frame waiting to be copied by the sinks.
+type fanJob struct {
+	view    Frame         // planes only; release is nil
+	sinks   []Sink        // enabled sinks at publish time
+	shown   chan struct{} // closed when the display path releases the frame
+	release func()        // drops the fan-out's reference to the buffer
+}
+
+// fanWorker copies frames to the sinks off the capture thread, after the
+// display path is done with them: a concurrent 3 MB copy measurably slows
+// the viewer's own upload (memory bandwidth), so sinks go second.
+type fanWorker struct {
+	start   sync.Once
+	jobs    chan *fanJob // capacity 1, drop-oldest
+	dropped atomic.Uint64
+}
+
+// prepareFanOut splits f's buffer reference between the display path and
+// the fan-out: the capture buffer is released when both are done.
+func prepareFanOut(f *Frame, sinks []Sink) *fanJob {
+	job := &fanJob{view: *f, sinks: sinks, shown: make(chan struct{})}
+	job.view.release = nil
+	orig := f.release
+	var refs atomic.Int32
+	refs.Store(2)
+	job.release = func() {
+		if refs.Add(-1) == 0 && orig != nil {
+			orig()
+		}
+	}
+	f.release = func() {
+		close(job.shown)
+		job.release()
+	}
+	return job
+}
+
+// submit queues job without blocking, replacing (and releasing) a job the
+// worker has not started yet.
+func (w *fanWorker) submit(job *fanJob) {
+	w.start.Do(func() {
+		w.jobs = make(chan *fanJob, 1)
+		go w.run()
+	})
+	for {
+		select {
+		case w.jobs <- job:
+			return
+		default:
+		}
+		select {
+		case old := <-w.jobs:
+			old.release()
+			w.dropped.Add(1)
+		default:
+		}
+	}
+}
+
+func (w *fanWorker) run() {
+	wait := time.NewTimer(fanOutWait)
+	for job := range w.jobs {
+		wait.Reset(fanOutWait)
+		select {
+		case <-job.shown:
+		case <-wait.C:
+		}
+		for _, s := range job.sinks {
+			s.WriteFrame(job.view)
+		}
+		job.release()
+	}
 }
 
 // sinkSet is the copy-on-write list of sinks attached to a Mailbox.
@@ -37,8 +116,8 @@ func (m *Mailbox) AddSink(s Sink) {
 	m.sinks.list.Store(&next)
 }
 
-// RemoveSink detaches s. A WriteFrame already running on the capture thread
-// may still complete after RemoveSink returns.
+// RemoveSink detaches s. A WriteFrame already queued on the fan-out
+// goroutine may still run after RemoveSink returns.
 func (m *Mailbox) RemoveSink(s Sink) {
 	m.sinks.mu.Lock()
 	defer m.sinks.mu.Unlock()
@@ -96,8 +175,9 @@ func (t *TapFrame) Plane1() ([]byte, int) {
 }
 
 // RawTap is a Sink that memcpys each frame into one of three pre-allocated
-// staging slots (drop-oldest), so the capture buffer is released at once and
-// a slow consumer never holds an IMFSample or stalls capture/display.
+// staging slots (drop-oldest), so the capture buffer is released right after
+// the copy and a slow consumer never holds an IMFSample or stalls
+// capture/display.
 type RawTap struct {
 	mu      sync.Mutex
 	slots   [3]TapFrame
