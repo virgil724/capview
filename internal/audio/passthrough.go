@@ -1,8 +1,10 @@
 package audio
 
 import (
+	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -27,14 +29,17 @@ type Passthrough struct {
 	InputRate  int
 	OutputRate int
 
-	ring    *Ring
-	tap     atomic.Pointer[mirrorTap] // non-nil while a mirror is running
-	mirMu   sync.Mutex                // serializes SetMirror
-	mir     *mirrorState
-	volBits atomic.Uint32 // float32 bits [0..1]
-	muted   atomic.Bool
-	stop    atomic.Bool
-	done    chan struct{}
+	ring  *Ring
+	tap   atomic.Pointer[mirrorTap] // non-nil while a mirror is running
+	mirMu sync.Mutex                // serializes SetMirror; guards mir and mirClosed
+	mir   *mirrorState
+	// mirClosed is set (under mirMu) when the main passthrough loop exits;
+	// after that no new mirror may be started.
+	mirClosed bool
+	volBits   atomic.Uint32 // float32 bits [0..1]
+	muted     atomic.Bool
+	stop      atomic.Bool
+	done      chan struct{}
 }
 
 func (p *Passthrough) Done() <-chan struct{} { return p.done }
@@ -80,6 +85,70 @@ type mirrorState struct {
 	tap      *mirrorTap
 	stop     atomic.Bool
 	done     chan struct{}
+}
+
+// ErrMirrorIsMainOutput is returned when the mirror endpoint is the same
+// device as the main output.
+var ErrMirrorIsMainOutput = errors.New("mirror endpoint is the main output device")
+
+// ErrPassthroughStopped is returned by SetMirror once the main passthrough
+// has exited (e.g. after a device error).
+var ErrPassthroughStopped = errors.New("audio passthrough has stopped")
+
+// setMirror holds the platform-independent mirror bookkeeping. start opens
+// and starts the mirror output for id; it runs under mirMu, so it can never
+// race with closeMirror.
+func (p *Passthrough) setMirror(id string, start func(id string) (*mirrorState, error)) error {
+	p.mirMu.Lock()
+	defer p.mirMu.Unlock()
+	if id != "" && p.mirClosed {
+		return ErrPassthroughStopped
+	}
+	if id != "" && p.OutputID != "" && strings.EqualFold(id, p.OutputID) {
+		return ErrMirrorIsMainOutput // leave any running mirror untouched
+	}
+	if cur := p.mir; cur != nil {
+		running := true
+		select {
+		case <-cur.done:
+			running = false
+		default:
+		}
+		if running && id != "" && strings.EqualFold(cur.id, id) {
+			return nil
+		}
+		p.stopMirrorLocked()
+	}
+	if id == "" {
+		return nil
+	}
+	st, err := start(id)
+	if err != nil {
+		return err
+	}
+	p.mir = st
+	p.tap.Store(st.tap)
+	return nil
+}
+
+// closeMirror stops any running mirror and forbids starting new ones. The
+// main passthrough loop calls it on exit, before Done() is closed.
+func (p *Passthrough) closeMirror() {
+	p.mirMu.Lock()
+	defer p.mirMu.Unlock()
+	p.mirClosed = true
+	p.stopMirrorLocked()
+}
+
+func (p *Passthrough) stopMirrorLocked() {
+	cur := p.mir
+	if cur == nil {
+		return
+	}
+	p.tap.CompareAndSwap(cur.tap, nil)
+	cur.stop.Store(true)
+	<-cur.done
+	p.mir = nil
 }
 
 // MirrorID returns the endpoint ID of the running mirror, or "" if none

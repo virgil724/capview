@@ -306,7 +306,13 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 
 	// Audio mirror: second copy of the audio to another playback device.
 	mainOutID, curMirror := "", h.cfg.AudioMirrorID
+	audRunning := false
 	if h.aud != nil {
+		select {
+		case <-h.aud.Done(): // passthrough exited (device error); mirror can't start
+		default:
+			audRunning = true
+		}
 		mainOutID, curMirror = h.aud.OutputID, h.aud.MirrorID()
 	}
 	var mirrorItems []render.MenuItem
@@ -316,7 +322,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 			ID:       addAction(func() (bool, bool, bool) { h.switchAudioMirror(id); return false, false, false }),
 			Label:    c.Label,
 			Checked:  c.Checked,
-			Disabled: c.Disabled || (id != "" && h.aud == nil),
+			Disabled: c.Disabled || (id != "" && !audRunning),
 		})
 	}
 

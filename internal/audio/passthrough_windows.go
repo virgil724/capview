@@ -96,7 +96,7 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 		return fmt.Errorf("COM: %w", err)
 	}
 	defer win.COUninit()
-	defer p.SetMirror("") //nolint:errcheck // stopping never fails
+	defer p.closeMirror()
 
 	// Pick capture endpoint.
 	inEps, err := win.AudioEndpoints(win.ECapture)
@@ -328,38 +328,17 @@ func pickEndpoint(eps []win.Endpoint, want, videoHint string) (win.Endpoint, boo
 	return out, chosen >= 0
 }
 
-// ErrMirrorIsMainOutput is returned when the mirror endpoint is the same
-// device as the main output.
-var ErrMirrorIsMainOutput = errors.New("mirror endpoint is the main output device")
-
 // SetMirror starts (or switches, or with id == "" stops) the mirror output
-// without restarting the main passthrough.
+// without restarting the main passthrough. Once the passthrough has exited
+// it returns ErrPassthroughStopped for any id != "".
 func (p *Passthrough) SetMirror(id string) error {
-	p.mirMu.Lock()
-	defer p.mirMu.Unlock()
-	if id != "" && p.OutputID != "" && strings.EqualFold(id, p.OutputID) {
-		return ErrMirrorIsMainOutput // leave any running mirror untouched
-	}
-	if cur := p.mir; cur != nil {
-		running := true
-		select {
-		case <-cur.done:
-			running = false
-		default:
-		}
-		if running && id != "" && strings.EqualFold(cur.id, id) {
-			return nil
-		}
-		p.tap.CompareAndSwap(cur.tap, nil)
-		cur.stop.Store(true)
-		<-cur.done
-		p.mir = nil
-	}
-	if id == "" {
-		return nil
-	}
+	return p.setMirror(id, p.startMirror)
+}
+
+// startMirror opens the mirror endpoint and starts its render goroutine.
+func (p *Passthrough) startMirror(id string) (*mirrorState, error) {
 	if p.InputRate <= 0 {
-		return errors.New("passthrough not running")
+		return nil, errors.New("passthrough not running")
 	}
 	capF, targetF, maxF := MirrorRingFrames(p.InputRate)
 	st := &mirrorState{
@@ -385,12 +364,10 @@ func (p *Passthrough) SetMirror(id string) error {
 	}()
 	if err := <-ready; err != nil {
 		<-st.done
-		return err
+		return nil, err
 	}
-	p.mir = st
-	p.tap.Store(st.tap)
 	fmt.Printf("audio mirror: -> %q (%d Hz stereo float32, post-fader)\n", st.name, p.InputRate)
-	return nil
+	return st, nil
 }
 
 // runMirror renders the mirror ring to its own WASAPI endpoint on a dedicated
