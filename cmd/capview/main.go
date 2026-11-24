@@ -800,7 +800,7 @@ func (h *appHost) enableVirtualCamera() {
 
 	if needsInstall {
 		if st.MismatchDetail != "" {
-			fmt.Fprintf(os.Stderr, "virtual_camera: %s; launching elevated installer\n", st.MismatchDetail)
+			fmt.Fprintf(os.Stderr, "virtual_camera: %s; triggering capview.exe UAC reinstall\n", st.MismatchDetail)
 		}
 		if !st.BundledExists {
 			win.ShowErrorBox("capview", fmt.Sprintf("Cannot enable Virtual Camera:\n%v (%s)", vcam.ErrBundledDLLMissing, st.BundledPath))
@@ -1058,7 +1058,7 @@ func runView(args []string) error {
 	if vcam.Available() {
 		vcam.CleanupOldDLLs(vcam.InstallDir)
 		if st := vcam.CheckInstallStatusForBackend("", vcamBackend); st.Mismatch && st.AnyRegistered {
-			fmt.Fprintf(os.Stderr, "warning: virtual camera registration mismatch: %s (right-click Virtual Camera -> %s or run capview -vcam-install)\n",
+			fmt.Fprintf(os.Stderr, "warning: virtual camera registration mismatch: %s — right-click the capview window -> Virtual Camera -> %s (capview.exe reinstalls automatically via UAC; no separate installer needed)\n",
 				st.MismatchDetail, st.MenuEnableLabel())
 		}
 	}
@@ -1109,9 +1109,9 @@ func runView(args []string) error {
 		} else {
 			st := vcam.CheckInstallStatusForBackend("", vcamBackend)
 			if st.NeedsInstallOrReinstall() {
-				msg := "virtual camera is not installed or needs upgrade (right-click Virtual Camera -> " + st.MenuEnableLabel() + ", or run capview -vcam-install)"
+				msg := fmt.Sprintf("virtual camera is not installed or needs upgrade — right-click the capview window -> Virtual Camera -> %s (capview.exe installs automatically via UAC; no separate installer needed)", st.MenuEnableLabel())
 				if st.MismatchDetail != "" {
-					msg = fmt.Sprintf("virtual camera needs reinstall: %s (right-click Virtual Camera -> %s, or run capview -vcam-install)", st.MismatchDetail, st.MenuEnableLabel())
+					msg = fmt.Sprintf("virtual camera registration mismatch: %s — right-click the capview window -> Virtual Camera -> %s (capview.exe reinstalls automatically via UAC; no separate installer needed)", st.MismatchDetail, st.MenuEnableLabel())
 				}
 				if setFlags["vcam"] {
 					return errors.New(msg)
