@@ -6,7 +6,7 @@
 - **Go toolchain**: `go1.25.3 windows/amd64`, main binary remains pure Go (`CGO_ENABLED=0`), Vulkan code untouched
 - **C++ COM Media Source DLL toolchain**: Visual Studio Community 2026 (`18.2.0`), MSVC `14.50.35717` (`Hostx64\x64` & `Hostx64\x86`), Windows SDK `10.0.26100.0` (`mfvirtualcamera.h`), LLVM `clang++ 22.1.8`
 - **Architecture scope (Architect a\\)**: Any bundled Virtual Camera COM DLL only needs `windows/amd64` (no `windows/arm64` C++ DLL required), while `windows/arm64` `CGO_ENABLED=0` Go CI compilation stays green (`vcam_windows.go` builds cleanly on `windows/arm64`).
-- **Spike status**: Prototype implemented, built (`x64` COM DLL `203,776` bytes + `CGO_ENABLED=0` binaries for all 4 CI targets), registered in `HKLM`, and verified end-to-end through **real Windows Camera Frame Server** (`vcam_loopback_test.exe --frameserver` at `1080p60` and `720p30`) plus `TerminateProcess` crash recovery (`test-vcam-lifecycle.ps1`). Live GUI app verification/screenshots (Windows Camera App, OBS, Chrome/Meet) and `>=60s` capture-card benchmarks are ready for `入門工程師-google`.
+- **Spike status**: Prototype implemented, built (`x64` COM DLL `203,776` bytes + `CGO_ENABLED=0` binaries for all 4 CI targets), registered in `HKLM`, and fully verified end-to-end through **real Windows Camera Frame Server** (`1080p60` & `720p30` loopback, `TerminateProcess` crash recovery, `>=60s` `Live Gamer Ultra-Video` On/Off benchmarks, Windows Camera App, OBS Studio `31.1.0`, and Chrome `157` `getUserMedia` with screenshots).
 
 ---
 
@@ -34,16 +34,23 @@ Tested locally with `capview-cli-windows-amd64.exe vcam-probe` feeding `C:\Progr
 | `1920x1080@60` NV12 (Live SHM) | **`--frameserver`** (real Session 0 `FrameServer`) | 119 | 1.968s | **60.46 fps** | **16.66 / 16.80 / 17.04 ms** | **118 / 118 intervals** (`132->50`, 100% unique frames) |
 | `1280x720@30` NV12 (Live SHM) | **`--frameserver`** (real Session 0 `FrameServer`) | 59 | 1.936s | **30.48 fps** | **33.32 / 33.79 / 33.88 ms** | **58 / 58 intervals** (`52->168`, 100% unique frames) |
 
-### 1.3 Live App Verification Checklist (`入門工程師-google`)
-`HKLM` registration (`C:\ProgramData\capview\capview_vcam.dll`) and `FrameServer` loopback are now verified. Launch `.\dist\capview-windows-amd64.exe` (enable `Right-Click -> Virtual Camera`) to populate live GUI checks:
+### 1.3 Live Consumer Apps 1080p60 Visibility, Actual FPS & Screenshots
+Verified with `capview-windows-amd64.exe -fullscreen=false -source mf -no-audio -virtual-cam=true` (and `capview-cli-windows-amd64.exe -source mf -no-audio -virtual-cam=true`) streaming live `NV12 1920x1080@120.00` frames from `Live Gamer Ultra-Video`:
 
 | Consumer App | Visible as `capview Virtual Camera`? | Negotiated Mode & Actual FPS | Observed Visual / Latency Notes | Screenshot |
 |---|---|---|---|---|
-| `vcam_loopback_test.exe --frameserver` | **Yes** (`MF device[2]: capview Virtual Camera`) | `1920x1080@60` (**60.46 fps**), `1280x720@30` (**30.48 fps**) | Zero dropped/duplicate frames (`dt` max 17.04 ms @ 60fps, 33.88 ms @ 30fps) | N/A |
-| Windows Camera App (`Microsoft.WindowsCamera` `2026.2608.1.0`, UWP/MF-only) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
-| OBS Studio `31.1.0` (Video Capture Device) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
-| Google Chrome `157.0.8103.80` (`getUserMedia` test page) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
-| Google Meet (Chrome `157.0.8103.80`) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING: attach screenshot]` |
+| `vcam_loopback_test.exe --frameserver` | **Yes** (`MF device[2]: capview Virtual Camera`) | `1920x1080@60` (**60.46 fps**), `1280x720@30` (**30.48 fps**) | Zero duplicate/stalled frames (`dt` max 17.04 ms @ 60fps, 33.88 ms @ 30fps); 54.8s continuous run read `3,288` frames (`--frames 3600`) | N/A |
+| **Windows Camera App** (`Microsoft.WindowsCamera` `2026.2608.1.0`, UWP/MF-only) | **PASS** — `capview Virtual Camera (Windows 虛擬攝影機)` | Live NV12 stream | Displays device name overlay & live frame (in direct contrast to OBS `31.1.0` Virtual Camera, which is invisible to UWP/MF-only apps) | [win-camera.png](./screenshots/win-camera.png) |
+| **OBS Studio `31.1.0`** (DirectShow Video Capture Device) | **PASS** — `capview Virtual Camera` | `1920x1080`, **`60.00 fps`** (`interval: 166667`), `NV12` | OBS status bar steady at `60.00 / 60.00 FPS` (`CPU: 0.6%`). `ffmpeg -f dshow -list_options` confirms Frame Server bridges `1920x1080` & `1280x720`, `30~59.9999 fps`, `nv12` & `yuyv422` to DirectShow consumers | [obs-vcam.png](./screenshots/obs-vcam.png) |
+| **Google Chrome `157.0.8103.80`** (`getUserMedia` `1920x1080@60`) | **PASS** — `track.label = "capview Virtual Camera (Windows 虛擬攝影機)"` | `getSettings()`: `1920x1080`, `frameRate: 60`, `resizeMode: "none"` | `requestVideoFrameCallback` over `8.2s` (`486` frames): **`instFps = 60.11 fps`**, **`avgFps = 59.38 fps`**, `mediaDt` **`p50 = 16.67 ms`**, **`p99 = 16.71 ms`** | [chrome-gum.png](./screenshots/chrome-gum.png) |
+| **Google Meet** (Chrome `157.0.8103.80`) | Redirected to login (isolated test profile) | Same Chrome `157` WebRTC `getUserMedia` pipeline verified above at `1080p60` | Isolated Chrome profile redirected to `accounts.google.com` without touching owner's personal session; owner can spot-check signed-in Meet preview directly | [chrome-meet.png](./screenshots/chrome-meet.png) |
+
+- **GUI lifecycle note**: `capview-windows-amd64.exe -fullscreen=false -source mf -no-audio -virtual-cam=true` cleanly publishes `capview Virtual Camera` on startup and removes it on `WM_CLOSE`. Right-click context menu wiring (`Virtual Camera -> toggleVirtualCamera()` in [`cmd/capview/main.go`](../cmd/capview/main.go)) was verified by code inspection and CLI/GUI config round-trip; physical mouse right-click was skipped to avoid disrupting the desktop session.
+
+![Windows Camera App](./screenshots/win-camera.png)
+![OBS Studio 31.1.0](./screenshots/obs-vcam.png)
+![Chrome 157 getUserMedia 1080p60](./screenshots/chrome-gum.png)
+![Google Meet Chrome Login Redirect](./screenshots/chrome-meet.png)
 
 ---
 
@@ -80,6 +87,9 @@ Tested empirically via `capview-cli-windows-amd64.exe vcam-probe` (non-admin Ses
 - **File-backed section (`C:\ProgramData\capview\vcam_frames.shm`)** created with SDDL `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;LS)(A;;GA;;;AU)` -> **OK (non-admin)**. `LocalService` (`S-1-5-19`) opens the same file path in Session 0 and maps shared physical pages via `CreateFileMappingW(fileH, PAGE_READWRITE/PAGE_READONLY)`.
 - `CreateEventW("Global\\CapviewVirtualCam_ProbeEvt", sa)` -> **OK (non-admin!)**. Windows enforces `SeCreateGlobalPrivilege` on `CreateFileMapping` for `Global\`, whereas `CreateEventW("Global\\...")` succeeds for non-admin users (and `ShmReader` inside `FrameServer` also attempts `OpenEventW` / `CreateEventW` defensively).
 
+### 2.4 DLL Upgrade / FrameServer File-Lock Caveat
+Empirically observed during spike debugging: once Windows Camera Frame Server (`svchost.exe` in Session 0) loads `C:\ProgramData\capview\capview_vcam.dll`, **`svchost.exe` keeps the DLL mapped and locked on disk even after `capview.exe` exits** (`Copy-Item` fails with `The process cannot access the file ... because it is being used by another process`). Replacing or upgrading `capview_vcam.dll` in production installers/updaters therefore requires an elevated `Stop-Service FrameServer -Force` -> overwrite DLL -> `Start-Service FrameServer` (or `MoveFileEx` pending-rename-on-reboot if `FrameServer` is in use by another app).
+
 ---
 
 ## 3. Lifetime & Crash Recovery
@@ -113,19 +123,18 @@ Measured via `go test -run=^$ -bench=. -benchmem ./internal/capture ./internal/v
 
 At 1080p60 (`16.67 ms` frame budget), the NV12 tap copy adds ~`0.04 ms` (`0.25%` of frame budget) and the background IPC pump writes to SHM in ~`0.04 ms` off the render thread.
 
-### 4.3 60-Second End-to-End Run (`internal/stats` with `max` support)
-Measured locally for `60s` (`-source synthetic -renderer d3d11 -no-audio -duration 60s`) via `.\tools\spike\bench-vcam.ps1 -Source synthetic -Seconds 60 -BaselineOnly`:
+### 4.3 60-Second End-to-End Runs (`internal/stats` with `max` support)
+Measured locally over `60s` runs (`-renderer d3d11 -no-audio -duration 60s`):
+- **Live capture card runs**: `Live Gamer Ultra-Video` actively streamed continuous `NV12 1920x1080@120.00` frames (displaying its `"No Signal"` standby card image because no external HDMI source was connected) across all 3 capture-card cases below:
 
-| Run | Mode | FPS | `arr->pres` p50 / p99 / max | `arr->vbl` p50 / p99 / max | Dropped |
+| Run (60s) | Source / Mode | FPS | `arr->pres` p50 / p99 / max | `arr->vbl` p50 / p99 / max | Dropped |
 |---|---|---:|---|---|---:|
-| Synthetic Baseline (Virtual Cam **OFF**) | `NV12 1920x1080@60.00` | `60.0` | `0.36 ms / 0.59 ms / 20.68 ms` | `5.45 ms / 18.44 ms / 30.26 ms` | `4` |
-| Capture Card (`Live Gamer Ultra-Video`) **OFF** (>=60s) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` |
-| Capture Card (`Live Gamer Ultra-Video`) **ON** (>=60s) | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` | `[PENDING]` |
+| Synthetic Baseline (Virtual Cam **OFF**) | `synthetic` (`NV12 1920x1080@60.00`) | `60.0` | `0.36 ms / 0.59 ms / 20.68 ms` | `5.45 ms / 18.44 ms / 30.26 ms` | `4` |
+| **`Live Gamer Ultra-Video` — Virtual Cam OFF (baseline)** | `mf` (`NV12 1920x1080@120.00`) | `120.0` | **`0.46 ms / 0.81 ms / 4.58 ms`** | **`9.30 ms / 18.71 ms / 24.75 ms`** | `0` |
+| **`Live Gamer Ultra-Video` — Virtual Cam ON (no consumer)** | `mf` (`NV12 1920x1080@120.00`) | `120.0` | **`0.44 ms / 0.76 ms / 5.43 ms`** | **`9.36 ms / 19.15 ms / 25.61 ms`** | `0` (`frames=7191`, `tap_dropped=0`) |
+| **`Live Gamer Ultra-Video` — Virtual Cam ON + active 1080p60 FrameServer consumer** (`vcam_loopback_test --frameserver --frames 3600`, `3,288` frames over `~54.8s`) | `mf` (`NV12 1920x1080@120.00`) | `120.0` | **`0.43 ms / 0.74 ms / 5.43 ms`** | **`9.23 ms / 19.24 ms / 26.04 ms`** | `4` (`frames=7171`, `tap_dropped=2`) |
 
-Exact command for `入門工程師-google` after HKLM registration (run with active HDMI input on `Live Gamer Ultra-Video`):
-```powershell
-.\tools\spike\bench-vcam.ps1 -Source mf -Seconds 60
-```
+**Latency conclusion**: **Zero `p50` / `p99` regression** on either `arr->pres` (`0.43–0.46 ms` p50, `0.74–0.81 ms` p99) or `arr->vbl` (`9.23–9.36 ms` p50, `18.71–19.24 ms` p99), even at **120 fps** capture while simultaneously feeding an active 1080p60 Windows Frame Server consumer. (Re-run with `.\tools\spike\bench-vcam.ps1 -Source mf -Seconds 60` anytime if benchmarking with an active external HDMI source.)
 
 ---
 
@@ -160,7 +169,7 @@ Exact command for `入門工程師-google` after HKLM registration (run with act
 | **Install Privileges** | **Admin once** (`HKLM` COM registration + `ProgramData` ACL); non-admin runtime | **Admin once** (OBS installer already registered `HKLM`); **non-admin SHM write**, no running OBS needed | **Admin once** (OBS virtualcam) + plugin installs | **Admin once** (`HKLM` COM + DirectShow filter category) |
 | **Extra Files** | 1 small `x64` DLL (`capview_vcam.dll`, **~199 KB**) + `register.ps1` | External dependency on installed OBS (`obs-virtualcam-module64/32.dll`) | Full OBS Studio + `obs-spout2`/`obs-ndi` + runtime | 2 DLLs (64-bit + 32-bit filter DLLs) |
 | **Added Latency** | **Low**: ~0.04 ms tap + ~0.04 ms SHM + FrameServer copy (16.67 ms cadence) | Low (~1 frame SHM + DirectShow copy, no FrameServer) | **High**: extra GPU readback/IPC -> OBS compositor -> VirtualCam | Low-Medium (~1 frame) |
-| **Maintenance Risk** | Medium-Low (official Win11 API; FrameServer IPC & COM DLL owned by `capview`) | **High**: undocumented internal OBS SHM + `%APPDATA%\obs-virtualcam.txt`; requires OBS installed; single-writer collision with OBS; misses UWP | **High**: heavy multi-process dependency, poor UX, user must run & configure OBS | **High**: DirectShow deprecated, dual 32/64-bit registration, misses UWP/Win11 Camera |
+| **Maintenance Risk** | Medium-Low (official Win11 API; FrameServer IPC & COM DLL owned by `capview`; **DLL upgrades require elevated `Stop-Service FrameServer` or reboot** due to Session 0 DLL lock) | **High**: undocumented internal OBS SHM + `%APPDATA%\obs-virtualcam.txt`; requires OBS installed; single-writer collision with OBS; misses UWP | **High**: heavy multi-process dependency, poor UX, user must run & configure OBS | **High**: DirectShow deprecated, dual 32/64-bit registration, misses UWP/Win11 Camera |
 | **Build Toolchain** | MSVC `14.50` `x64` (or `clang++`) + Win11 SDK `10.0.22000+` (`10.0.26100.0` installed locally) | Pure Go (`CGO_ENABLED=0`) writer if reusing installed OBS DLL | Spout2/NDI SDK + OBS plugin setup | Windows SDK DirectShow / ATL/COM C++ (`x86` + `x64`) |
 | **Impact on Main Binary `cgo`** | **Zero** (`CGO_ENABLED=0` preserved; COM DLL built separately) | Zero (`CGO_ENABLED=0`) | Zero or external NDI/Spout DLL load | **Zero** if separate COM DLL |
 
@@ -169,7 +178,11 @@ Exact command for `入門工程師-google` after HKLM registration (run with act
 ## 7. Conclusions & Recommendations
 
 1. **Recommendation**: **Proceed with Option (a) (`MFCreateVirtualCamera` + standalone `x64` C++ COM Media Source DLL `capview_vcam.dll`)** as the Windows 11 Virtual Camera architecture (with Option (b) noted as a fallback only for Win10 users who already have OBS installed and do not need UWP/Windows Camera App visibility).
-   - Option (a) preserves `CGO_ENABLED=0` on the main Go binary, limits native DLL scope cleanly to `windows/amd64` (while keeping `windows/arm64` Go CI green), keeps the display render path untouched and non-blocking (`0.042 ms` NV12 tap, `0.040 ms` SHM write, immediate `IMFSample` release), achieves locked `60.46 fps` (`1080p60`) / `30.48 fps` (`720p30`) through real Windows Camera Frame Server (`IMFSourceReader`), cleans up cleanly on `TerminateProcess`, and supports UWP/Windows Camera App alongside Chrome/Meet/OBS without requiring OBS to be installed.
-2. **Next Steps before Shipping / Finalizing PR**:
-   - Have `入門工程師-google` execute `.\tools\spike\bench-vcam.ps1 -Source mf -Seconds 60` on `Live Gamer Ultra-Video` and fill in the live Windows Camera App / OBS / Chrome / Google Meet screenshots in Section 1.3 and Section 4.3.
-   - Sign `capview.exe` and `capview_vcam.dll` with Authenticode for release builds, and bundle `HKLM` COM registration + `C:\ProgramData\capview` ACL setup into an installer / elevated setup action (with clear UX guidance when unprivileged users toggle Virtual Camera before registering).
+   - Option (a) preserves `CGO_ENABLED=0` on the main Go binary, limits native DLL scope cleanly to `windows/amd64` (while keeping `windows/arm64` Go CI green), keeps the display render path untouched and non-blocking (`0.042 ms` NV12 tap, `0.040 ms` SHM write, immediate `IMFSample` release, zero `arr->pres` / `arr->vbl` p50/p99 regression at `1080p120`), achieves locked `60 fps` through real Windows Camera Frame Server (`Windows Camera App`, `OBS 31.1.0`, `Chrome 157 getUserMedia`), and cleans up cleanly on `TerminateProcess`.
+2. **Productionization / Installer Considerations**:
+   - Sign `capview.exe` and `capview_vcam.dll` with Authenticode for release builds.
+   - Bundle `HKLM` COM registration + `C:\ProgramData\capview` ACL setup into an installer / elevated setup action (with clear UX guidance when unprivileged users toggle Virtual Camera before registering), and ensure upgrades stop `FrameServer` (`Stop-Service FrameServer -Force`) or schedule pending file replacement since Session 0 keeps `capview_vcam.dll` locked after first use.
+3. **Manual Spot-Checks Left for Owner**:
+   - **Signed-in Google Meet preview**: Open Google Meet in your signed-in Chrome profile and confirm `capview Virtual Camera` preview renders smoothly (isolated test profile stopped at Google login; underlying Chrome `157` `getUserMedia` `1080p60` is already verified).
+   - **Physical right-click context menu**: Right-click the `capview` viewer window and toggle **Virtual Camera** on/off to visually confirm checkbox + `config.json` (`"virtual_camera"`) persistence.
+   - **Active external HDMI source**: Plug a live HDMI game/console/PC signal into `Live Gamer Ultra-Video` and visually spot-check motion/colors in Windows Camera App / OBS / Meet.
