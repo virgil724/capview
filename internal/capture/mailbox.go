@@ -63,7 +63,7 @@ type Mailbox struct {
 	dropped atomic.Uint64
 	notify  chan struct{}
 	sinks   sinkSet   // secondary consumers (see tap.go)
-	fan     fanWorker // copies frames to the sinks
+	fan     fanWorker // copies frames to the sinks off the capture thread
 }
 
 // NewMailbox creates a latest-frame mailbox.
@@ -99,6 +99,13 @@ func (m *Mailbox) Discard() {
 		m.pending.Release()
 		m.pending, m.hasNew = Frame{}, false
 	}
+}
+
+// Close discards any pending frame and shuts down the fan-out worker,
+// releasing any queued fan-out job. Safe to call more than once.
+func (m *Mailbox) Close() {
+	m.Discard()
+	m.fan.close()
 }
 
 func (m *Mailbox) publish(f Frame) {

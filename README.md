@@ -86,7 +86,7 @@ Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, S
 
 ### Controls
 
-- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Fullscreen, VRR/VSync, Mute, Spout Output, Quit)
+- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Audio Mirror Output, Fullscreen, VRR/VSync, Mute, Spout Output, Virtual Camera, Quit)
 - `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s; engages Independent Flip / VRR for <1 ms display latency)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
 - `M`: Mute / unmute audio
@@ -98,6 +98,18 @@ Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, S
 Right-click → **Spout Output** (or `-spout`, saved as `spout_enabled`) publishes the video as a Spout2 sender named `capview` (`-spout-name` to change it). In OBS add a **Spout2 Capture** source ([obs-spout2-plugin](https://github.com/Off-World-Live/obs-spout2-plugin)) and pick `capview`. Off by default; turning it off unregisters the sender and the OBS source goes blank.
 
 The sender is pure Go (no Spout DLL): a separate thread with its own D3D11 device converts NV12/YUY2 to a BGRA legacy shared texture, fed by a drop-oldest copy of each captured frame, so the viewer never waits for it. `go run ./tools/spoutcheck` lists senders, measures the sender frame rate and saves a received frame as PNG without OBS.
+
+## Windows 11 x64 Virtual Camera
+
+`capview` can expose your live capture feed as **`capview Virtual Camera`** to Windows Camera, Google Meet, Chrome, OBS, Teams, and Zoom via `MFCreateVirtualCamera` (`MFVirtualCameraLifetime_Session` + `MFVirtualCameraAccess_CurrentUser`).
+
+- **Supported platform**: **Windows 11 x64 (`windows/amd64`) only** (disabled/hidden on Windows ARM64 and Linux).
+- **Bundle layout**: Keep `capview_vcam.dll` in the same directory as `capview.exe`.
+- **Usage**:
+  - Right-click the viewer window → **`Virtual Camera`** ▸ **`Enable`** / **`Disable`** / **`Uninstall`** (or pass `-vcam` on the CLI; saved as `"vcam_enabled"` in `config.json`, `false` by default).
+  - **One-time UAC elevation**: Enabling for the first time (or when the bundled `capview_vcam.dll` version/hash changes) prompts UAC once to run `capview.exe -vcam-install`, deploying the COM DLL to `C:\ProgramData\capview\`, setting `LocalService` ACLs, and registering the CLSID in `HKLM`. Everyday **Enable** / **Disable** afterwards runs with **zero admin privileges**.
+  - **Standby placeholder**: When capture is idle or paused, the COM source outputs a dark `"capview"` placeholder frame at the negotiated mode (`1080p60`, `1080p30`, `720p60`, `720p30`).
+- **TODO (Code Signing)**: Release binaries (`capview.exe` and `capview_vcam.dll`) are not yet Authenticode-signed. Adding an Authenticode signing step to the release workflow is tracked before public distribution to avoid Microsoft Defender SmartScreen prompts and WDAC/HVCI `svchost.exe` load restrictions.
 
 ## Roadmap
 

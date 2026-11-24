@@ -326,7 +326,6 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		black    = [4]float32{0, 0, 0, 1}
 		tracker  = stats.New(120, cfg.Freq)
 	)
-
 	if cfg.PrintStats {
 		defer func() { fmt.Println(tracker.RunSummary()) }()
 	}
@@ -470,11 +469,12 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 					return FinalState{}, err
 				}
 			}
+			// Under VSync, sc.Present(1, 0) can block 8-16 ms waiting for vblank,
+			// so release the capture buffer right after upload to avoid holding
+			// the driver IMFSample across vblank. Under VRR/LowLat (!useVSync),
+			// Present returns immediately, so defer Release until after Present
+			// so secondary sinks (Spout/Virtual Camera) do not contend with draw and present.
 			if useVSync {
-				// Present(1,0) waits for vblank: hand the buffer back now rather
-				// than holding the IMFSample for up to a refresh. Secondary
-				// outputs then copy during that wait, which is not on the
-				// latency path.
 				f.Release()
 			}
 
@@ -509,8 +509,8 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			}
 			presentQPC := win.QPC()
 			// Without VSync, hand the capture buffer back only now: secondary
-			// outputs (Spout) copy it once the viewer releases it, and their
-			// copy must not compete with this frame's draw and present.
+			// outputs (Spout, Virtual Camera) copy it once the viewer releases it,
+			// and their copy must not compete with this frame's draw and present.
 			f.Release() // no-op if already released above
 			if pErr != nil && !errors.Is(pErr, win.ErrOccluded) {
 				return FinalState{}, fmt.Errorf("present: %w", pErr)

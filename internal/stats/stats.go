@@ -3,6 +3,7 @@ package stats
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 )
@@ -40,7 +41,23 @@ type Summary struct {
 	HasVBlank       bool
 }
 
-// Tracker maintains a fixed-size ring buffer of recent frame samples.
+// Dist is a latency distribution summary in milliseconds.
+type Dist struct {
+	N             uint64
+	P50, P99, Max float64
+}
+
+// RunSummary aggregates every sample since the tracker was created (not just
+// the rolling window), for end-of-run A/B measurements.
+type RunSummary struct {
+	Frames  uint64
+	Dropped uint64
+	Pres    Dist
+	Vbl     Dist
+}
+
+// Tracker maintains a fixed-size ring buffer of recent frame samples and
+// bounded-memory whole-run latency histograms (0.01 ms resolution).
 type Tracker struct {
 	mu sync.Mutex
 
@@ -55,7 +72,7 @@ type Tracker struct {
 	dispIdx   int
 	dispCount int
 
-	// Whole-run latency histograms (bounded memory, 0.01 ms resolution).
+	// Whole-run latency histograms (fixed bounded memory, 0.01 ms resolution).
 	runPres hist
 	runVbl  hist
 
@@ -128,7 +145,7 @@ func (t *Tracker) AddDropped() {
 	t.mu.Unlock()
 }
 
-// Summary computes percentiles over the current rolling window.
+// Summary computes percentiles and max over the current rolling window.
 func (t *Tracker) Summary() Summary {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -183,6 +200,25 @@ func (t *Tracker) Summary() Summary {
 	return s
 }
 
+// RunSummary returns whole-run arr->pres and arr->vbl percentiles and max
+// from the fixed-memory histograms.
+func (t *Tracker) RunSummary() RunSummary {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return RunSummary{
+		Frames:  t.frames,
+		Dropped: t.dropped,
+		Pres:    t.runPres.dist(),
+		Vbl:     t.runVbl.dist(),
+	}
+}
+
+// String formats the run summary as one line.
+func (r RunSummary) String() string {
+	return fmt.Sprintf("run: frames %d drop %d | arr->pres n %d p50 %.2fms p99 %.2fms max %.2fms | arr->vbl n %d p50 %.2fms p99 %.2fms max %.2fms",
+		r.Frames, r.Dropped, r.Pres.N, r.Pres.P50, r.Pres.P99, r.Pres.Max, r.Vbl.N, r.Vbl.P50, r.Vbl.P99, r.Vbl.Max)
+}
+
 func percentile(sorted []float64, p float64) float64 {
 	if len(sorted) == 0 {
 		return 0
@@ -195,60 +231,6 @@ func percentile(sorted []float64, p float64) float64 {
 		i = len(sorted) - 1
 	}
 	return sorted[i]
-}
-
-// FormatLine formats a compact one-line status string for the window title or stdout.
-func (s Summary) FormatLine(mode string, tearing bool) string {
-	syncMode := "VSync"
-	if tearing {
-		syncMode = "VRR/LowLat"
-	}
-	return s.FormatLineExt(mode, syncMode, "arr->vbl")
-}
-
-// FormatLineExt formats a one-line status string with custom sync and display
-// timing labels (e.g. "arr->vbl" or "arr->presentwait", or "" to omit).
-func (s Summary) FormatLineExt(mode, syncLabel, displayLabel string) string {
-	presCallPart := ""
-	if s.HasPresentCall {
-		presCallPart = fmt.Sprintf(" | pres_call p50 %.2fms p99 %.2fms max %.2fms",
-			s.PresentCallP50, s.PresentCallP99, s.PresentCallMax)
-	}
-	vblPart := ""
-	if s.HasVBlank && displayLabel != "" {
-		vblPart = fmt.Sprintf(" | %s p50 %.2fms p99 %.2fms max %.2fms",
-			displayLabel, s.ArriveToVblP50, s.ArriveToVblP99, s.ArriveToVblMax)
-	}
-	return fmt.Sprintf("%s | %.1f fps | %s | dev->arr %.2fms | arr->pres p50 %.2fms p99 %.2fms max %.2fms%s%s | drop %d",
-		mode, s.FPS, syncLabel, s.DevToArriveP50, s.ArriveToPresP50, s.ArriveToPresP99, s.ArriveToPresMax, presCallPart, vblPart, s.Dropped)
-}
-
-// RunSummary aggregates every sample since the tracker was created (not just
-// the rolling window), for end-of-run A/B measurements.
-type RunSummary struct {
-	Frames  uint64
-	Dropped uint64
-	Pres    Dist
-	Vbl     Dist
-}
-
-// Dist is a latency distribution summary in milliseconds.
-type Dist struct {
-	N             uint64
-	P50, P99, Max float64
-}
-
-// RunSummary returns whole-run arr->pres and arr->vbl percentiles and max.
-func (t *Tracker) RunSummary() RunSummary {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return RunSummary{Frames: t.frames, Dropped: t.dropped, Pres: t.runPres.dist(), Vbl: t.runVbl.dist()}
-}
-
-// String formats the run summary as one line.
-func (r RunSummary) String() string {
-	return fmt.Sprintf("run: frames %d drop %d | arr->pres n %d p50 %.2fms p99 %.2fms max %.2fms | arr->vbl n %d p50 %.2fms p99 %.2fms max %.2fms",
-		r.Frames, r.Dropped, r.Pres.N, r.Pres.P50, r.Pres.P99, r.Pres.Max, r.Vbl.N, r.Vbl.P50, r.Vbl.P99, r.Vbl.Max)
 }
 
 const (
@@ -268,7 +250,7 @@ func (h *hist) add(ms float64) {
 	if h.bins == nil {
 		h.bins = make([]uint32, histBins)
 	}
-	i := int(ms / histRes)
+	i := int(math.Round(ms / histRes))
 	if i < 0 {
 		i = 0
 	}
@@ -304,4 +286,30 @@ func (h *hist) dist() Dist {
 		return Dist{}
 	}
 	return Dist{N: h.n, P50: h.quantile(0.50), P99: h.quantile(0.99), Max: h.max}
+}
+
+// FormatLine formats a compact one-line status string for the window title or stdout.
+func (s Summary) FormatLine(mode string, tearing bool) string {
+	syncMode := "VSync"
+	if tearing {
+		syncMode = "VRR/LowLat"
+	}
+	return s.FormatLineExt(mode, syncMode, "arr->vbl")
+}
+
+// FormatLineExt formats a one-line status string with custom sync and display
+// timing labels (e.g. "arr->vbl" or "arr->presentwait", or "" to omit).
+func (s Summary) FormatLineExt(mode, syncLabel, displayLabel string) string {
+	presCallPart := ""
+	if s.HasPresentCall {
+		presCallPart = fmt.Sprintf(" | pres_call p50 %.2fms p99 %.2fms max %.2fms",
+			s.PresentCallP50, s.PresentCallP99, s.PresentCallMax)
+	}
+	vblPart := ""
+	if s.HasVBlank && displayLabel != "" {
+		vblPart = fmt.Sprintf(" | %s p50 %.2fms p99 %.2fms max %.2fms",
+			displayLabel, s.ArriveToVblP50, s.ArriveToVblP99, s.ArriveToVblMax)
+	}
+	return fmt.Sprintf("%s | %.1f fps | %s | dev->arr %.2fms | arr->pres p50 %.2fms p99 %.2fms max %.2fms%s%s | drop %d",
+		mode, s.FPS, syncLabel, s.DevToArriveP50, s.ArriveToPresP50, s.ArriveToPresP99, s.ArriveToPresMax, presCallPart, vblPart, s.Dropped)
 }

@@ -3,8 +3,10 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
+	"github.com/virgil724/capview/internal/vcam"
 	"github.com/virgil724/capview/internal/win"
 )
 
@@ -34,11 +37,95 @@ func main() {
 		}
 		return
 	}
+	if hasVcamAdminFlag(os.Args[1:]) {
+		if err := runVcamAdmin(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := runView(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		win.ShowErrorBox("capview", err.Error())
 		os.Exit(1)
 	}
+}
+
+func hasVcamAdminFlag(args []string) bool {
+	for _, a := range args {
+		switch {
+		case a == "-vcam-install", a == "--vcam-install",
+			a == "-vcam-uninstall", a == "--vcam-uninstall",
+			strings.HasPrefix(a, "-vcam-install="), strings.HasPrefix(a, "--vcam-install="),
+			strings.HasPrefix(a, "-vcam-uninstall="), strings.HasPrefix(a, "--vcam-uninstall="):
+			return true
+		}
+	}
+	return false
+}
+
+func runVcamAdmin(args []string) error {
+	fs := flag.NewFlagSet("capview-vcam", flag.ContinueOnError)
+	doInstall := fs.Bool("vcam-install", false, "install/upgrade and register Windows 11 x64 virtual camera COM DLL")
+	doUninstall := fs.Bool("vcam-uninstall", false, "unregister and remove Windows 11 x64 virtual camera COM DLL")
+	dllPath := fs.String("vcam-dll", "", "optional path to bundled capview_vcam.dll")
+	upgradeModeStr := fs.String("vcam-upgrade-mode", "auto", "DLL upgrade mode: auto, rename, or restart")
+	logPath := fs.String("vcam-log", "", "optional log file path")
+	cfgPath := fs.String("vcam-config", config.DefaultPath(), "config.json path for uninstall")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *doInstall && *doUninstall {
+		return errors.New("cannot specify both -vcam-install and -vcam-uninstall")
+	}
+
+	var logW io.Writer = os.Stdout
+	var logFile *os.File
+	if strings.TrimSpace(*logPath) != "" {
+		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err == nil {
+			logFile = f
+			defer f.Close()
+			logW = io.MultiWriter(os.Stdout, f)
+		}
+	}
+
+	mode, err := vcam.ParseUpgradeMode(*upgradeModeStr)
+	if err != nil {
+		fmt.Fprintf(logW, "error: %v\n", err)
+		return err
+	}
+
+	if *doInstall {
+		_, err := vcam.Install(vcam.InstallOptions{
+			BundledDLL:  *dllPath,
+			UpgradeMode: mode,
+		}, logW)
+		if err != nil {
+			fmt.Fprintf(logW, "error: %v\n", err)
+			return err
+		}
+		if logFile != nil {
+			_ = logFile.Sync()
+		}
+		return nil
+	}
+
+	if *doUninstall {
+		err := vcam.Uninstall(vcam.UninstallOptions{
+			UpgradeMode: mode,
+			ConfigPath:  *cfgPath,
+		}, logW)
+		if err != nil {
+			fmt.Fprintf(logW, "error: %v\n", err)
+			return err
+		}
+		if logFile != nil {
+			_ = logFile.Sync()
+		}
+		return nil
+	}
+	return nil
 }
 
 func runList() error {
@@ -88,6 +175,7 @@ type appHost struct {
 	cfgPath string
 	freq    int64
 	mailbox *capture.Mailbox
+	tap     *capture.Tap
 	vid     *capture.Source
 	aud     *audio.Passthrough
 	diag    bool // print audio ring diagnostics (-stats)
@@ -98,6 +186,10 @@ type appHost struct {
 	printStats bool
 	spoutTap   *capture.RawTap
 	spout      *render.SpoutOutput
+
+	// Windows 11 Virtual Camera output (nil when off).
+	vcam    *vcam.Controller
+	vcamShm string
 
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
@@ -397,7 +489,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 
 	muted := h.aud != nil && h.aud.Muted()
 
-	return []render.MenuItem{
+	items := []render.MenuItem{
 		{Label: "Video Device", Submenu: vidItems},
 		{Label: "Resolution / FPS", Submenu: modeItems},
 		{Label: "Audio Input", Submenu: audInItems},
@@ -430,12 +522,43 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 			Label:   "Spout Output",
 			Checked: h.spoutRunning(),
 		},
-		{Separator: true},
-		{
+	}
+
+	if vcam.Available() {
+		vcamOn := h.vcam != nil
+		vcamInstalled := vcam.IsInstalled()
+		items = append(items, render.MenuItem{
+			Label: "Virtual Camera",
+			Submenu: []render.MenuItem{
+				{
+					ID:       addAction(func() (bool, bool, bool) { h.enableVirtualCamera(); return false, false, false }),
+					Label:    "Enable",
+					Checked:  vcamOn,
+					Disabled: vcamOn,
+				},
+				{
+					ID:       addAction(func() (bool, bool, bool) { h.disableVirtualCamera(); return false, false, false }),
+					Label:    "Disable",
+					Disabled: !vcamOn,
+				},
+				{Separator: true},
+				{
+					ID:       addAction(func() (bool, bool, bool) { h.uninstallVirtualCamera(); return false, false, false }),
+					Label:    "Uninstall",
+					Disabled: !vcamInstalled,
+				},
+			},
+		})
+	}
+
+	items = append(items,
+		render.MenuItem{Separator: true},
+		render.MenuItem{
 			ID:    addAction(func() (bool, bool, bool) { return false, false, true }),
 			Label: "Quit (ESC)",
 		},
-	}
+	)
+	return items
 }
 
 func (h *appHost) HandleMenu(id uint32) (toggleFS, toggleVSync, quit bool) {
@@ -452,13 +575,23 @@ func (h *appHost) switchVideoDevice(dev string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	prev := h.cfg.Device
+	if h.vcam != nil {
+		h.vcam.SetActive(false)
+	}
 	h.stopVideo()
 	h.cfg.Device = dev
 	if err := h.startVideo("mf"); err != nil {
 		win.ShowErrorBox("capview", fmt.Sprintf("Failed to open %s:\n%v", dev, err))
 		h.cfg.Device = prev
-		_ = h.startVideo("mf")
+		if h.startVideo("mf") == nil && h.vcam != nil && h.vid != nil {
+			h.vcam.SetFPS(h.vid.Mode.FPS)
+			h.vcam.SetActive(true)
+		}
 		return
+	}
+	if h.vcam != nil && h.vid != nil {
+		h.vcam.SetFPS(h.vid.Mode.FPS)
+		h.vcam.SetActive(true)
 	}
 	_ = config.Save(h.cfgPath, h.cfg)
 }
@@ -467,15 +600,128 @@ func (h *appHost) switchVideoMode(m capture.Mode) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	prevW, prevH, prevFPS, prevFmt := h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format
+	if h.vcam != nil {
+		h.vcam.SetActive(false)
+	}
 	h.stopVideo()
 	h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = m.Width, m.Height, m.FPS, m.FourCC
 	if err := h.startVideo("mf"); err != nil {
 		win.ShowErrorBox("capview", fmt.Sprintf("Failed to switch to %s:\n%v", m, err))
 		h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = prevW, prevH, prevFPS, prevFmt
-		_ = h.startVideo("mf")
+		if h.startVideo("mf") == nil && h.vcam != nil && h.vid != nil {
+			h.vcam.SetFPS(h.vid.Mode.FPS)
+			h.vcam.SetActive(true)
+		}
 		return
 	}
+	if h.vcam != nil && h.vid != nil {
+		h.vcam.SetFPS(h.vid.Mode.FPS)
+		h.vcam.SetActive(true)
+	}
 	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) startVirtualCameraLocked() error {
+	if h.vcam != nil {
+		return nil
+	}
+	fps := h.cfg.FPS
+	if h.vid != nil && h.vid.Mode.FPS > 0 {
+		fps = h.vid.Mode.FPS
+	}
+	vc, err := vcam.Start(h.tap, vcam.Options{
+		FriendlyName: vcam.DefaultFriendlyName,
+		ShmMode:      h.vcamShm,
+		FPS:          fps,
+	})
+	if err != nil {
+		return err
+	}
+	h.vcam = vc
+	st := vc.Stats()
+	fmt.Printf("virtual_camera: enabled (shm=%s event=%s link=%q)\n", st.ShmBackend, st.EventMode, st.SymbolicLink)
+	return nil
+}
+
+func (h *appHost) stopVirtualCameraLocked() {
+	if h.vcam != nil {
+		st := h.vcam.Stats()
+		h.vcam.Stop()
+		h.vcam = nil
+		fmt.Printf("virtual_camera: stopped (frames=%d tap_dropped=%d)\n", st.FramesWritten, h.tap.Dropped())
+	}
+}
+
+func (h *appHost) stopVirtualCamera() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopVirtualCameraLocked()
+}
+
+func (h *appHost) enableVirtualCamera() {
+	h.mu.Lock()
+	if h.vcam != nil {
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+
+	st := vcam.CheckInstallStatus("")
+	if !st.Installed || (st.BundledExists && !st.UpToDate) {
+		if !st.BundledExists {
+			win.ShowErrorBox("capview", fmt.Sprintf("Cannot enable Virtual Camera:\n%v (%s)", vcam.ErrBundledDLLMissing, st.BundledPath))
+			return
+		}
+		if err := vcam.RunElevatedInstall(st.BundledPath); err != nil {
+			if errors.Is(err, vcam.ErrUserCancelled) {
+				fmt.Fprintln(os.Stderr, "virtual_camera: setup cancelled by user")
+				return
+			}
+			win.ShowErrorBox("capview", fmt.Sprintf("Failed to install Virtual Camera:\n%v", err))
+			return
+		}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.startVirtualCameraLocked(); err != nil {
+		h.cfg.VcamEnabled = false
+		_ = config.Save(h.cfgPath, h.cfg)
+		win.ShowErrorBox("capview", fmt.Sprintf("Failed to start Virtual Camera:\n%v", err))
+		return
+	}
+	h.cfg.VcamEnabled = true
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) disableVirtualCamera() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopVirtualCameraLocked()
+	h.cfg.VcamEnabled = false
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) uninstallVirtualCamera() {
+	h.mu.Lock()
+	h.stopVirtualCameraLocked()
+	cfgPath := h.cfgPath
+	h.mu.Unlock()
+
+	if err := vcam.RunElevatedUninstall(cfgPath); err != nil {
+		if errors.Is(err, vcam.ErrUserCancelled) {
+			fmt.Fprintln(os.Stderr, "virtual_camera: uninstall cancelled by user")
+			return
+		}
+		win.ShowErrorBox("capview", fmt.Sprintf("Failed to uninstall Virtual Camera:\n%v", err))
+		return
+	}
+
+	h.mu.Lock()
+	h.cfg.VcamEnabled = false
+	_ = config.Save(h.cfgPath, h.cfg)
+	h.mu.Unlock()
+	fmt.Println("virtual_camera: uninstalled")
 }
 
 func (h *appHost) switchAudioIn(dev string, disabled bool) {
@@ -567,6 +813,8 @@ func runView(args []string) error {
 	volume := fs.Float64("volume", float64(cfg.Volume), "initial audio volume (0.0 to 1.0)")
 	renderer := fs.String("renderer", "d3d11", "render backend: d3d11 or vulkan")
 	source := fs.String("source", "mf", "video source: mf or synthetic")
+	vcamFlag := fs.Bool("vcam", cfg.VcamEnabled, "enable Windows 11 x64 Virtual Camera output")
+	vcamShm := fs.String("vcam-shm", "auto", "virtual camera shared memory mode: auto, global, file, local")
 	vkInfo := fs.Bool("vkinfo", false, "print Vulkan device/extension/present-mode capabilities and exit")
 	duration := fs.Duration("duration", 0, "optional run duration before clean exit (e.g. 20s)")
 	spoutOn := fs.Bool("spout", cfg.SpoutEnabled, "publish the video as a Spout2 sender (e.g. OBS Spout2 Capture)")
@@ -638,6 +886,9 @@ func runView(args []string) error {
 	if setFlags["spout"] {
 		cfg.SpoutEnabled = *spoutOn
 	}
+	if setFlags["vcam"] {
+		cfg.VcamEnabled = *vcamFlag
+	}
 
 	if srcKind == "synthetic" {
 		if !setFlags["size"] {
@@ -651,19 +902,62 @@ func runView(args []string) error {
 		}
 	}
 
+	if vcam.Available() {
+		vcam.CleanupOldDLLs(vcam.InstallDir)
+	}
+
+	mb := capture.NewMailbox()
+	defer mb.Close()
+	tap := capture.NewTap()
+	mb.AddSink(tap)
+
 	host := &appHost{
-		cfg:     cfg,
-		cfgPath: cfgPath,
-		freq:    win.QPCFrequency(),
-		mailbox: capture.NewMailbox(),
+		cfg:        cfg,
+		cfgPath:    cfgPath,
+		freq:       win.QPCFrequency(),
+		mailbox:    mb,
+		tap:        tap,
 		diag:       *printStats,
 		spoutName:  *spoutName,
 		printStats: *printStats,
+		vcamShm:    *vcamShm,
 	}
 	if err := host.startVideo(srcKind); err != nil {
 		return err
 	}
 	defer host.stopVideo()
+
+	if cfg.VcamEnabled {
+		if !vcam.Available() {
+			if setFlags["vcam"] {
+				return vcam.ErrUnsupported
+			}
+			fmt.Fprintf(os.Stderr, "warning: virtual camera unavailable on this architecture\n")
+			host.cfg.VcamEnabled = false
+		} else {
+			st := vcam.CheckInstallStatus("")
+			if !st.Installed || (st.BundledExists && !st.UpToDate) {
+				msg := "virtual camera is not installed or needs upgrade (right-click Virtual Camera -> Enable, or run capview -vcam-install)"
+				if setFlags["vcam"] {
+					return errors.New(msg)
+				}
+				fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
+				host.cfg.VcamEnabled = false
+			} else {
+				host.mu.Lock()
+				vcamErr := host.startVirtualCameraLocked()
+				host.mu.Unlock()
+				if vcamErr != nil {
+					if setFlags["vcam"] {
+						return fmt.Errorf("virtual camera: %w", vcamErr)
+					}
+					fmt.Fprintf(os.Stderr, "warning: virtual camera disabled: %v\n", vcamErr)
+					host.cfg.VcamEnabled = false
+				}
+			}
+		}
+	}
+	defer host.stopVirtualCamera()
 
 	if srcKind != "synthetic" {
 		host.startAudio()

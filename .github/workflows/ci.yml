@@ -36,8 +36,38 @@ jobs:
           name: capview-linux
           path: dist/*
 
-  build:
+  vcam-dll:
     runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build x64 COM Media Source DLL
+        shell: pwsh
+        run: |
+          $ver = "1.0.0.0"
+          if ($env:GITHUB_REF -match '^refs/tags/v(\d+)\.(\d+)\.(\d+)') {
+            $ver = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+          }
+          pwsh -File vcam/dll/build.ps1 -Arch x64 -Version $ver
+
+      - name: Verify Placeholder & In-Proc COM Loopback
+        shell: pwsh
+        run: |
+          .\vcam\dll\build\x64\vcam_loopback_test.exe `
+            --dll .\vcam\dll\build\x64\capview_vcam.dll `
+            --verify-placeholder `
+            --frames 15
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capview-vcam-dll-x64
+          path: vcam/dll/build/x64/capview_vcam.dll
+
+  build:
+    needs: [vcam-dll]
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@v4
 
@@ -45,10 +75,19 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Vet & Test
+      - name: Vet & Test (windows/amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
         run: |
           go vet ./...
           go test -v ./...
+
+      - name: Vet (windows/arm64)
+        env:
+          GOOS: windows
+          GOARCH: arm64
+        run: go vet ./...
 
       - name: Build windows/amd64
         env:
@@ -66,10 +105,22 @@ jobs:
           go build -ldflags="-s -w -H=windowsgui" -o dist/capview-windows-arm64.exe ./cmd/capview
           go build -ldflags="-s -w" -o dist/capview-cli-windows-arm64.exe ./cmd/capview
 
-      - name: Checksums
+      - uses: actions/download-artifact@v4
+        with:
+          name: capview-vcam-dll-x64
+          path: dist
+
+      - name: Bundle windows/amd64 zip & Checksums
         shell: pwsh
         run: |
-          Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
+          $stage = Join-Path $env:RUNNER_TEMP "capview-amd64-bundle"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item dist\capview-windows-amd64.exe (Join-Path $stage "capview.exe")
+          Copy-Item dist\capview-cli-windows-amd64.exe (Join-Path $stage "capview-cli.exe")
+          Copy-Item dist\capview_vcam.dll (Join-Path $stage "capview_vcam.dll")
+          Compress-Archive -Path "$stage\*" -DestinationPath dist\capview-windows-amd64.zip -Force
+
+          Get-ChildItem dist\* -Include *.exe,*.dll,*.zip | Sort-Object Name | ForEach-Object {
             $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
             "$h  $($_.Name)"
           } | Set-Content -Encoding ascii dist\SHA256SUMS.txt
