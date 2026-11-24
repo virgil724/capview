@@ -7,6 +7,8 @@ import (
 	"os"
 	"slices"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 func readNames(t *testing.T) []string {
@@ -41,6 +43,16 @@ func TestSenderRegisterUpdateClose(t *testing.T) {
 	}
 	if s.Name != name || !slices.Contains(readNames(t), name) {
 		t.Fatalf("not registered: %q in %v", s.Name, readNames(t))
+	}
+	// The sync objects exist by the time the name is visible.
+	mn, _ := windows.UTF16PtrFromString(name + "_SpoutAccessMutex")
+	if h, err := windows.OpenMutex(windows.SYNCHRONIZE, false, mn); err != nil {
+		t.Fatalf("access mutex missing: %v", err)
+	} else {
+		windows.CloseHandle(h)
+	}
+	if s.frameSem == 0 {
+		t.Fatal("frame-count semaphore missing")
 	}
 	if info := readInfo(t, name); info.ShareHandle != 0x1234 || info.Width != 1920 || info.Height != 1080 || info.Format != 87 || CString(info.Description[:]) == "" {
 		t.Fatalf("info = %+v", info)

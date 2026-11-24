@@ -144,8 +144,13 @@ func NewSender(name string, handle, w, h, format uint32) (*Sender, error) {
 	if exe, err := os.Executable(); err == nil {
 		s.rec.SetDescription(exe)
 	}
-	// Info first, then the name: a receiver that sees the name can read it.
-	if s.info, err = createShm(final, InfoSize); err == nil {
+	// Sync objects, then info, then the name: a receiver that sees the
+	// name finds everything it opens already in place.
+	err = s.createSyncObjects()
+	if err == nil {
+		s.info, err = createShm(final, InfoSize)
+	}
+	if err == nil {
 		err = s.writeInfo()
 	}
 	if err == nil {
@@ -162,13 +167,31 @@ func NewSender(name string, handle, w, h, format uint32) (*Sender, error) {
 	EncodeNames(names.bytes(), live)
 	names.unlock()
 	s.setActive(final)
-
-	an, _ := windows.UTF16PtrFromString(final + "_SpoutAccessMutex")
-	s.access, _ = windows.CreateMutex(nil, false, an)
-	sn, _ := windows.UTF16PtrFromString(final + "_Count_Semaphore")
-	r, _, _ := procCreateSemaphoreW.Call(0, 1, math.MaxInt32, uintptr(unsafe.Pointer(sn)))
-	s.frameSem = windows.Handle(r)
 	return s, nil
+}
+
+// createSyncObjects creates (or opens) the texture access mutex and the
+// frame-count semaphore for s.Name.
+func (s *Sender) createSyncObjects() error {
+	an, err := windows.UTF16PtrFromString(s.Name + "_SpoutAccessMutex")
+	if err != nil {
+		return err
+	}
+	// CreateMutex returns a valid handle with ERROR_ALREADY_EXISTS when a
+	// receiver created it first; only a zero handle is a failure.
+	if s.access, err = windows.CreateMutex(nil, false, an); s.access == 0 {
+		return fmt.Errorf("spout: access mutex: %w", err)
+	}
+	sn, err := windows.UTF16PtrFromString(s.Name + "_Count_Semaphore")
+	if err != nil {
+		return err
+	}
+	r, _, e := procCreateSemaphoreW.Call(0, 1, math.MaxInt32, uintptr(unsafe.Pointer(sn)))
+	if r == 0 {
+		return fmt.Errorf("spout: frame-count semaphore: %w", e)
+	}
+	s.frameSem = windows.Handle(r)
+	return nil
 }
 
 func containsName(list []string, n string) bool {
