@@ -69,6 +69,12 @@ func (o *SpoutOutput) Err() error {
 	return o.err
 }
 
+func (o *SpoutOutput) countBusy() {
+	o.mu.Lock()
+	o.busy++
+	o.mu.Unlock()
+}
+
 // spoutGPU is the sender thread's private D3D11 state.
 type spoutGPU struct {
 	dev     win.Device
@@ -151,12 +157,15 @@ func newSpoutGPU() (*spoutGPU, error) {
 	return g, nil
 }
 
-// ensureShared (re)creates the BGRA shared texture for a w x h output.
-// changed reports a new share handle.
-func (g *spoutGPU) ensureShared(w, h int) (changed bool, err error) {
-	if g.shared != 0 && g.outW == w && g.outH == h {
-		return false, nil
-	}
+// needsResize reports whether a w x h frame needs a new shared texture.
+func (g *spoutGPU) needsResize(w, h int) bool {
+	return g.shared == 0 || g.outW != w || g.outH != h
+}
+
+// createShared releases the current shared texture and creates a w x h
+// one. Once a sender exists, call it only while holding the access mutex
+// with the published share handle already zeroed.
+func (g *spoutGPU) createShared(w, h int) error {
 	g.releaseShared()
 	tex, err := g.dev.CreateTexture2D(&win.Texture2DDesc{
 		Width: uint32(w), Height: uint32(h), MipLevels: 1, ArraySize: 1,
@@ -167,24 +176,21 @@ func (g *spoutGPU) ensureShared(w, h int) (changed bool, err error) {
 		MiscFlags:   win.D3D11_RESOURCE_MISC_SHARED,
 	})
 	if err != nil {
-		return false, fmt.Errorf("spout: shared texture %dx%d: %w", w, h, err)
+		return fmt.Errorf("spout: shared texture %dx%d: %w", w, h, err)
 	}
 	rtv, err := g.dev.CreateRenderTargetView(tex)
 	if err != nil {
 		tex.Release()
-		return false, fmt.Errorf("spout: RTV: %w", err)
+		return fmt.Errorf("spout: RTV: %w", err)
 	}
 	handle, err := win.GetSharedHandle(tex)
 	if err != nil || handle == 0 || handle > 0xFFFFFFFF {
 		rtv.Release()
 		tex.Release()
-		return false, fmt.Errorf("spout: shared handle 0x%x: %v", handle, err)
+		return fmt.Errorf("spout: shared handle 0x%x: %v", handle, err)
 	}
 	g.shared, g.rtv, g.handle, g.outW, g.outH = tex, rtv, uint32(handle), w, h
-	// Make the (cleared) texture exist on the GPU before receivers open it.
-	g.ctx.ClearRenderTargetView(rtv, &[4]float32{0, 0, 0, 1})
-	g.ctx.Flush()
-	return true, nil
+	return nil
 }
 
 // upload copies a staged frame into the source textures.
@@ -296,32 +302,50 @@ func (o *SpoutOutput) run(ready chan<- error) {
 			fail(err)
 			return
 		}
-		changed, err := g.ensureShared(w, h)
-		if err != nil {
-			fail(err)
-			return
-		}
-		if sender == nil {
+		switch {
+		case sender == nil:
+			// Nobody knows a texture yet: create and draw it, then register.
+			if err := g.createShared(w, h); err != nil {
+				fail(err)
+				return
+			}
+			g.draw()
 			sender, err = spout.NewSender(o.name, g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM)
 			if err != nil {
 				fail(err)
 				return
 			}
 			fmt.Printf("spout: sending as %q (%dx%d BGRA)\n", sender.Name, w, h)
-		} else if changed {
-			if err := sender.Update(g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM); err != nil {
+		case g.needsResize(w, h):
+			// Resize under the access mutex: unpublish the old handle, free
+			// the old texture, create and draw the new one, publish it. On a
+			// timeout the old texture stays published; retry next frame.
+			if !sender.LockTexture() {
+				o.countBusy()
+				continue
+			}
+			err := sender.Update(0, 0, 0, win.DXGI_FORMAT_B8G8R8A8_UNORM)
+			if err == nil {
+				err = g.createShared(w, h)
+			}
+			if err == nil {
+				g.draw()
+				err = sender.Update(g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM)
+			}
+			sender.UnlockTexture()
+			if err != nil {
 				fail(err)
 				return
 			}
+			fmt.Printf("spout: resized to %dx%d\n", w, h)
+		default:
+			if !sender.LockTexture() {
+				o.countBusy()
+				continue
+			}
+			g.draw()
+			sender.UnlockTexture()
 		}
-		if !sender.LockTexture() {
-			o.mu.Lock()
-			o.busy++
-			o.mu.Unlock()
-			continue
-		}
-		g.draw()
-		sender.UnlockTexture()
 		done := win.QPC()
 		o.mu.Lock()
 		o.sent++
