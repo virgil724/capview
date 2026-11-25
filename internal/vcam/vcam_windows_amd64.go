@@ -339,7 +339,8 @@ func (c *Controller) getFPS() float64 {
 // Start opens shared memory, optionally starts MFCreateVirtualCamera (on Win11 MF mode),
 // and pumps frames from tap into shared memory.
 // In DirectShow mode (Win10 or BackendDShow), MFCreateVirtualCamera is never called:
-// Start sets SHM Active=1 and pumps frames; Stop sets Active=0 so the resident
+// Start opens SHM (Active=0 until the first WriteNV12) and pumps frames through the
+// shared avsync VideoDelayQueue; Stop clears delayQ and sets Active=0 so the resident
 // DirectShow filter immediately outputs the dark "capview" placeholder.
 func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 	if tap == nil {
@@ -456,6 +457,11 @@ func (c *Controller) runMF(friendlyName string, ready chan<- error) {
 
 func (c *Controller) runPump() {
 	defer close(c.pumpDone)
+	defer func() {
+		if c.delayQ != nil {
+			c.delayQ.Reset()
+		}
+	}()
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	stopTimer := func() {

@@ -6,10 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/win"
 	"golang.org/x/sys/windows"
@@ -204,6 +206,313 @@ func TestDShowControllerLifecycle(t *testing.T) {
 	if got := atomic.LoadUint32(&obsHdr.Active); got != 0 {
 		t.Fatalf("SHM Active after Stop = %d, want 0 (triggers DShow placeholder)", got)
 	}
+}
+
+func TestDShowControllerAVSyncDelayPath(t *testing.T) {
+	freq := win.QPCFrequency()
+	if freq <= 0 {
+		freq = 10_000_000
+	}
+
+	syncCtrl := avsync.NewController(avsync.Options{
+		AutoEnabled: true,
+	})
+	syncCtrl.SetAudioMirrorActive(true)
+
+	tap := capture.NewTap()
+	ctrl, err := Start(tap, Options{
+		Backend: BackendDShow,
+		ShmMode: "local",
+		FPS:     60,
+		Sync:    syncCtrl,
+	})
+	if err != nil {
+		t.Fatalf("Start(BackendDShow): %v", err)
+	}
+	defer ctrl.Stop()
+
+	if st := ctrl.Stats(); st.Backend != BackendDShow {
+		t.Fatalf("Stats().Backend = %q, want %q", st.Backend, BackendDShow)
+	}
+	if ctrl.SymbolicLink() != "" {
+		t.Fatalf("BackendDShow must not call MFCreateVirtualCamera (got symbolicLink=%q)", ctrl.SymbolicLink())
+	}
+	if snap := syncCtrl.Snapshot(); !snap.VcamActive {
+		t.Fatal("expected avsync SinkVcam to be active after BackendDShow Start")
+	}
+
+	// Open observer mapping over the full SHM region to inspect Active and slot payload bytes.
+	obsMap, err := win.OpenNamedFileMapping(ShmLocalName)
+	if err != nil {
+		t.Fatalf("OpenNamedFileMapping(%s): %v", ShmLocalName, err)
+	}
+	defer windows.CloseHandle(obsMap)
+	obsAddr, obsBuf, err := win.MapViewReadWrite(obsMap, uintptr(ShmTotalSize))
+	if err != nil {
+		t.Fatalf("MapViewReadWrite observer: %v", err)
+	}
+	defer win.UnmapView(obsAddr)
+	obsHdr := headerFromBytes(obsBuf)
+
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 0 {
+		t.Fatalf("SHM Active before first WriteNV12 = %d, want 0", got)
+	}
+
+	const w, h = 128, 64
+	makeNV12 := func(yVal byte) ([]byte, []byte) {
+		y := make([]byte, w*h)
+		uv := make([]byte, w*(h/2))
+		for i := range y {
+			y[i] = yVal
+		}
+		for i := range uv {
+			uv[i] = 128
+		}
+		return y, uv
+	}
+	latestLuma := func() (uint64, byte) {
+		seq := atomic.LoadUint64(&obsHdr.Seq)
+		slot := atomic.LoadUint32(&obsHdr.LatestSlot)
+		return seq, obsBuf[SlotOffset(slot)]
+	}
+
+	// Prime avsync with 6 audio + video samples (audio baseline ~65 ms -> video delay ~60 ms).
+	yWarm, uvWarm := makeNV12(100)
+	for i := 0; i < 6; i++ {
+		qpc := win.QPC()
+		nowNS := avsync.QPCTicksToNS(qpc, freq)
+		syncCtrl.ReportAudioMirror(15, 25, 15, 10, nowNS) // 65 ms baseline
+		tap.WriteFrame(capture.Frame{
+			Width:     w,
+			Height:    h,
+			FourCC:    "NV12",
+			Plane0:    yWarm,
+			Stride0:   w,
+			Plane1:    uvWarm,
+			Stride1:   w,
+			ArriveQPC: qpc,
+		})
+		time.Sleep(16 * time.Millisecond)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		snap := syncCtrl.Snapshot()
+		if snap.VcamSamples >= 6 && syncCtrl.VideoDelayNS(avsync.SinkVcam) > 40*int64(time.Millisecond) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	snap := syncCtrl.Snapshot()
+	if snap.VcamSamples < 6 {
+		t.Fatalf("expected ReportVideoEmit to record >=6 samples, got %d", snap.VcamSamples)
+	}
+	delayNS := syncCtrl.VideoDelayNS(avsync.SinkVcam)
+	if delayNS <= 40*int64(time.Millisecond) {
+		t.Fatalf("expected avsync VideoDelayNS(SinkVcam) > 40ms, got %.2fms (snap=%+v)",
+			avsync.NSToMS(delayNS), snap)
+	}
+
+	// Drain any queued warmup frames before measuring the tagged frame delay.
+	time.Sleep(100 * time.Millisecond)
+
+	// Push a tagged NV12 frame (Y=211) and verify VideoDelayQueue holds it before emitting to SHM.
+	yTag, uvTag := makeNV12(211)
+	arriveQPC := win.QPC()
+	tap.WriteFrame(capture.Frame{
+		Width:     w,
+		Height:    h,
+		FourCC:    "NV12",
+		Plane0:    yTag,
+		Stride0:   w,
+		Plane1:    uvTag,
+		Stride1:   w,
+		ArriveQPC: arriveQPC,
+	})
+
+	// Must NOT be emitted immediately while ~60ms delay is active.
+	time.Sleep(10 * time.Millisecond)
+	if _, luma := latestLuma(); luma == 211 {
+		t.Fatalf("tagged frame reached SHM after only 10ms despite %.1fms avsync delay", avsync.NSToMS(delayNS))
+	}
+
+	// Wait for delayed delivery into SHM.
+	var emitQPC int64
+	emitDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(emitDeadline) {
+		if _, luma := latestLuma(); luma == 211 {
+			emitQPC = win.QPC()
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if emitQPC == 0 {
+		t.Fatalf("tagged delayed frame (Y=211) never arrived in SHM")
+	}
+	elapsedNS := avsync.QPCTicksToNS(emitQPC-arriveQPC, freq)
+	minExpectedNS := delayNS - 15*int64(time.Millisecond)
+	if elapsedNS < minExpectedNS {
+		t.Fatalf("delayed frame emitted too early: elapsed=%.2fms, want >= %.2fms (delay=%.2fms)",
+			avsync.NSToMS(elapsedNS), avsync.NSToMS(minExpectedNS), avsync.NSToMS(delayNS))
+	}
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 1 {
+		t.Fatalf("SHM Active after delayed WriteNV12 = %d, want 1", got)
+	}
+
+	// Verify SetFPS updates Controller/avsync and propagates to SHM header on next emitted frame.
+	ctrl.SetFPS(120)
+	if got := ctrl.getFPS(); got != 120 {
+		t.Fatalf("Controller.getFPS() after SetFPS(120) = %v, want 120", got)
+	}
+	if num, den := ctrl.shm.fpsNum.Load(), ctrl.shm.fpsDen.Load(); num == 0 || den == 0 || float64(num)/float64(den) != 120 {
+		t.Fatalf("ShmWriter FPS rational after SetFPS(120) = %d/%d, want 120/1", num, den)
+	}
+	y120, uv120 := makeNV12(222)
+	tap.WriteFrame(capture.Frame{
+		Width:     w,
+		Height:    h,
+		FourCC:    "NV12",
+		Plane0:    y120,
+		Stride0:   w,
+		Plane1:    uv120,
+		Stride1:   w,
+		ArriveQPC: win.QPC(),
+	})
+	fpsDeadline := time.Now().Add(time.Second)
+	for time.Now().Before(fpsDeadline) {
+		if _, luma := latestLuma(); luma == 222 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if _, luma := latestLuma(); luma != 222 {
+		t.Fatal("frame after SetFPS(120) never arrived in SHM")
+	}
+	if num, den := atomic.LoadUint32(&obsHdr.FPSNum), atomic.LoadUint32(&obsHdr.FPSDen); num == 0 || den == 0 || float64(num)/float64(den) != 120 {
+		t.Fatalf("SHM header FPS rational after SetFPS(120) frame = %d/%d, want 120/1", num, den)
+	}
+
+	// Queue one more delayed frame and Stop() before it releases: delayQ must clear and Active -> 0.
+	yPending, uvPending := makeNV12(233)
+	tap.WriteFrame(capture.Frame{
+		Width:     w,
+		Height:    h,
+		FourCC:    "NV12",
+		Plane0:    yPending,
+		Stride0:   w,
+		Plane1:    uvPending,
+		Stride1:   w,
+		ArriveQPC: win.QPC(),
+	})
+	time.Sleep(10 * time.Millisecond)
+
+	ctrl.Stop()
+	if tap.Enabled() {
+		t.Fatal("expected capture tap to be disabled after Stop")
+	}
+	if snap := syncCtrl.Snapshot(); snap.VcamActive {
+		t.Fatal("expected avsync SinkVcam to be inactive after Stop")
+	}
+	if got := ctrl.delayQ.Len(); got != 0 {
+		t.Fatalf("delayQ.Len() after Stop = %d, want 0", got)
+	}
+	if got := atomic.LoadUint32(&obsHdr.Active); got != 0 {
+		t.Fatalf("SHM Active after Stop = %d, want 0 (triggers DShow placeholder)", got)
+	}
+}
+
+// TestDShowSyntheticMailboxAVSyncNonBlocking exercises the full non-admin
+// synthetic -> Mailbox.AddSink -> avsync.VideoDelayQueue -> ShmWriter pipeline
+// under BackendDShow and reports display-side take/release latency.
+func TestDShowSyntheticMailboxAVSyncNonBlocking(t *testing.T) {
+	freq := win.QPCFrequency()
+	if freq <= 0 {
+		freq = 10_000_000
+	}
+
+	mb := capture.NewMailbox()
+	defer mb.Close()
+	tap := capture.NewTap()
+	mb.AddSink(tap)
+	defer mb.RemoveSink(tap)
+
+	syncCtrl := avsync.NewController(avsync.Options{
+		AutoEnabled: true,
+	})
+	syncCtrl.SetAudioMirrorActive(true)
+
+	ctrl, err := Start(tap, Options{
+		Backend: BackendDShow,
+		ShmMode: "local",
+		FPS:     60,
+		Sync:    syncCtrl,
+	})
+	if err != nil {
+		t.Fatalf("Start(BackendDShow): %v", err)
+	}
+
+	src, err := capture.StartSynthetic(capture.Config{
+		Width:   1920,
+		Height:  1080,
+		FPS:     60,
+		Format:  "NV12",
+		Mailbox: mb,
+	}, freq)
+	if err != nil {
+		ctrl.Stop()
+		t.Fatalf("StartSynthetic: %v", err)
+	}
+
+	// Feed realistic audio mirror baseline (~55 ms) alongside synthetic video for 1.5s.
+	const runDur = 1500 * time.Millisecond
+	deadline := time.Now().Add(runDur)
+	takeSamplesUS := make([]float64, 0, 128)
+	var displayFrames int
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-mb.Notify():
+			f := mb.Take()
+			if f == nil {
+				continue
+			}
+			nowQPC := win.QPC()
+			arrToTakeUS := float64(nowQPC-f.ArriveQPC) * 1e6 / float64(freq)
+			if arrToTakeUS >= 0 {
+				takeSamplesUS = append(takeSamplesUS, arrToTakeUS)
+			}
+			// Simulate immediate display handoff releasing frame before deferred fan-out copies.
+			f.Release()
+			displayFrames++
+			syncCtrl.ReportAudioMirror(15, 25, 10, 5, avsync.QPCTicksToNS(nowQPC, freq))
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	src.Stop()
+	st := ctrl.Stats()
+	snapBeforeStop := syncCtrl.Snapshot()
+	ctrl.Stop()
+
+	if displayFrames < 40 {
+		t.Fatalf("expected >=40 synthetic display frames in %v, got %d", runDur, displayFrames)
+	}
+	if st.FramesWritten < 30 {
+		t.Fatalf("expected >=30 DShow SHM frames written, got %d", st.FramesWritten)
+	}
+	if snapBeforeStop.VcamDelayMS < 25 {
+		t.Fatalf("expected active avsync VcamDelayMS >= 25ms, got %.2fms (snap=%+v)", snapBeforeStop.VcamDelayMS, snapBeforeStop)
+	}
+	if tap.Dropped() > 5 {
+		t.Fatalf("excessive tap_dropped under DShow + avsync: %d", tap.Dropped())
+	}
+
+	slices.Sort(takeSamplesUS)
+	p50 := takeSamplesUS[len(takeSamplesUS)/2]
+	p99 := takeSamplesUS[(len(takeSamplesUS)*99)/100]
+	t.Logf("BackendDShow synthetic 1080p60 + avsync (delay=%.1fms): display=%d shm_written=%d mb_drop=%d tap_drop=%d arr->take p50=%.1fus p99=%.1fus",
+		snapBeforeStop.VcamDelayMS, displayFrames, st.FramesWritten, mb.Dropped(), tap.Dropped(), p50, p99)
 }
 
 func TestDShowLiveShmEndToEnd(t *testing.T) {
