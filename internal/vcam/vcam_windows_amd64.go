@@ -465,6 +465,10 @@ func (c *Controller) runPump() {
 	}
 
 	drainReady := func() {
+		if c.delayQ.Len() == 0 {
+			stopTimer()
+			return
+		}
 		nowNS := avsync.QPCTicksToNS(win.QPC(), c.freq)
 		if f, ok := c.delayQ.PopReady(nowNS); ok {
 			tsHNS := qpcToHNS(f.ArriveQPC, c.freq)
@@ -481,6 +485,9 @@ func (c *Controller) runPump() {
 		case <-c.stopCh:
 			return
 		case <-c.tap.Notify():
+			// Drain any already-due head frame BEFORE pushing the new arrival so
+			// pushing at near-cap delay never evicts a frame that is ready to emit.
+			drainReady()
 			for {
 				tf := c.tap.Take()
 				if tf == nil {

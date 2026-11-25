@@ -4,10 +4,12 @@ package render
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/virgil724/capview/internal/avsync"
@@ -21,12 +23,12 @@ import (
 // touched): frames staged by a capture.RawTap are uploaded, converted to BGRA
 // with the viewer's NV12/YUY2 shaders and drawn into a legacy shared texture.
 type SpoutOutput struct {
-	name string
-	tap  *capture.RawTap
-	freq int64
-	log  bool
-	sync *avsync.Controller
-	fps  float64
+	name    string
+	tap     *capture.RawTap
+	freq    int64
+	log     bool
+	sync    *avsync.Controller
+	fpsBits atomic.Uint64
 
 	stop chan struct{}
 	done chan struct{}
@@ -35,6 +37,29 @@ type SpoutOutput struct {
 	err  error
 	sent uint64
 	busy uint64 // frames skipped because a receiver held the access mutex
+}
+
+func (o *SpoutOutput) getFPS() float64 {
+	v := math.Float64frombits(o.fpsBits.Load())
+	if v <= 0 {
+		return 60
+	}
+	return v
+}
+
+// SetFPS updates the nominal capture frame rate used by audience A/V sync
+// capping and telemetry for this Spout2 sender. Safe to call concurrently.
+func (o *SpoutOutput) SetFPS(fps float64) {
+	if o == nil || fps <= 0 {
+		return
+	}
+	o.fpsBits.Store(math.Float64bits(fps))
+	select {
+	case <-o.done:
+		return
+	default:
+	}
+	o.sync.SetVideoSinkActive(avsync.SinkSpout, true, fps)
 }
 
 // StartSpout initialises the device and shaders, then starts the sender
@@ -53,8 +78,9 @@ func StartSpoutWithSync(name string, tap *capture.RawTap, freq int64, printStats
 	if fps <= 0 {
 		fps = 60
 	}
-	o := &SpoutOutput{name: name, tap: tap, freq: freq, log: printStats, sync: syncCtrl, fps: fps,
+	o := &SpoutOutput{name: name, tap: tap, freq: freq, log: printStats, sync: syncCtrl,
 		stop: make(chan struct{}), done: make(chan struct{})}
+	o.fpsBits.Store(math.Float64bits(fps))
 	ready := make(chan error, 1)
 	go o.run(ready)
 	if err := <-ready; err != nil {
@@ -257,7 +283,7 @@ func (o *SpoutOutput) run(ready chan<- error) {
 	if err != nil {
 		return
 	}
-	o.sync.SetVideoSinkActive(avsync.SinkSpout, true, o.fps)
+	o.sync.SetVideoSinkActive(avsync.SinkSpout, true, o.getFPS())
 	var sender *spout.Sender
 	defer func() {
 		o.sync.SetVideoSinkActive(avsync.SinkSpout, false, 0)
@@ -382,13 +408,17 @@ func (o *SpoutOutput) run(ready chan<- error) {
 			if o.sync != nil {
 				arriveNS := avsync.QPCTicksToNS(arrive, o.freq)
 				doneNS := avsync.QPCTicksToNS(done, o.freq)
-				o.sync.ReportVideoEmit(avsync.SinkSpout, arriveNS, appliedDelayNS, doneNS, o.fps)
+				o.sync.ReportVideoEmit(avsync.SinkSpout, arriveNS, appliedDelayNS, doneNS, o.getFPS())
 			}
 		}
 		return true
 	}
 
 	drainReady := func() bool {
+		if delayQ.Len() == 0 {
+			stopRelTimer()
+			return true
+		}
 		nowNS := avsync.QPCTicksToNS(win.QPC(), o.freq)
 		if qf, ok := delayQ.PopReady(nowNS); ok {
 			p0, s0 := qf.Plane0()
@@ -426,6 +456,11 @@ func (o *SpoutOutput) run(ready chan<- error) {
 		case <-o.tap.Notify():
 		}
 
+		// Drain any already-due head frame BEFORE pushing the new arrival so
+		// pushing at near-cap delay never evicts a frame that is ready to emit.
+		if !drainReady() {
+			return
+		}
 		f := o.tap.Take()
 		if f == nil {
 			continue

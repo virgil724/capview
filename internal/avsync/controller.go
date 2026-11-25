@@ -313,6 +313,9 @@ func (c *Controller) SetVideoSinkActive(sink VideoSink, active bool, fps float64
 	st := &c.sinks[sink]
 	if fps > 0 {
 		st.fps = fps
+		if capMS := maxVideoDelayMS(fps); st.appliedMS > capMS {
+			st.appliedMS = capMS
+		}
 	}
 	if st.active == active {
 		return
@@ -397,6 +400,9 @@ func (c *Controller) ReportVideoEmit(sink VideoSink, arriveNS, appliedDelayNS, e
 	}
 	if fps > 0 {
 		st.fps = fps
+		if capMS := maxVideoDelayMS(fps); st.appliedMS > capMS {
+			st.appliedMS = capMS
+		}
 	}
 
 	procNS := (emitNS - arriveNS) - appliedDelayNS
@@ -518,12 +524,16 @@ func (c *Controller) resetAppliedLocked() {
 }
 
 // maxVideoDelayMS returns the maximum video delay representable by the bounded
-// 8-frame delay queue at fps (reserving 1 slot for consumer read/jitter headroom).
+// VideoDelayQueue at fps, reserving 1 slot for timer/scheduling jitter headroom.
 func maxVideoDelayMS(fps float64) float64 {
 	if fps <= 0 {
 		fps = 60
 	}
-	return float64(MaxDelayFrames) * 1000.0 / fps
+	maxFrames := MaxDelayFrames - 1
+	if maxFrames < 1 {
+		maxFrames = 1
+	}
+	return float64(maxFrames) * 1000.0 / fps
 }
 
 func (c *Controller) computeTargetsLocked() (wantAudioMS float64, wantVideoMS [numVideoSinks]float64, clamped [numVideoSinks]bool) {
@@ -674,7 +684,7 @@ func (c *Controller) recordClampLocked(sink VideoSink, isClamped bool) {
 		st.clampLogged = true
 		if c.logClamp != nil {
 			c.logClamp(fmt.Sprintf("avsync: video delay clamped to %d-frame cap (%.1f ms @ %.1f fps)",
-				MaxDelayFrames, maxVideoDelayMS(st.fps), st.fps))
+				MaxDelayFrames-1, maxVideoDelayMS(st.fps), st.fps))
 		}
 	}
 }

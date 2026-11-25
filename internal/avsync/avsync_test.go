@@ -258,26 +258,26 @@ func TestControllerSimultaneousVcamAndSpout(t *testing.T) {
 	}
 }
 
-func TestControllerClampToEightFrameCapLogsOnce(t *testing.T) {
+func TestControllerClampToFrameCapLogsOnce(t *testing.T) {
 	var logs []string
 	c := NewController(Options{
 		AutoEnabled: true,
 		LogClamp:    func(msg string) { logs = append(logs, msg) },
 	})
 	c.SetAudioMirrorActive(true)
-	c.SetVideoSinkActive(SinkVcam, true, 60)
-	c.SetManualOffsetMS(-150) // push desired video delay way past 8 frames (~133.3ms @ 60fps)
+	c.SetVideoSinkActive(SinkVcam, true, 120)
+	c.SetManualOffsetMS(-150) // push desired video delay past 15-frame cap (~125ms @ 120fps)
 
 	now := int64(1_000_000_000)
 	for i := 0; i < 20; i++ {
-		now += 16_666_667
-		c.ReportAudioMirror(10, 30, 10, 10, now) // 60ms -> +150 = 210ms desired
-		c.ReportVideoEmit(SinkVcam, now-1_666_667, 0, now, 60)
+		now += 8_333_333
+		c.ReportAudioMirror(10, 30, 10, 10, now) // 60ms + 150ms manual -> 210ms desired
+		c.ReportVideoEmit(SinkVcam, now-1_000_000, 0, now, 120)
 	}
 	gotMS := NSToMS(c.VideoDelayNS(SinkVcam))
-	wantCap := float64(MaxDelayFrames) * 1000.0 / 60.0
+	wantCap := float64(MaxDelayFrames-1) * 1000.0 / 120.0
 	if math.Abs(gotMS-wantCap) > 0.2 {
-		t.Fatalf("clamped video delay = %.2f ms, want %.2f ms", gotMS, wantCap)
+		t.Fatalf("clamped video delay @120fps = %.2f ms, want %.2f ms", gotMS, wantCap)
 	}
 	if len(logs) != 1 {
 		t.Fatalf("expected LogClamp called exactly once, got %d (%v)", len(logs), logs)
@@ -288,15 +288,16 @@ func TestControllerClampToEightFrameCapLogsOnce(t *testing.T) {
 }
 
 func TestVideoDelayQueueScheduleDropOldestAndCap(t *testing.T) {
-	q := NewVideoDelayQueue(0) // defaults to MaxDelayFrames (8)
+	q := NewVideoDelayQueue(0) // defaults to MaxDelayFrames (16)
 	if q.Cap() != MaxDelayFrames {
 		t.Fatalf("Cap() = %d, want %d", q.Cap(), MaxDelayFrames)
 	}
 
-	// Push 10 frames with 50ms delay -> oldest 2 must be dropped cleanly.
+	// Push MaxDelayFrames+2 frames with 300ms delay -> oldest 2 must be dropped cleanly.
 	const stepNS = 16_666_667
-	const delayNS = 50_000_000
-	for i := 1; i <= 10; i++ {
+	const delayNS = 300_000_000
+	total := MaxDelayFrames + 2
+	for i := 1; i <= total; i++ {
 		arr := int64(i) * stepNS
 		data := []byte{byte(i), 2, 3, 4, 5, 6}
 		q.Push("NV12", 2, 2, data, int64(i), int64(i), arr, delayNS, uint64(i))
@@ -308,7 +309,7 @@ func TestVideoDelayQueueScheduleDropOldestAndCap(t *testing.T) {
 		t.Fatalf("Dropped() = %d, want 2", q.Dropped())
 	}
 
-	// Head should be frame 3 (frames 1 & 2 dropped), due at 3*stepNS + 50ms.
+	// Head should be frame 3 (frames 1 & 2 dropped), due at 3*stepNS + delayNS.
 	nextRel, ok := q.NextReleaseNS()
 	wantRel := int64(3)*stepNS + delayNS
 	if !ok || nextRel != wantRel {
@@ -326,16 +327,139 @@ func TestVideoDelayQueueScheduleDropOldestAndCap(t *testing.T) {
 		t.Fatalf("PopReady at ReleaseNS returned %+v, %v", f, ok)
 	}
 
-	// Jump far ahead so frames 4..10 are all due -> returns newest (10), skips 6.
-	f, ok = q.PopReady(int64(10)*stepNS + delayNS + 1_000_000)
-	if !ok || f == nil || f.Seq != 10 || f.Data[0] != 10 {
+	// Jump far ahead so remaining frames are all due -> returns newest, skips rest.
+	f, ok = q.PopReady(int64(total)*stepNS + delayNS + 1_000_000)
+	if !ok || f == nil || f.Seq != uint64(total) || f.Data[0] != byte(total) {
 		t.Fatalf("PopReady catch-up returned %+v, %v", f, ok)
 	}
-	if q.Skipped() != 6 {
-		t.Fatalf("Skipped() = %d, want 6", q.Skipped())
+	wantSkipped := uint64(MaxDelayFrames - 2)
+	if q.Skipped() != wantSkipped {
+		t.Fatalf("Skipped() = %d, want %d", q.Skipped(), wantSkipped)
 	}
 	if q.Len() != 0 {
 		t.Fatalf("Len() after drain = %d, want 0", q.Len())
+	}
+}
+
+func TestVideoDelayQueueMonotonicBumpAppliedDelay(t *testing.T) {
+	q := NewVideoDelayQueue(MaxDelayFrames)
+	// Frame 1 arrives at t=100ms with 100ms delay -> ReleaseNS = 200ms.
+	q.Push("NV12", 2, 2, []byte{1, 0, 0, 0, 0, 0}, 1, 1, 100_000_000, 100_000_000, 1)
+	// Frame 2 arrives at t=116ms with target delay decreased to 60ms -> raw ReleaseNS=176ms < 200ms,
+	// so monotonic ordering bumps ReleaseNS to 200ms. AppliedDelayNS must reflect actual wait (84ms).
+	q.Push("NV12", 2, 2, []byte{2, 0, 0, 0, 0, 0}, 2, 2, 116_000_000, 60_000_000, 2)
+
+	// Pop frame 1 + frame 2 at t=200ms (PopReady returns newest due frame = frame 2).
+	f, ok := q.PopReady(200_000_000)
+	if !ok || f == nil || f.Seq != 2 {
+		t.Fatalf("expected frame 2 at 200ms, got %+v %v", f, ok)
+	}
+	wantApplied := f.ReleaseNS - f.ArriveNS // 200ms - 116ms = 84ms
+	if f.ReleaseNS != 200_000_000 || f.AppliedDelayNS != wantApplied || wantApplied != 84_000_000 {
+		t.Fatalf("monotonic bump AppliedDelayNS = %d, ReleaseNS = %d, want AppliedDelayNS = %d",
+			f.AppliedDelayNS, f.ReleaseNS, wantApplied)
+	}
+}
+
+func TestVideoDelayQueueNoStarvationAtCap60And120FPSAndModeSwitch(t *testing.T) {
+	// Simulate continuous arrivals at capped delay (modeling the vcam/Spout pump
+	// loop: armed release timer + drain-before-push on arrival, with +/-1.5ms
+	// timer/scheduling jitter) at 60fps, then switching live to 120fps.
+	// With MaxDelayFrames=16 and cap=(MaxDelayFrames-1)/fps, frames must emit
+	// steadily with zero cap starvation and zero dropped frames.
+	c := NewController(Options{AutoEnabled: true, ManualOffsetMS: -200})
+	c.SetAudioMirrorActive(true)
+	c.SetVideoSinkActive(SinkVcam, true, 60)
+	q := NewVideoDelayQueue(MaxDelayFrames)
+
+	runPhase := func(fps float64, stepNS int64, frames int, startNS int64, startSeq uint64) (emitted int, endNS int64) {
+		nowNS := startNS
+		jitterPattern := []int64{-1_500_000, 1_200_000, -800_000, 1_500_000, 0}
+		for i := 0; i < frames; i++ {
+			nextArrivalNS := nowNS + stepNS
+			// Fire armed release timer if a queued head frame becomes due before nextArrivalNS.
+			if nextRel, ok := q.NextReleaseNS(); ok && nextRel <= nextArrivalNS {
+				wakeNS := nextRel + 500_000 // +0.5ms OS timer wake latency
+				if wakeNS < nextArrivalNS {
+					if f, ok := q.PopReady(wakeNS); ok {
+						emitted++
+						c.ReportVideoEmit(SinkVcam, f.ArriveNS, f.AppliedDelayNS, wakeNS+300_000, fps)
+					}
+				}
+			}
+
+			nowNS = nextArrivalNS
+			evalNS := nowNS + jitterPattern[i%len(jitterPattern)]
+			c.ReportAudioMirror(10, 25, 17, 35, evalNS)
+
+			// Drain-before-push (mirrors vcam/Spout pump on <-tap.Notify()).
+			if f, ok := q.PopReady(evalNS); ok {
+				emitted++
+				c.ReportVideoEmit(SinkVcam, f.ArriveNS, f.AppliedDelayNS, evalNS+400_000, fps)
+			}
+			delayNS := c.VideoDelayNS(SinkVcam)
+			seq := startSeq + uint64(i)
+			q.Push("NV12", 2, 2, []byte{byte(seq), 0, 0, 0, 0, 0}, int64(seq), int64(seq), nowNS, delayNS, seq)
+			if f, ok := q.PopReady(evalNS); ok {
+				emitted++
+				c.ReportVideoEmit(SinkVcam, f.ArriveNS, f.AppliedDelayNS, evalNS+400_000, fps)
+			}
+		}
+		return emitted, nowNS
+	}
+
+	// Phase 1: 60 frames at 60fps under max cap delay (~250ms = 15 frames).
+	emitted60, nowNS := runPhase(60, 16_666_667, 60, 1_000_000_000, 1)
+	if q.Dropped() != 0 {
+		t.Fatalf("60fps capped run dropped %d frames, want 0", q.Dropped())
+	}
+	// 60 arrivals with 15 frames buffered in flight -> ~45 frames emitted.
+	if emitted60 < 42 {
+		t.Fatalf("60fps capped run emitted only %d frames (starvation!), want >=42", emitted60)
+	}
+
+	// Phase 2: live switch 60fps -> 120fps (GC553 1080p120). Cap shrinks from ~250ms to ~125ms.
+	c.SetVideoSinkActive(SinkVcam, true, 120)
+	if got := NSToMS(c.VideoDelayNS(SinkVcam)); got > maxVideoDelayMS(120)+0.01 {
+		t.Fatalf("after 60->120fps switch, applied delay = %.2fms exceeds 120fps cap %.2fms", got, maxVideoDelayMS(120))
+	}
+	q.Reset()
+	emitted120, _ := runPhase(120, 8_333_333, 120, nowNS, 100)
+	if q.Dropped() != 0 {
+		t.Fatalf("120fps capped run dropped %d frames, want 0", q.Dropped())
+	}
+	// 120 arrivals with 15 frames buffered in flight -> ~105 frames emitted.
+	if emitted120 < 100 {
+		t.Fatalf("120fps capped run emitted only %d frames (starvation!), want >=100", emitted120)
+	}
+}
+
+func TestControllerWarmupSkippedLocksCleanly(t *testing.T) {
+	// Verify that when ReportAudioMirror is withheld until the mirror ring is
+	// primed (~25ms), initial startup lock snaps directly to true steady-state
+	// audio latency (~87ms) instead of being pulled down by 0ms warmup samples.
+	c := NewController(Options{AutoEnabled: true})
+	c.SetAudioMirrorActive(true)
+	c.SetVideoSinkActive(SinkVcam, true, 60)
+
+	now := int64(1_000_000_000)
+	// First 3 ticks: audio mirror is not yet primed -> only video reports arrive.
+	for i := 0; i < 3; i++ {
+		now += 16_666_667
+		c.ReportVideoEmit(SinkVcam, now-500_000, 0, now, 60) // ~2.5ms
+	}
+	if got := c.VideoDelayNS(SinkVcam); got != 0 {
+		t.Fatalf("delay before audio primed = %v, want 0", got)
+	}
+	// Mirror primes at 25ms ring fill; 5 steady samples arrive (~87ms total).
+	for i := 0; i < initialLockSamples; i++ {
+		now += 16_666_667
+		c.ReportAudioMirror(10, 25, 17, 35, now) // 87.0ms
+		c.ReportVideoEmit(SinkVcam, now-500_000, 0, now, 60) // 2.5ms
+	}
+	gotMS := NSToMS(c.VideoDelayNS(SinkVcam))
+	if math.Abs(gotMS-84.5) > 0.5 {
+		t.Fatalf("initial lock after primed = %.2fms, want ~84.5ms", gotMS)
 	}
 }
 

@@ -591,13 +591,6 @@ func (p *Passthrough) runMirror(st *mirrorState, baseTargetFrames, baseMaxFrames
 		ringAvail, _, _ := ring.Stats()
 		extraFrames := 0
 		if p.sync != nil {
-			nowNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
-			capAgeMS := avsync.NSToMS(st.tap.lastCaptureAgeNS.Load())
-			ringMS := float64(ringAvail) * 1000.0 / float64(p.InputRate)
-			// Midpoint wait in the WASAPI render buffer for the chunk being written now:
-			// first sample plays after pad frames, last sample after pad+avail frames.
-			padMS := (float64(pad) + float64(avail)/2.0) * 1000.0 / float64(p.InputRate)
-			p.sync.ReportAudioMirror(capAgeMS, ringMS, padMS, streamLatMS, nowNS)
 			audioDelayMS := p.sync.AudioDelayMS()
 			if audioDelayMS > 0 {
 				extraFrames = int(math.Round(audioDelayMS * float64(p.InputRate) / 1000.0))
@@ -614,6 +607,28 @@ func (p *Passthrough) runMirror(st *mirrorState, baseTargetFrames, baseMaxFrames
 			// does not turn into a stream of tiny underruns.
 			if ringAvail >= primeFrames {
 				primed = true
+			}
+		}
+
+		// Only report mirror latency once primed so the ring's 0->target silence
+		// warmup does not pull down the EMA / initial startup lock-in estimate.
+		if primed && p.sync != nil {
+			nowNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
+			capAgeMS := avsync.NSToMS(st.tap.lastCaptureAgeNS.Load())
+			ringMS := float64(ringAvail) * 1000.0 / float64(p.InputRate)
+			// Midpoint wait in the WASAPI render buffer for the chunk being written now:
+			// first sample plays after pad frames, last sample after pad+avail frames.
+			padMS := (float64(pad) + float64(avail)/2.0) * 1000.0 / float64(p.InputRate)
+			p.sync.ReportAudioMirror(capAgeMS, ringMS, padMS, streamLatMS, nowNS)
+			audioDelayMS := p.sync.AudioDelayMS()
+			if audioDelayMS > 0 {
+				extraFrames = int(math.Round(audioDelayMS * float64(p.InputRate) / 1000.0))
+			} else {
+				extraFrames = 0
+			}
+			if extraFrames != lastExtraF {
+				ring.SetBounds(baseTargetFrames+extraFrames, baseMaxFrames+extraFrames)
+				lastExtraF = extraFrames
 			}
 		}
 		if primed {

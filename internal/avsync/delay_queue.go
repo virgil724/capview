@@ -3,9 +3,11 @@ package avsync
 import "sync/atomic"
 
 // MaxDelayFrames caps the number of pre-allocated staging frames held in a
-// VideoDelayQueue (~133 ms at 60 fps, ~24 MB for 1080p NV12). Memory is
-// allocated lazily on first Push, only when vcam or Spout2 is enabled.
-const MaxDelayFrames = 8
+// VideoDelayQueue (16 slots = 15 frames max delay + 1 jitter headroom slot:
+// ~125 ms at 120 fps or ~250 ms at 60 fps; ~48 MB worst-case for 1080p NV12).
+// Buffers are allocated lazily on first Push, ONLY when vcam/Spout2 is active
+// and delaying (0 MB allocated when off or at 0 ms delay).
+const MaxDelayFrames = 16
 
 // QueuedFrame is a self-contained copy of a video frame sitting in a
 // VideoDelayQueue slot. It NEVER holds any Media Foundation IMFSample or
@@ -119,6 +121,11 @@ func (q *VideoDelayQueue) Push(fourcc string, w, h int, data []byte, arriveQPC, 
 	}
 	q.lastRel = releaseNS
 
+	appliedDelayNS := releaseNS - arriveNS
+	if appliedDelayNS < 0 {
+		appliedDelayNS = 0
+	}
+
 	slot.FourCC = fourcc
 	slot.Width = w
 	slot.Height = h
@@ -126,7 +133,7 @@ func (q *VideoDelayQueue) Push(fourcc string, w, h int, data []byte, arriveQPC, 
 	slot.DeviceQPC = deviceQPC
 	slot.ArriveNS = arriveNS
 	slot.ReleaseNS = releaseNS
-	slot.AppliedDelayNS = delayNS
+	slot.AppliedDelayNS = appliedDelayNS
 	slot.Seq = seq
 	q.count++
 }

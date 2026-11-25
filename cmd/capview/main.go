@@ -677,15 +677,25 @@ func (h *appHost) switchVideoDevice(dev string) {
 	if err := h.startVideo("mf"); err != nil {
 		win.ShowErrorBox("capview", fmt.Sprintf("Failed to open %s:\n%v", dev, err))
 		h.cfg.Device = prev
-		if h.startVideo("mf") == nil && h.vcam != nil && h.vid != nil {
-			h.vcam.SetFPS(h.vid.Mode.FPS)
-			h.vcam.SetActive(true)
+		if h.startVideo("mf") == nil && h.vid != nil {
+			if h.vcam != nil {
+				h.vcam.SetFPS(h.vid.Mode.FPS)
+				h.vcam.SetActive(true)
+			}
+			if h.spout != nil {
+				h.spout.SetFPS(h.vid.Mode.FPS)
+			}
 		}
 		return
 	}
-	if h.vcam != nil && h.vid != nil {
-		h.vcam.SetFPS(h.vid.Mode.FPS)
-		h.vcam.SetActive(true)
+	if h.vid != nil {
+		if h.vcam != nil {
+			h.vcam.SetFPS(h.vid.Mode.FPS)
+			h.vcam.SetActive(true)
+		}
+		if h.spout != nil {
+			h.spout.SetFPS(h.vid.Mode.FPS)
+		}
 	}
 	_ = config.Save(h.cfgPath, h.cfg)
 }
@@ -702,15 +712,25 @@ func (h *appHost) switchVideoMode(m capture.Mode) {
 	if err := h.startVideo("mf"); err != nil {
 		win.ShowErrorBox("capview", fmt.Sprintf("Failed to switch to %s:\n%v", m, err))
 		h.cfg.Width, h.cfg.Height, h.cfg.FPS, h.cfg.Format = prevW, prevH, prevFPS, prevFmt
-		if h.startVideo("mf") == nil && h.vcam != nil && h.vid != nil {
-			h.vcam.SetFPS(h.vid.Mode.FPS)
-			h.vcam.SetActive(true)
+		if h.startVideo("mf") == nil && h.vid != nil {
+			if h.vcam != nil {
+				h.vcam.SetFPS(h.vid.Mode.FPS)
+				h.vcam.SetActive(true)
+			}
+			if h.spout != nil {
+				h.spout.SetFPS(h.vid.Mode.FPS)
+			}
 		}
 		return
 	}
-	if h.vcam != nil && h.vid != nil {
-		h.vcam.SetFPS(h.vid.Mode.FPS)
-		h.vcam.SetActive(true)
+	if h.vid != nil {
+		if h.vcam != nil {
+			h.vcam.SetFPS(h.vid.Mode.FPS)
+			h.vcam.SetActive(true)
+		}
+		if h.spout != nil {
+			h.spout.SetFPS(h.vid.Mode.FPS)
+		}
 	}
 	_ = config.Save(h.cfgPath, h.cfg)
 }
