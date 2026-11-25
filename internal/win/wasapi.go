@@ -67,8 +67,10 @@ const (
 	vtPropStoreGetValue       = 5 // IPropertyStore
 	vtACInitialize            = 3 // IAudioClient
 	vtACGetBufferSize         = 4
+	vtACGetStreamLatency      = 5
 	vtACGetPadding            = 6
 	vtACGetMixFormat          = 8
+	vtACGetDevicePeriod       = 9
 	vtACStart                 = 10
 	vtACStop                  = 11
 	vtACSetEventHandle        = 13
@@ -351,6 +353,19 @@ func (c *AudioClient) Padding() (int, error) {
 	var n uint32
 	err := hr(c.call(vtACGetPadding, uintptr(unsafe.Pointer(&n))))
 	return int(n), err
+}
+
+// StreamLatency returns IAudioClient::GetStreamLatency in 100ns (HNS) units.
+func (c *AudioClient) StreamLatency() (int64, error) {
+	var hns int64
+	err := hr(c.call(vtACGetStreamLatency, uintptr(unsafe.Pointer(&hns))))
+	return hns, err
+}
+
+// DevicePeriod returns IAudioClient::GetDevicePeriod (default, minimum) in 100ns (HNS) units.
+func (c *AudioClient) DevicePeriod() (defaultHNS, minHNS int64, err error) {
+	err = hr(c.call(vtACGetDevicePeriod, uintptr(unsafe.Pointer(&defaultHNS)), uintptr(unsafe.Pointer(&minHNS))))
+	return defaultHNS, minHNS, err
 }
 
 func (c *AudioClient) Service(iid *GUID) (Object, error) {

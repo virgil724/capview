@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+
+	"github.com/virgil724/capview/internal/avsync"
 )
 
 // Config configures audio passthrough.
@@ -18,6 +20,16 @@ type Config struct {
 	// MirrorID is an optional playback endpoint ID that receives a second
 	// copy of the audio (e.g. a virtual cable). Empty disables the mirror.
 	MirrorID string
+	// MirrorTargetMS optionally overrides the default audio mirror ring target
+	// fill duration in ms (<=0 uses MirrorTargetMS).
+	MirrorTargetMS int
+	// Sync is an optional audience A/V synchronization controller.
+	Sync *avsync.Controller
+	// SyntheticSyncTest generates a 48 kHz 1 Hz 33ms 1 kHz (-12 dBFS) sine beep
+	// pinned to SyncEpochQPC instead of reading from a physical WASAPI capture
+	// device, feeding both local playback and the audio mirror pipeline.
+	SyntheticSyncTest bool
+	SyncEpochQPC      int64
 }
 
 // Passthrough streams audio from a capture endpoint directly to a playback
@@ -29,8 +41,11 @@ type Passthrough struct {
 	InputRate  int
 	OutputRate int
 
-	ring  *Ring
-	tap   atomic.Pointer[mirrorTap] // non-nil while a mirror is running
+	ring           *Ring
+	sync           *avsync.Controller
+	freq           int64
+	mirrorTargetMS int
+	tap            atomic.Pointer[mirrorTap] // non-nil while a mirror is running
 	mirMu sync.Mutex                // serializes SetMirror; guards mir and mirClosed
 	mir   *mirrorState
 	// mirClosed is set (under mirMu) when the main passthrough loop exits;

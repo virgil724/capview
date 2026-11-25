@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/clock"
 )
 
@@ -48,9 +49,25 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 	var bufs [numSlots][]byte
 	var ySize, uvSize int
 	var templateTop0, templateTop1 []byte
+	var darkBuf, whiteBuf []byte
 
 	const barRows = 64
-	if fourcc == "NV12" {
+	if cfg.SyncTest {
+		if fourcc == "NV12" {
+			ySize = w * h
+			uvSize = w * (h / 2)
+			darkBuf = make([]byte, ySize+uvSize)
+			whiteBuf = make([]byte, ySize+uvSize)
+			fillSolidNV12(darkBuf[:ySize], darkBuf[ySize:], 16, 128, 128)
+			fillSolidNV12(whiteBuf[:ySize], whiteBuf[ySize:], 235, 128, 128)
+		} else {
+			frameSize := w * 2 * h
+			darkBuf = make([]byte, frameSize)
+			whiteBuf = make([]byte, frameSize)
+			fillSolidYUY2(darkBuf, w, h, 16, 128, 128)
+			fillSolidYUY2(whiteBuf, w, h, 235, 128, 128)
+		}
+	} else if fourcc == "NV12" {
 		ySize = w * h
 		uvSize = w * (h / 2)
 		for i := range bufs {
@@ -73,7 +90,11 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 		Mode:    Mode{Device: "synthetic", FourCC: fourcc, Width: w, Height: h, FPS: fps},
 		Mailbox: mb,
 	}
-	s.status.Store("synthetic")
+	if cfg.SyncTest {
+		s.status.Store("synthetic sync-test")
+	} else {
+		s.status.Store("synthetic")
+	}
 
 	var once sync.Once
 	go func() {
@@ -81,9 +102,17 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 			mb.Discard()
 			close(s.done)
 		})
-		startQPC := clock.Now()
+		startQPC := cfg.SyncEpochQPC
+		if startQPC <= 0 {
+			startQPC = clock.Now()
+		}
+		epochNS := avsync.QPCTicksToNS(startQPC, freq)
 		var frameIdx uint64
-		const tickerW = 16
+		const (
+			tickerW       = 16
+			syncPeriodNS  = 1_000_000_000
+			syncFlashDur  = 33_333_333 // ~2 frames @ 60 fps
+		)
 		for !s.stop.Load() {
 			nextQPC := startQPC + int64(float64(frameIdx+1)*float64(freq)/fps)
 			for !s.stop.Load() {
@@ -103,11 +132,48 @@ func StartSynthetic(cfg Config, freq int64) (*Source, error) {
 				break
 			}
 
+			var f Frame
+			if cfg.SyncTest {
+				now := clock.Now()
+				nowNS := avsync.QPCTicksToNS(now, freq)
+				relNS := nowNS - epochNS
+				flash := relNS >= 0 && (relNS%syncPeriodNS) < syncFlashDur
+				buf := darkBuf
+				if flash {
+					buf = whiteBuf
+				}
+				if fourcc == "NV12" {
+					f = Frame{
+						FourCC:    "NV12",
+						Width:     w,
+						Height:    h,
+						Plane0:    buf[:ySize:ySize],
+						Stride0:   w,
+						Plane1:    buf[ySize : ySize+uvSize : ySize+uvSize],
+						Stride1:   w,
+						ArriveQPC: now,
+						DeviceQPC: now,
+					}
+				} else {
+					f = Frame{
+						FourCC:    "YUY2",
+						Width:     w,
+						Height:    h,
+						Plane0:    buf,
+						Stride0:   w * 2,
+						ArriveQPC: now,
+						DeviceQPC: now,
+					}
+				}
+				mb.publish(f)
+				frameIdx++
+				continue
+			}
+
 			buf := bufs[frameIdx%numSlots]
 			barX := int((frameIdx * 16) % uint64(max(w-tickerW, 2)))
 			barX &^= 1
 
-			var f Frame
 			if fourcc == "NV12" {
 				yPlane := buf[:ySize:ySize]
 				uvPlane := buf[ySize : ySize+uvSize : ySize+uvSize]
@@ -196,6 +262,29 @@ func fillColorBarsNV12(yPlane, uvPlane []byte, w, h int) {
 	}
 	for row := 1; row < h/2; row++ {
 		copy(uvPlane[row*w:(row+1)*w], uvPlane[:w])
+	}
+}
+
+func fillSolidNV12(yPlane, uvPlane []byte, y, u, v byte) {
+	for i := range yPlane {
+		yPlane[i] = y
+	}
+	for i := 0; i+1 < len(uvPlane); i += 2 {
+		uvPlane[i] = u
+		uvPlane[i+1] = v
+	}
+}
+
+func fillSolidYUY2(buf []byte, w, h int, y, u, v byte) {
+	stride := w * 2
+	for x := 0; x < w; x += 2 {
+		buf[x*2+0] = y
+		buf[x*2+1] = u
+		buf[x*2+2] = y
+		buf[x*2+3] = v
+	}
+	for row := 1; row < h; row++ {
+		copy(buf[row*stride:(row+1)*stride], buf[:stride])
 	}
 }
 

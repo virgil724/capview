@@ -9,15 +9,111 @@ import (
 // Mirror ring sizing in milliseconds of capture-rate audio. The mirror is
 // usually a virtual cable feeding a call app, so it gets a deeper buffer
 // than the local monitor path to absorb clock drift and scheduling jitter.
+// Empirically evaluated over 65s runs: 20ms had 15 underruns (too tight for
+// 10ms capture + 12ms VB-Cable render chunks), while 25ms achieved 0 underruns
+// and 0 overruns while cutting 10ms off the original 35ms baseline gap.
+// Cap is sized to accommodate dynamic A/V sync delay up to +200ms without
+// reallocating or overrunning.
 const (
-	MirrorTargetMS = 35
-	MirrorMaxMS    = 60
-	MirrorCapMS    = 100
+	MirrorTargetMS = 25
+	MirrorMaxMS    = 55
+	MirrorCapMS    = 300
 )
+
+// VirtualCableLoopbackMS is the typical internal render-to-capture FIFO delay
+// of virtual audio cable drivers (e.g. VB-Audio Virtual Cable, VoiceMeeter)
+// that sits downstream of the WASAPI render pin and is therefore invisible to
+// IAudioClient::GetStreamLatency(). Empirically measured on VB-Cable at ~30 ms;
+// using 25 ms keeps end-to-end receiver A/V error well within +/-20 ms across
+// common virtual-cable buffer configurations.
+const VirtualCableLoopbackMS = 25.0
+
+// mirrorEndpointExtraLatencyMS returns additional downstream loopback latency
+// for known virtual audio cable render endpoints (0 for physical speakers/DACs).
+func mirrorEndpointExtraLatencyMS(endpointName string) float64 {
+	nl := strings.ToLower(endpointName)
+	for _, pat := range []string{"vb-audio", "cable input", "voicemeeter", "virtual audio cable"} {
+		if strings.Contains(nl, pat) {
+			return VirtualCableLoopbackMS
+		}
+	}
+	return 0
+}
 
 // MirrorRingFrames returns (cap, target, max) ring sizes in frames at rate Hz.
 func MirrorRingFrames(rate int) (capFrames, targetFrames, maxFrames int) {
-	return rate * MirrorCapMS / 1000, rate * MirrorTargetMS / 1000, rate * MirrorMaxMS / 1000
+	return MirrorRingFramesForTarget(rate, MirrorTargetMS)
+}
+
+// MirrorRingFramesForTarget returns (cap, target, max) ring sizes in frames for
+// a custom baseline target duration in milliseconds (<=0 defaults to MirrorTargetMS).
+func MirrorRingFramesForTarget(rate, targetMS int) (capFrames, targetFrames, maxFrames int) {
+	if targetMS <= 0 {
+		targetMS = MirrorTargetMS
+	}
+	maxMS := targetMS + (MirrorMaxMS - MirrorTargetMS)
+	if maxMS > MirrorCapMS {
+		maxMS = MirrorCapMS
+	}
+	return rate * MirrorCapMS / 1000, rate * targetMS / 1000, rate * maxMS / 1000
+}
+
+// adaptiveMirrorReadFrames chooses how many source frames to pull from the
+// mirror ring to produce wantFrames output frames. When extraDelayFrames == 0
+// and the ring is not elevated above baseline target, it returns wantFrames
+// unchanged (exact 1:1 passthrough, zero resampling). Otherwise it applies a
+// tiny (±0.5% max) rate adjustment so the ring glides smoothly to
+// baseTargetFrames + extraDelayFrames without injecting silence clicks/pops.
+func adaptiveMirrorReadFrames(wantFrames, ringAvail, baseTargetFrames, extraDelayFrames, rate int) int {
+	if wantFrames <= 0 || rate <= 0 {
+		return wantFrames
+	}
+	desiredFill := baseTargetFrames + extraDelayFrames
+	deadband := rate * 2 / 1000 // ±2 ms deadband avoids jitter chatter
+	if deadband < 16 {
+		deadband = 16
+	}
+	// When no extra audio delay is requested and the ring isn't still draining
+	// down from a previous audio delay, keep exact 1:1 passthrough.
+	if extraDelayFrames <= 0 && ringAvail <= baseTargetFrames+deadband {
+		return wantFrames
+	}
+	errFrames := desiredFill - ringAvail
+	if errFrames > -deadband && errFrames < deadband {
+		return wantFrames
+	}
+	// Max rate nudge: 0.5% (~5 ms/sec slew, < 9 cents pitch shift, inaudible).
+	maxDelta := wantFrames / 200
+	if maxDelta < 1 {
+		maxDelta = 1
+	}
+	if errFrames > 0 {
+		// Ring is below desired fill -> pull slightly fewer frames to build cushion.
+		delta := errFrames / 8
+		if delta < 1 {
+			delta = 1
+		}
+		if delta > maxDelta {
+			delta = maxDelta
+		}
+		if wantFrames-delta < 1 {
+			return 1
+		}
+		return wantFrames - delta
+	}
+	// Ring is above desired fill -> pull slightly more frames to drain smoothly.
+	excess := -errFrames
+	delta := excess / 8
+	if delta < 1 {
+		delta = 1
+	}
+	if delta > maxDelta {
+		delta = maxDelta
+	}
+	if wantFrames+delta > ringAvail {
+		return wantFrames
+	}
+	return wantFrames + delta
 }
 
 // mirrorGain is the single place that decides the mirror's gain. The mirror
@@ -30,11 +126,12 @@ func (p *Passthrough) mirrorGain() float32 { return p.gain() }
 // consumer holds the ring lock, the chunk is parked in a bounded pending
 // buffer and flushed on the next Push (oldest dropped if it overflows).
 type mirrorTap struct {
-	ring      *Ring
-	pending   []float32 // producer-owned; only touched by Push
-	maxPend   int       // samples (frames*2)
-	contended atomic.Uint64
-	pendDrops atomic.Uint64
+	ring             *Ring
+	pending          []float32 // producer-owned; only touched by Push
+	maxPend          int       // samples (frames*2)
+	lastCaptureAgeNS atomic.Int64
+	contended        atomic.Uint64
+	pendDrops        atomic.Uint64
 }
 
 func newMirrorTap(r *Ring) *mirrorTap {

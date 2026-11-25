@@ -19,6 +19,8 @@ type Config struct {
 	Format        string  // "auto" (NV12 preferred, then YUY2), "NV12", or "YUY2"
 	AutoReconnect bool    // automatically retry if signal drops or device resets
 	Mailbox       *Mailbox
+	SyncTest      bool  // synthetic mode: emit 1 Hz white flash pinned to SyncEpochQPC
+	SyncEpochQPC  int64 // shared QPC epoch for synchronized flash + beep test
 }
 
 // Mode is the native capture mode negotiated with the device.

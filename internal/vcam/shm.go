@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"unsafe"
+
+	"github.com/virgil724/capview/internal/avsync"
 )
 
 const (
@@ -93,6 +95,7 @@ type Options struct {
 	ShmMode            string // "auto" (default), "global", "file", "local"
 	FPS                float64
 	SkipMFRegistration bool
+	Sync               *avsync.Controller
 }
 
 // Stats reports runtime virtual camera metrics.

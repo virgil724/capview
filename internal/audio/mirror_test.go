@@ -4,11 +4,59 @@ import "testing"
 
 func TestMirrorRingFrames(t *testing.T) {
 	c, tg, mx := MirrorRingFrames(48000)
-	if c != 4800 || tg != 1680 || mx != 2880 {
-		t.Fatalf("MirrorRingFrames(48000) = %d,%d,%d; want 4800,1680,2880", c, tg, mx)
+	if c != 48000*MirrorCapMS/1000 || tg != 48000*MirrorTargetMS/1000 || mx != 48000*MirrorMaxMS/1000 {
+		t.Fatalf("MirrorRingFrames(48000) = %d,%d,%d; want %d,%d,%d",
+			c, tg, mx, 48000*MirrorCapMS/1000, 48000*MirrorTargetMS/1000, 48000*MirrorMaxMS/1000)
 	}
 	if !(tg < mx && mx < c) {
 		t.Fatal("expected target < max < cap")
+	}
+	// Custom target override (e.g. 35ms) preserves headroom and cap.
+	c35, tg35, mx35 := MirrorRingFramesForTarget(48000, 35)
+	if c35 != c || tg35 != 1680 || mx35 <= tg35 {
+		t.Fatalf("MirrorRingFramesForTarget(48000, 35) = %d,%d,%d", c35, tg35, mx35)
+	}
+}
+
+func TestAdaptiveMirrorReadFrames(t *testing.T) {
+	const rate = 48000
+	const base = 960 // 20ms
+	const want = 480 // 10ms chunk
+
+	// No extra delay, normal fill -> exact 1:1 passthrough.
+	if got := adaptiveMirrorReadFrames(want, base, base, 0, rate); got != want {
+		t.Fatalf("no delay normal fill = %d, want %d", got, want)
+	}
+	// Extra +30ms delay requested while ring is still at 20ms -> pull slightly fewer frames (<=0.5%).
+	extra := rate * 30 / 1000 // 1440 frames
+	got := adaptiveMirrorReadFrames(want, base, base, extra, rate)
+	if got >= want || got < want-want/200-1 {
+		t.Fatalf("build delay pull = %d, want slightly < %d", got, want)
+	}
+	// Extra delay dropped back to 0 while ring is still elevated at 50ms -> pull slightly more frames.
+	gotDrain := adaptiveMirrorReadFrames(want, base+extra, base, 0, rate)
+	if gotDrain <= want || gotDrain > want+want/200+1 {
+		t.Fatalf("drain delay pull = %d, want slightly > %d", gotDrain, want)
+	}
+	// Ring SetBounds updates target and max cleanly without overrunning.
+	r := NewRing(14400, base, 2400)
+	r.SetBounds(base+extra, 2400+extra)
+	r.Write(make([]float32, (base+extra+200)*2))
+	avail, over, _ := r.Stats()
+	if over != 0 || avail != base+extra+200 {
+		t.Fatalf("SetBounds ring write: avail=%d over=%d, want %d and 0", avail, over, base+extra+200)
+	}
+}
+
+func TestMirrorEndpointExtraLatencyMS(t *testing.T) {
+	if got := mirrorEndpointExtraLatencyMS("CABLE Input (VB-Audio Virtual Cable)"); got != VirtualCableLoopbackMS {
+		t.Fatalf("VB-Cable extra latency = %v, want %v", got, VirtualCableLoopbackMS)
+	}
+	if got := mirrorEndpointExtraLatencyMS("VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)"); got != VirtualCableLoopbackMS {
+		t.Fatalf("VoiceMeeter extra latency = %v, want %v", got, VirtualCableLoopbackMS)
+	}
+	if got := mirrorEndpointExtraLatencyMS("Speakers (FiiO BTR5 1.1)"); got != 0 {
+		t.Fatalf("physical speakers extra latency = %v, want 0", got)
 	}
 }
 

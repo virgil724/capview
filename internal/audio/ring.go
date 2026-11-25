@@ -137,6 +137,25 @@ func (r *Ring) Stats() (avail int, overruns, underruns uint64) {
 	return r.avail, r.overruns, r.underruns
 }
 
+// SetBounds dynamically adjusts targetFrames and maxFrames within [1, capFrames].
+// Used by audience audio mirror A/V sync to shift the ring target fill level
+// smoothly without reallocating or dropping audio.
+func (r *Ring) SetBounds(targetFrames, maxFrames int) {
+	r.mu.Lock()
+	if maxFrames <= 0 || maxFrames > r.capFrames {
+		maxFrames = r.capFrames
+	}
+	if targetFrames <= 0 {
+		targetFrames = 1
+	}
+	if targetFrames > maxFrames {
+		targetFrames = maxFrames
+	}
+	r.targetFrames = targetFrames
+	r.maxFrames = maxFrames
+	r.mu.Unlock()
+}
+
 // DecodeStereo converts raw capture bytes into interleaved stereo float32 [-1, 1].
 func DecodeStereo(raw []byte, frames int, f Format, dst []float32) []float32 {
 	need := frames * 2

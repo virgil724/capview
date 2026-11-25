@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/win"
@@ -303,6 +304,9 @@ func (w *ShmWriter) Close() {
 type Controller struct {
 	shm          *ShmWriter
 	tap          *capture.Tap
+	sync         *avsync.Controller
+	delayQ       *avsync.VideoDelayQueue
+	fpsBits      atomic.Uint64
 	stopCh       chan struct{}
 	pumpDone     chan struct{}
 	mfStopCh     chan struct{}
@@ -310,6 +314,14 @@ type Controller struct {
 	symbolicLink string
 	freq         int64
 	stopOnce     sync.Once
+}
+
+func (c *Controller) getFPS() float64 {
+	v := math.Float64frombits(c.fpsBits.Load())
+	if v <= 0 {
+		return 60
+	}
+	return v
 }
 
 // Start creates and starts the Windows 11 virtual camera (Session + CurrentUser)
@@ -342,10 +354,13 @@ func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 	c := &Controller{
 		shm:      shm,
 		tap:      tap,
+		sync:     opts.Sync,
+		delayQ:   avsync.NewVideoDelayQueue(avsync.MaxDelayFrames),
 		stopCh:   make(chan struct{}),
 		pumpDone: make(chan struct{}),
 		freq:     win.QPCFrequency(),
 	}
+	c.fpsBits.Store(math.Float64bits(opts.FPS))
 	if c.freq <= 0 {
 		c.freq = 10_000_000
 	}
@@ -361,6 +376,7 @@ func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 		}
 	}
 
+	c.sync.SetVideoSinkActive(avsync.SinkVcam, true, opts.FPS)
 	tap.SetEnabled(true)
 	go c.runPump()
 	return c, nil
@@ -414,6 +430,52 @@ func (c *Controller) runMF(friendlyName string, ready chan<- error) {
 
 func (c *Controller) runPump() {
 	defer close(c.pumpDone)
+	var timer *time.Timer
+	var timerC <-chan time.Time
+	stopTimer := func() {
+		if timer != nil {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timerC = nil
+		}
+	}
+	defer stopTimer()
+
+	armTimer := func(nowNS int64) {
+		nextRel, ok := c.delayQ.NextReleaseNS()
+		if !ok {
+			stopTimer()
+			return
+		}
+		waitNS := nextRel - nowNS
+		if waitNS < 0 {
+			waitNS = 0
+		}
+		if timer == nil {
+			timer = time.NewTimer(time.Duration(waitNS))
+		} else {
+			stopTimer()
+			timer.Reset(time.Duration(waitNS))
+		}
+		timerC = timer.C
+	}
+
+	drainReady := func() {
+		nowNS := avsync.QPCTicksToNS(win.QPC(), c.freq)
+		if f, ok := c.delayQ.PopReady(nowNS); ok {
+			tsHNS := qpcToHNS(f.ArriveQPC, c.freq)
+			_ = c.shm.WriteNV12(f.Data, f.Width, f.Height, tsHNS)
+			emitNS := avsync.QPCTicksToNS(win.QPC(), c.freq)
+			c.sync.ReportVideoEmit(avsync.SinkVcam, f.ArriveNS, f.AppliedDelayNS, emitNS, c.getFPS())
+			nowNS = emitNS
+		}
+		armTimer(nowNS)
+	}
+
 	for {
 		select {
 		case <-c.stopCh:
@@ -424,10 +486,23 @@ func (c *Controller) runPump() {
 				if tf == nil {
 					break
 				}
-				tsHNS := qpcToHNS(tf.ArriveQPC, c.freq)
-				_ = c.shm.WriteNV12(tf.Data, tf.Width, tf.Height, tsHNS)
+				delayNS := c.sync.VideoDelayNS(avsync.SinkVcam)
+				arriveNS := avsync.QPCTicksToNS(tf.ArriveQPC, c.freq)
+				if delayNS == 0 && c.delayQ.Len() == 0 {
+					tsHNS := qpcToHNS(tf.ArriveQPC, c.freq)
+					_ = c.shm.WriteNV12(tf.Data, tf.Width, tf.Height, tsHNS)
+					c.tap.Release()
+					emitNS := avsync.QPCTicksToNS(win.QPC(), c.freq)
+					c.sync.ReportVideoEmit(avsync.SinkVcam, arriveNS, 0, emitNS, c.getFPS())
+					continue
+				}
+				c.delayQ.Push(tf.FourCC, tf.Width, tf.Height, tf.Data, tf.ArriveQPC, tf.DeviceQPC, arriveNS, delayNS, tf.Seq)
 				c.tap.Release()
 			}
+			drainReady()
+		case <-timerC:
+			timerC = nil
+			drainReady()
 		}
 	}
 }
@@ -436,6 +511,10 @@ func (c *Controller) runPump() {
 func (c *Controller) SetFPS(fps float64) {
 	if c == nil || c.shm == nil {
 		return
+	}
+	if fps > 0 {
+		c.fpsBits.Store(math.Float64bits(fps))
+		c.sync.SetVideoSinkActive(avsync.SinkVcam, true, fps)
 	}
 	c.shm.SetFPS(fps)
 }
@@ -477,6 +556,7 @@ func (c *Controller) Stop() {
 		return
 	}
 	c.stopOnce.Do(func() {
+		c.sync.SetVideoSinkActive(avsync.SinkVcam, false, 0)
 		if c.tap != nil {
 			c.tap.SetEnabled(false)
 		}

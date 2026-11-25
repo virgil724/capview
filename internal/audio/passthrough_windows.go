@@ -5,10 +5,12 @@ package audio
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/win"
 	"golang.org/x/sys/windows"
 )
@@ -65,7 +67,13 @@ func Start(cfg Config) (*Passthrough, error) {
 		cfg.Volume = 1.0
 	}
 	p := &Passthrough{
-		done: make(chan struct{}),
+		sync:           cfg.Sync,
+		freq:           win.QPCFrequency(),
+		mirrorTargetMS: cfg.MirrorTargetMS,
+		done:           make(chan struct{}),
+	}
+	if p.freq <= 0 {
+		p.freq = 10_000_000
 	}
 	p.SetVolume(cfg.Volume)
 
@@ -98,20 +106,11 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 	defer win.COUninit()
 	defer p.closeMirror()
 
-	// Pick capture endpoint.
-	inEps, err := win.AudioEndpoints(win.ECapture)
-	if err != nil {
-		return fmt.Errorf("enum audio capture: %w", err)
-	}
-	inEp, ok := pickEndpoint(inEps, cfg.InputDevice, cfg.VideoHint)
-	if !ok {
-		return fmt.Errorf("no audio capture endpoint matching %q", cfg.InputDevice)
-	}
-	defer inEp.Device.Release()
-	p.InputName = inEp.Name
-
 	// Pick playback endpoint.
-	var outEp win.Endpoint
+	var (
+		outEp win.Endpoint
+		err   error
+	)
 	if strings.TrimSpace(cfg.OutputDevice) == "" || strings.EqualFold(cfg.OutputDevice, "default") {
 		outEp, err = win.DefaultAudioEndpoint(win.ERender)
 		if err != nil {
@@ -132,25 +131,13 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 	p.OutputName = outEp.Name
 	p.OutputID = outEp.ID
 
-	// Initialize shared event-driven WASAPI clients (20 ms buffer each).
+	// Initialize shared event-driven WASAPI playback client (20 ms buffer).
 	const bufHNS = 200_000
-	capClient, err := win.NewAudioClient(inEp.Device, bufHNS)
-	if err != nil {
-		return fmt.Errorf("open audio input %q: %w", inEp.Name, err)
-	}
-	defer capClient.Close()
-
 	renClient, err := win.NewAudioClient(outEp.Device, bufHNS)
 	if err != nil {
 		return fmt.Errorf("open audio output %q: %w", outEp.Name, err)
 	}
 	defer renClient.Close()
-
-	cc, err := capClient.Service(&win.IID_IAudioCaptureClient)
-	if err != nil {
-		return fmt.Errorf("capture service: %w", err)
-	}
-	defer cc.Release()
 
 	rc, err := renClient.Service(&win.IID_IAudioRenderClient)
 	if err != nil {
@@ -158,10 +145,39 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 	}
 	defer rc.Release()
 
-	inFmt := toFormat(capClient.Format)
 	outFmt := toFormat(renClient.Format)
-	p.InputRate = inFmt.Rate
 	p.OutputRate = outFmt.Rate
+
+	if cfg.SyntheticSyncTest {
+		return p.runSyntheticSyncTest(cfg, renClient, rc, outFmt, ready)
+	}
+
+	// Pick capture endpoint.
+	inEps, err := win.AudioEndpoints(win.ECapture)
+	if err != nil {
+		return fmt.Errorf("enum audio capture: %w", err)
+	}
+	inEp, ok := pickEndpoint(inEps, cfg.InputDevice, cfg.VideoHint)
+	if !ok {
+		return fmt.Errorf("no audio capture endpoint matching %q", cfg.InputDevice)
+	}
+	defer inEp.Device.Release()
+	p.InputName = inEp.Name
+
+	capClient, err := win.NewAudioClient(inEp.Device, bufHNS)
+	if err != nil {
+		return fmt.Errorf("open audio input %q: %w", inEp.Name, err)
+	}
+	defer capClient.Close()
+
+	cc, err := capClient.Service(&win.IID_IAudioCaptureClient)
+	if err != nil {
+		return fmt.Errorf("capture service: %w", err)
+	}
+	defer cc.Release()
+
+	inFmt := toFormat(capClient.Format)
+	p.InputRate = inFmt.Rate
 
 	// Ring buffer sized in output-rate frames: target ~15ms, max ~35ms, cap 100ms.
 	targetFrames := outFmt.Rate * 15 / 1000
@@ -225,6 +241,15 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 				// Mirror tap: capture-rate, before the local resampler. Push
 				// never waits on the mirror thread.
 				if t := p.tap.Load(); t != nil {
+					// Record capture-to-ring age using WASAPI pu64QPCPosition (100ns HNS units)
+					// converted to the common QPC nanosecond timebase.
+					if pk.Flags&win.BufferFlagsTimestampErr == 0 && pk.QPC > 0 {
+						nowNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
+						capNS := avsync.HNSToNS(pk.QPC)
+						if ageNS := nowNS - capNS; ageNS >= 0 && ageNS <= 150_000_000 {
+							t.lastCaptureAgeNS.Store(ageNS)
+						}
+					}
 					t.Push(decBuf)
 				}
 				samples := ResampleLinear(decBuf, inFmt.Rate, outFmt.Rate, resBuf)
@@ -237,6 +262,115 @@ func (p *Passthrough) run(cfg Config, ready chan<- error) error {
 		}
 
 		// Fill available space in playback buffer.
+		pad, err := renClient.Padding()
+		if err != nil {
+			continue
+		}
+		avail := renClient.Frames - pad
+		if avail <= 0 {
+			continue
+		}
+		buf, err := win.RenderBuffer(rc, avail, outFmt.BlockAlign)
+		if err != nil {
+			continue
+		}
+		need := avail * 2
+		if cap(renBuf) < need {
+			renBuf = make([]float32, need)
+		} else {
+			renBuf = renBuf[:need]
+		}
+		p.ring.Read(renBuf, p.gain())
+		EncodeStereo(renBuf, avail, outFmt, buf)
+		win.RenderRelease(rc, avail)
+	}
+	return nil
+}
+
+// runSyntheticSyncTest generates a 48 kHz stereo float32 stream pinned to
+// cfg.SyncEpochQPC: silence normally, emitting a clean 1 kHz sine beep
+// (-12 dBFS, 33.33 ms) at the exact start of every 1.000 s cycle, feeding both
+// local WASAPI playback and the audio mirror pipeline.
+func (p *Passthrough) runSyntheticSyncTest(cfg Config, renClient *win.AudioClient, rc win.Object, outFmt Format, ready chan<- error) error {
+	const (
+		synthRate   = 48000
+		pktFrames   = 480 // 10 ms packets, matching WASAPI shared capture cadence
+		beepFreqHz  = 1000.0
+		beepDurNS   = 33_333_333 // ~2 frames @ 60 fps
+		periodNS    = 1_000_000_000
+		beepAmp     = 0.25118864 // -12 dBFS
+	)
+	p.InputName = "synthetic-sync-test"
+	p.InputRate = synthRate
+
+	targetFrames := outFmt.Rate * 15 / 1000
+	maxFrames := outFmt.Rate * 35 / 1000
+	capFrames := outFmt.Rate * 100 / 1000
+	p.ring = NewRing(capFrames, targetFrames, maxFrames)
+
+	if buf, err := win.RenderBuffer(rc, renClient.Frames, outFmt.BlockAlign); err == nil {
+		clear(buf)
+		win.RenderRelease(rc, renClient.Frames)
+	}
+	if err := renClient.Start(); err != nil {
+		return fmt.Errorf("start audio playback: %w", err)
+	}
+	defer renClient.Stop()
+
+	ready <- nil
+
+	epochQPC := cfg.SyncEpochQPC
+	if epochQPC <= 0 {
+		epochQPC = win.QPC()
+	}
+	epochNS := avsync.QPCTicksToNS(epochQPC, p.freq)
+	startNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
+	var emittedSamples int64
+
+	decBuf := make([]float32, pktFrames*2)
+	var resBuf []float32
+	var renBuf []float32
+
+	for !p.stop.Load() {
+		_, _ = windows.WaitForSingleObject(renClient.Event, 5)
+
+		nowNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
+		elapsedNS := nowNS - startNS
+		if elapsedNS > 0 {
+			wantSamples := (elapsedNS * synthRate) / 1_000_000_000
+			// Emit complete 10ms packets up to nowNS (matching WASAPI capture cadence).
+			for wantSamples-emittedSamples >= pktFrames {
+				pktStartNS := startNS + (emittedSamples*1_000_000_000)/synthRate
+				for i := 0; i < pktFrames; i++ {
+					sampleNS := pktStartNS + (int64(i)*1_000_000_000)/synthRate
+					relNS := sampleNS - epochNS
+					var v float32
+					if relNS >= 0 {
+						phaseNS := relNS % periodNS
+						if phaseNS < beepDurNS {
+							v = float32(beepAmp * math.Sin(2*math.Pi*beepFreqHz*float64(phaseNS)*1e-9))
+						}
+					}
+					decBuf[i*2] = v
+					decBuf[i*2+1] = v
+				}
+				emittedSamples += pktFrames
+
+				if t := p.tap.Load(); t != nil {
+					if ageNS := nowNS - pktStartNS; ageNS >= 0 && ageNS <= 150_000_000 {
+						t.lastCaptureAgeNS.Store(ageNS)
+					}
+					t.Push(decBuf)
+				}
+				samples := ResampleLinear(decBuf, synthRate, outFmt.Rate, resBuf)
+				if synthRate != outFmt.Rate {
+					resBuf = samples
+				}
+				p.ring.Write(samples)
+			}
+		}
+
+		// Fill available space in local playback buffer.
 		pad, err := renClient.Padding()
 		if err != nil {
 			continue
@@ -340,7 +474,7 @@ func (p *Passthrough) startMirror(id string) (*mirrorState, error) {
 	if p.InputRate <= 0 {
 		return nil, errors.New("passthrough not running")
 	}
-	capF, targetF, maxF := MirrorRingFrames(p.InputRate)
+	capF, targetF, maxF := MirrorRingFramesForTarget(p.InputRate, p.mirrorTargetMS)
 	st := &mirrorState{
 		id:   id,
 		tap:  newMirrorTap(NewRing(capF, targetF, maxF)),
@@ -349,7 +483,7 @@ func (p *Passthrough) startMirror(id string) (*mirrorState, error) {
 	ready := make(chan error, 1)
 	go func() {
 		defer close(st.done)
-		err := p.runMirror(st, targetF, ready)
+		err := p.runMirror(st, targetF, maxF, ready)
 		p.tap.CompareAndSwap(st.tap, nil)
 		select {
 		case ready <- err: // failed before becoming ready
@@ -373,7 +507,7 @@ func (p *Passthrough) startMirror(id string) (*mirrorState, error) {
 // runMirror renders the mirror ring to its own WASAPI endpoint on a dedicated
 // COM thread. Any device error (notably AUDCLNT_E_DEVICE_INVALIDATED on
 // unplug) ends only this goroutine; the main passthrough is unaffected.
-func (p *Passthrough) runMirror(st *mirrorState, primeFrames int, ready chan<- error) error {
+func (p *Passthrough) runMirror(st *mirrorState, baseTargetFrames, baseMaxFrames int, ready chan<- error) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	if err := win.COInitMultithreaded(); err != nil {
@@ -409,11 +543,29 @@ func (p *Passthrough) runMirror(st *mirrorState, primeFrames int, ready chan<- e
 		return fmt.Errorf("start mirror output: %w", err)
 	}
 	defer cl.Stop()
+
+	var streamLatMS float64
+	if hns, err := cl.StreamLatency(); err == nil && hns > 0 {
+		streamLatMS = avsync.HNSToMS(hns)
+	} else if defHNS, _, err := cl.DevicePeriod(); err == nil && defHNS > 0 {
+		// On Windows 10/11 shared-mode streams (especially with AUTOCONVERTPCM),
+		// GetStreamLatency() often reports 0; use the shared audio engine period
+		// (~10 ms) as the floor engine latency.
+		streamLatMS = avsync.HNSToMS(defHNS)
+	}
+	streamLatMS += mirrorEndpointExtraLatencyMS(ep.Name)
+	p.sync.SetAudioMirrorActive(true)
+	defer p.sync.SetAudioMirrorActive(false)
+
 	ready <- nil
 
 	ring := st.tap.ring
-	var out []float32
-	primed := false
+	var (
+		out         []float32
+		srcBuf      []float32
+		primed      bool
+		lastExtraF  = -1
+	)
 	for !st.stop.Load() {
 		if _, err := windows.WaitForSingleObject(cl.Event, 50); err != nil {
 			return fmt.Errorf("wait mirror event: %w", err)
@@ -435,16 +587,51 @@ func (p *Passthrough) runMirror(st *mirrorState, primeFrames int, ready chan<- e
 			out = make([]float32, need)
 		}
 		out = out[:need]
+
+		ringAvail, _, _ := ring.Stats()
+		extraFrames := 0
+		if p.sync != nil {
+			nowNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
+			capAgeMS := avsync.NSToMS(st.tap.lastCaptureAgeNS.Load())
+			ringMS := float64(ringAvail) * 1000.0 / float64(p.InputRate)
+			// Midpoint wait in the WASAPI render buffer for the chunk being written now:
+			// first sample plays after pad frames, last sample after pad+avail frames.
+			padMS := (float64(pad) + float64(avail)/2.0) * 1000.0 / float64(p.InputRate)
+			p.sync.ReportAudioMirror(capAgeMS, ringMS, padMS, streamLatMS, nowNS)
+			audioDelayMS := p.sync.AudioDelayMS()
+			if audioDelayMS > 0 {
+				extraFrames = int(math.Round(audioDelayMS * float64(p.InputRate) / 1000.0))
+			}
+			if extraFrames != lastExtraF {
+				ring.SetBounds(baseTargetFrames+extraFrames, baseMaxFrames+extraFrames)
+				lastExtraF = extraFrames
+			}
+		}
+
+		primeFrames := baseTargetFrames + extraFrames
 		if !primed {
 			// (Re)build ~target ms of cushion before draining, so jitter
 			// does not turn into a stream of tiny underruns.
-			if n, _, _ := ring.Stats(); n >= primeFrames {
+			if ringAvail >= primeFrames {
 				primed = true
 			}
 		}
 		if primed {
-			if ring.Read(out, p.mirrorGain()) < avail {
-				primed = false
+			srcFrames := adaptiveMirrorReadFrames(avail, ringAvail, baseTargetFrames, extraFrames, p.InputRate)
+			if srcFrames == avail {
+				if ring.Read(out, p.mirrorGain()) < avail {
+					primed = false
+				}
+			} else {
+				srcNeed := srcFrames * 2
+				if cap(srcBuf) < srcNeed {
+					srcBuf = make([]float32, srcNeed)
+				}
+				srcBuf = srcBuf[:srcNeed]
+				if ring.Read(srcBuf, p.mirrorGain()) < srcFrames {
+					primed = false
+				}
+				out = ResampleLinear(srcBuf, srcFrames, avail, out)
 			}
 		} else {
 			clear(out)

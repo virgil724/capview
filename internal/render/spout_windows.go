@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/spout"
 	"github.com/virgil724/capview/internal/win"
@@ -24,6 +25,8 @@ type SpoutOutput struct {
 	tap  *capture.RawTap
 	freq int64
 	log  bool
+	sync *avsync.Controller
+	fps  float64
 
 	stop chan struct{}
 	done chan struct{}
@@ -38,10 +41,19 @@ type SpoutOutput struct {
 // thread. The sender is registered (and becomes visible to receivers) on the
 // first frame, when the size is known.
 func StartSpout(name string, tap *capture.RawTap, freq int64, printStats bool) (*SpoutOutput, error) {
+	return StartSpoutWithSync(name, tap, freq, printStats, nil, 60)
+}
+
+// StartSpoutWithSync starts a Spout2 sender wired into an optional audience
+// A/V sync controller.
+func StartSpoutWithSync(name string, tap *capture.RawTap, freq int64, printStats bool, syncCtrl *avsync.Controller, fps float64) (*SpoutOutput, error) {
 	if !spout.ValidName(name) {
 		return nil, fmt.Errorf("invalid Spout sender name %q", name)
 	}
-	o := &SpoutOutput{name: name, tap: tap, freq: freq, log: printStats,
+	if fps <= 0 {
+		fps = 60
+	}
+	o := &SpoutOutput{name: name, tap: tap, freq: freq, log: printStats, sync: syncCtrl, fps: fps,
 		stop: make(chan struct{}), done: make(chan struct{})}
 	ready := make(chan error, 1)
 	go o.run(ready)
@@ -194,26 +206,24 @@ func (g *spoutGPU) createShared(w, h int) error {
 }
 
 // upload copies a staged frame into the source textures.
-func (g *spoutGPU) upload(f *capture.TapFrame) error {
-	if f.Width != g.srcW || f.Height != g.srcH || f.FourCC != g.srcFmt {
+func (g *spoutGPU) upload(fourcc string, w, h int, p0 []byte, s0 int, p1 []byte, s1 int) error {
+	if w != g.srcW || h != g.srcH || fourcc != g.srcFmt {
 		g.releaseSource()
 		var err error
-		g.tex0, g.srv0, g.tex1, g.srv1, err = createVideoTextures(g.dev, f.FourCC, f.Width, f.Height)
+		g.tex0, g.srv0, g.tex1, g.srv1, err = createVideoTextures(g.dev, fourcc, w, h)
 		if err != nil {
 			g.srcW = 0
 			return err
 		}
-		g.srcW, g.srcH, g.srcFmt = f.Width, f.Height, f.FourCC
+		g.srcW, g.srcH, g.srcFmt = w, h, fourcc
 	}
-	p0, s0 := f.Plane0()
-	if f.FourCC == "NV12" {
-		if err := uploadPlane(g.ctx, g.tex0, p0, s0, f.Width, f.Height); err != nil {
+	if fourcc == "NV12" {
+		if err := uploadPlane(g.ctx, g.tex0, p0, s0, w, h); err != nil {
 			return err
 		}
-		p1, s1 := f.Plane1()
-		return uploadPlane(g.ctx, g.tex1, p1, s1, f.Width, f.Height/2)
+		return uploadPlane(g.ctx, g.tex1, p1, s1, w, h/2)
 	}
-	return uploadPlane(g.ctx, g.tex0, p0, s0, f.Width*2, f.Height)
+	return uploadPlane(g.ctx, g.tex0, p0, s0, w*2, h)
 }
 
 // draw converts the source textures into the shared texture.
@@ -247,8 +257,10 @@ func (o *SpoutOutput) run(ready chan<- error) {
 	if err != nil {
 		return
 	}
+	o.sync.SetVideoSinkActive(avsync.SinkSpout, true, o.fps)
 	var sender *spout.Sender
 	defer func() {
+		o.sync.SetVideoSinkActive(avsync.SinkSpout, false, 0)
 		o.tap.SetEnabled(false) // no consumer any more: stop copying
 		// Unregister first so receivers drop the sender before the texture dies.
 		if sender != nil {
@@ -268,10 +280,127 @@ func (o *SpoutOutput) run(ready chan<- error) {
 		fmt.Fprintln(os.Stderr, "spout:", err)
 	}
 
+	delayQ := avsync.NewVideoDelayQueue(avsync.MaxDelayFrames)
+	var relTimer *time.Timer
+	var relTimerC <-chan time.Time
+	stopRelTimer := func() {
+		if relTimer != nil {
+			if !relTimer.Stop() {
+				select {
+				case <-relTimer.C:
+				default:
+				}
+			}
+			relTimerC = nil
+		}
+	}
+	defer stopRelTimer()
+
+	armRelTimer := func(nowNS int64) {
+		nextRel, ok := delayQ.NextReleaseNS()
+		if !ok {
+			stopRelTimer()
+			return
+		}
+		waitNS := nextRel - nowNS
+		if waitNS < 0 {
+			waitNS = 0
+		}
+		if relTimer == nil {
+			relTimer = time.NewTimer(time.Duration(waitNS))
+		} else {
+			stopRelTimer()
+			relTimer.Reset(time.Duration(waitNS))
+		}
+		relTimerC = relTimer.C
+	}
+
 	var lat []float64 // arrival -> texture flushed, ms, since the last log line
 	logTick := time.NewTicker(time.Second)
 	defer logTick.Stop()
 	lastSent := uint64(0)
+
+	publishFrame := func(fourcc string, w, h int, p0 []byte, s0 int, p1 []byte, s1 int, arrive int64, appliedDelayNS int64, releaseTap func()) bool {
+		err := g.upload(fourcc, w, h, p0, s0, p1, s1)
+		if releaseTap != nil {
+			releaseTap() // staging slot back to capture; GPU has the copy
+		}
+		if err != nil {
+			fail(err)
+			return false
+		}
+		switch {
+		case sender == nil:
+			// Nobody knows a texture yet: create and draw it, then register.
+			if err := g.createShared(w, h); err != nil {
+				fail(err)
+				return false
+			}
+			g.draw()
+			sender, err = spout.NewSender(o.name, g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM)
+			if err != nil {
+				fail(err)
+				return false
+			}
+			fmt.Printf("spout: sending as %q (%dx%d BGRA)\n", sender.Name, w, h)
+		case g.needsResize(w, h):
+			// Resize under the access mutex: unpublish the old handle, free
+			// the old texture, create and draw the new one, publish it. On a
+			// timeout the old texture stays published; retry next frame.
+			if !sender.LockTexture() {
+				o.countBusy()
+				return true
+			}
+			err := sender.Update(0, 0, 0, win.DXGI_FORMAT_B8G8R8A8_UNORM)
+			if err == nil {
+				err = g.createShared(w, h)
+			}
+			if err == nil {
+				g.draw()
+				err = sender.Update(g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM)
+			}
+			sender.UnlockTexture()
+			if err != nil {
+				fail(err)
+				return false
+			}
+			fmt.Printf("spout: resized to %dx%d\n", w, h)
+		default:
+			if !sender.LockTexture() {
+				o.countBusy()
+				return true
+			}
+			g.draw()
+			sender.UnlockTexture()
+		}
+		done := win.QPC()
+		o.mu.Lock()
+		o.sent++
+		o.mu.Unlock()
+		if arrive > 0 && done >= arrive {
+			lat = append(lat, float64(done-arrive)*1000/float64(o.freq))
+			if o.sync != nil {
+				arriveNS := avsync.QPCTicksToNS(arrive, o.freq)
+				doneNS := avsync.QPCTicksToNS(done, o.freq)
+				o.sync.ReportVideoEmit(avsync.SinkSpout, arriveNS, appliedDelayNS, doneNS, o.fps)
+			}
+		}
+		return true
+	}
+
+	drainReady := func() bool {
+		nowNS := avsync.QPCTicksToNS(win.QPC(), o.freq)
+		if qf, ok := delayQ.PopReady(nowNS); ok {
+			p0, s0 := qf.Plane0()
+			p1, s1 := qf.Plane1()
+			if !publishFrame(qf.FourCC, qf.Width, qf.Height, p0, s0, p1, s1, qf.ArriveQPC, qf.AppliedDelayNS, nil) {
+				return false
+			}
+			nowNS = avsync.QPCTicksToNS(win.QPC(), o.freq)
+		}
+		armRelTimer(nowNS)
+		return true
+	}
 
 	for {
 		select {
@@ -288,6 +417,12 @@ func (o *SpoutOutput) run(ready chan<- error) {
 			}
 			lastSent, lat = sent, lat[:0]
 			continue
+		case <-relTimerC:
+			relTimerC = nil
+			if !drainReady() {
+				return
+			}
+			continue
 		case <-o.tap.Notify():
 		}
 
@@ -295,63 +430,20 @@ func (o *SpoutOutput) run(ready chan<- error) {
 		if f == nil {
 			continue
 		}
-		err := g.upload(f)
-		w, h, arrive := f.Width, f.Height, f.ArriveQPC
-		o.tap.Release() // staging slot back to capture; GPU has the copy
-		if err != nil {
-			fail(err)
+		delayNS := o.sync.VideoDelayNS(avsync.SinkSpout)
+		if delayNS == 0 && delayQ.Len() == 0 {
+			p0, s0 := f.Plane0()
+			p1, s1 := f.Plane1()
+			if !publishFrame(f.FourCC, f.Width, f.Height, p0, s0, p1, s1, f.ArriveQPC, 0, o.tap.Release) {
+				return
+			}
+			continue
+		}
+		arriveNS := avsync.QPCTicksToNS(f.ArriveQPC, o.freq)
+		delayQ.Push(f.FourCC, f.Width, f.Height, f.Data, f.ArriveQPC, f.DeviceQPC, arriveNS, delayNS, f.Seq)
+		o.tap.Release()
+		if !drainReady() {
 			return
-		}
-		switch {
-		case sender == nil:
-			// Nobody knows a texture yet: create and draw it, then register.
-			if err := g.createShared(w, h); err != nil {
-				fail(err)
-				return
-			}
-			g.draw()
-			sender, err = spout.NewSender(o.name, g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM)
-			if err != nil {
-				fail(err)
-				return
-			}
-			fmt.Printf("spout: sending as %q (%dx%d BGRA)\n", sender.Name, w, h)
-		case g.needsResize(w, h):
-			// Resize under the access mutex: unpublish the old handle, free
-			// the old texture, create and draw the new one, publish it. On a
-			// timeout the old texture stays published; retry next frame.
-			if !sender.LockTexture() {
-				o.countBusy()
-				continue
-			}
-			err := sender.Update(0, 0, 0, win.DXGI_FORMAT_B8G8R8A8_UNORM)
-			if err == nil {
-				err = g.createShared(w, h)
-			}
-			if err == nil {
-				g.draw()
-				err = sender.Update(g.handle, uint32(w), uint32(h), win.DXGI_FORMAT_B8G8R8A8_UNORM)
-			}
-			sender.UnlockTexture()
-			if err != nil {
-				fail(err)
-				return
-			}
-			fmt.Printf("spout: resized to %dx%d\n", w, h)
-		default:
-			if !sender.LockTexture() {
-				o.countBusy()
-				continue
-			}
-			g.draw()
-			sender.UnlockTexture()
-		}
-		done := win.QPC()
-		o.mu.Lock()
-		o.sent++
-		o.mu.Unlock()
-		if arrive > 0 && done >= arrive {
-			lat = append(lat, float64(done-arrive)*1000/float64(o.freq))
 		}
 	}
 }
