@@ -36,9 +36,11 @@ var (
 	IID_IAudioClient         = guid(0x1cb9ad4c, 0xdbfa, 0x4c32, 0xb1, 0x78, 0xc2, 0xf5, 0x68, 0xa7, 0x03, 0xb2)
 	IID_IAudioRenderClient   = guid(0xf294acfc, 0x3146, 0x4483, 0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2)
 	IID_IAudioCaptureClient  = guid(0xc8adbd64, 0xe71e, 0x48a0, 0xa4, 0xde, 0x18, 0x5c, 0x39, 0x5c, 0xd3, 0x17)
-	pkeyDeviceFriendlyName   = propertyKey{guid(0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0), 14}
-	subtypeIEEEFloat         = guid(0x00000003, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71)
-	subtypePCM               = guid(0x00000001, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71)
+	pkeyDeviceFriendlyName          = propertyKey{guid(0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0), 14}
+	pkeyDeviceDesc                  = propertyKey{guid(0xa45c254e, 0xdf1c, 0x4efd, 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0), 2}
+	pkeyDeviceInterfaceFriendlyName = propertyKey{guid(0x026e516e, 0xb814, 0x414b, 0x83, 0xcd, 0x85, 0x6d, 0x6f, 0xef, 0x48, 0x22), 2}
+	subtypeIEEEFloat                = guid(0x00000003, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71)
+	subtypePCM                      = guid(0x00000001, 0x0000, 0x0010, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71)
 )
 
 // Data flows & roles.
@@ -100,9 +102,11 @@ const AUDCLNT_E_DEVICE_INVALIDATED HRESULT = 0x88890004
 
 // Endpoint is an active audio endpoint; caller must Release Device.
 type Endpoint struct {
-	ID     string // IMMDevice::GetId endpoint ID string (stable across reboots)
-	Name   string
-	Device Object
+	ID      string // IMMDevice::GetId endpoint ID string (stable across reboots)
+	Name    string // PKEY_Device_FriendlyName (e.g. "CABLE Input (VB-Audio Virtual Cable)")
+	Desc    string // PKEY_Device_DeviceDesc (e.g. "CABLE Input")
+	Adapter string // PKEY_DeviceInterface_FriendlyName (e.g. "VB-Audio Virtual Cable")
+	Device  Object
 }
 
 // AudioEndpoints lists all active audio endpoints for flow (ERender or ECapture).
@@ -127,7 +131,8 @@ func AudioEndpoints(flow int) ([]Endpoint, error) {
 		if hr(col.call(vtCollectionItem, uintptr(i), uintptr(unsafe.Pointer(&d)))) != nil {
 			continue
 		}
-		out = append(out, Endpoint{ID: endpointID(d), Name: endpointName(d), Device: d})
+		name, desc, adapter := endpointProps(d)
+		out = append(out, Endpoint{ID: endpointID(d), Name: name, Desc: desc, Adapter: adapter, Device: d})
 	}
 	return out, nil
 }
@@ -143,7 +148,8 @@ func DefaultAudioEndpoint(flow int) (Endpoint, error) {
 	if err := hr(en.call(vtGetDefaultAudioEndpoint, uintptr(flow), EConsole, uintptr(unsafe.Pointer(&d)))); err != nil {
 		return Endpoint{}, err
 	}
-	return Endpoint{ID: endpointID(d), Name: endpointName(d), Device: d}, nil
+	name, desc, adapter := endpointProps(d)
+	return Endpoint{ID: endpointID(d), Name: name, Desc: desc, Adapter: adapter, Device: d}, nil
 }
 
 // AudioEndpointByID opens the endpoint with the given IMMDevice ID
@@ -162,7 +168,8 @@ func AudioEndpointByID(id string) (Endpoint, error) {
 	if err := hr(en.call(vtEnumGetDevice, uintptr(unsafe.Pointer(wid)), uintptr(unsafe.Pointer(&d)))); err != nil {
 		return Endpoint{}, err
 	}
-	return Endpoint{ID: endpointID(d), Name: endpointName(d), Device: d}, nil
+	name, desc, adapter := endpointProps(d)
+	return Endpoint{ID: endpointID(d), Name: name, Desc: desc, Adapter: adapter, Device: d}, nil
 }
 
 func endpointID(d Object) string {
@@ -174,14 +181,20 @@ func endpointID(d Object) string {
 	return windows.UTF16PtrToString(p)
 }
 
-func endpointName(d Object) string {
+func endpointProps(d Object) (name, desc, adapter string) {
 	var ps Object
 	if hr(d.call(vtOpenPropertyStore, 0, uintptr(unsafe.Pointer(&ps)))) != nil {
-		return ""
+		return "", "", ""
 	}
 	defer ps.Release()
+	return propStoreString(ps, &pkeyDeviceFriendlyName),
+		propStoreString(ps, &pkeyDeviceDesc),
+		propStoreString(ps, &pkeyDeviceInterfaceFriendlyName)
+}
+
+func propStoreString(ps Object, key *propertyKey) string {
 	var pv propVariant
-	if hr(ps.call(vtPropStoreGetValue, uintptr(unsafe.Pointer(&pkeyDeviceFriendlyName)), uintptr(unsafe.Pointer(&pv)))) != nil {
+	if hr(ps.call(vtPropStoreGetValue, uintptr(unsafe.Pointer(key)), uintptr(unsafe.Pointer(&pv)))) != nil {
 		return ""
 	}
 	defer procPropVariantClear.Call(uintptr(unsafe.Pointer(&pv)))

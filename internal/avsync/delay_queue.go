@@ -3,11 +3,11 @@ package avsync
 import "sync/atomic"
 
 // MaxDelayFrames caps the number of pre-allocated staging frames held in a
-// VideoDelayQueue (16 slots = 15 frames max delay + 1 jitter headroom slot:
-// ~125 ms at 120 fps or ~250 ms at 60 fps; ~48 MB worst-case for 1080p NV12).
+// VideoDelayQueue (24 slots = 23 frames max delay + 1 jitter headroom slot:
+// ~191.7 ms at 120 fps or ~383.3 ms at 60 fps; ~72 MB worst-case for 1080p NV12).
 // Buffers are allocated lazily on first Push, ONLY when vcam/Spout2 is active
 // and delaying (0 MB allocated when off or at 0 ms delay).
-const MaxDelayFrames = 16
+const MaxDelayFrames = 24
 
 // QueuedFrame is a self-contained copy of a video frame sitting in a
 // VideoDelayQueue slot. It NEVER holds any Media Foundation IMFSample or

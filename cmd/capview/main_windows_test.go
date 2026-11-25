@@ -138,3 +138,90 @@ func TestAudienceAVSyncMenu(t *testing.T) {
 		t.Fatalf("persisted config mismatch: %+v err=%v", saved, err)
 	}
 }
+
+func TestAudienceAVSyncCalibrateMenuAutoPairAndFallback(t *testing.T) {
+	findSub := func(items []render.MenuItem, label string) *render.MenuItem {
+		for i := range items {
+			if items[i].Label == label {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+	findItem := func(items []render.MenuItem, label string) *render.MenuItem {
+		for i := range items {
+			if items[i].Label == label {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+
+	fakeEps := func() ([]audio.EndpointInfo, []audio.EndpointInfo, error) {
+		return []audio.EndpointInfo{
+				{ID: "{in-cable}", Name: "CABLE Output (VB-Audio Virtual Cable)", Desc: "CABLE Output", Adapter: "VB-Audio Virtual Cable"},
+				{ID: "{in-mic}", Name: "Microphone (USB)", Desc: "Microphone", Adapter: "USB"},
+			}, []audio.EndpointInfo{
+				{ID: "{out-cable}", Name: "CABLE Input (VB-Audio Virtual Cable)", Desc: "CABLE Input", Adapter: "VB-Audio Virtual Cable"},
+				{ID: "{out-dac}", Name: "Speakers (DAC)", Desc: "Speakers", Adapter: "DAC"},
+			}, nil
+	}
+
+	// 1. No mirror configured -> Calibrate disabled.
+	cfg := config.Default()
+	h := &appHost{cfg: cfg, listEndpointsFn: fakeEps}
+	sub := findSub(h.BuildMenu(false, false), "Audience A/V Sync")
+	if cal := findItem(sub.Submenu, "Calibrate"); cal == nil || !cal.Disabled {
+		t.Fatalf("expected disabled Calibrate with no mirror, got %+v", cal)
+	}
+
+	// 2. VB-Cable mirror configured -> auto-paired Calibrate enabled + default 35.0 ms display.
+	h.cfg.AudioMirrorID = "{out-cable}"
+	sub = findSub(h.BuildMenu(false, false), "Audience A/V Sync")
+	if cal := findItem(sub.Submenu, "Calibrate"); cal == nil || cal.Disabled || cal.ID == 0 {
+		t.Fatalf("expected enabled auto-paired Calibrate for VB-Cable, got %+v", cal)
+	}
+	if ds := findItem(sub.Submenu, "Downstream: 35.0 ms (default)"); ds == nil || !ds.Disabled {
+		t.Fatalf("expected Downstream: 35.0 ms (default) label, got %+v", ds)
+	}
+
+	// 3. Saved calibrated value overrides default display.
+	h.cfg.AudioMirrorDownstreamMS = map[string]float64{"{out-cable}": 61.5}
+	sub = findSub(h.BuildMenu(false, false), "Audience A/V Sync")
+	if ds := findItem(sub.Submenu, "Downstream: 61.5 ms (calibrated)"); ds == nil || !ds.Disabled {
+		t.Fatalf("expected calibrated downstream label, got %+v", ds)
+	}
+
+	// 4. Unpaired mirror (physical DAC) -> fallback "Calibrate With" submenu listing capture endpoints.
+	h.cfg.AudioMirrorID = "{out-dac}"
+	sub = findSub(h.BuildMenu(false, false), "Audience A/V Sync")
+	calWith := findItem(sub.Submenu, "Calibrate With")
+	if calWith == nil || len(calWith.Submenu) != 2 {
+		t.Fatalf("expected Calibrate With fallback submenu with 2 capture endpoints, got %+v", calWith)
+	}
+	if calWith.Submenu[0].Label != "CABLE Output (VB-Audio Virtual Cable)" || calWith.Submenu[1].Label != "Microphone (USB)" {
+		t.Fatalf("unexpected Calibrate With entries: %+v", calWith.Submenu)
+	}
+
+	// 5. While calibrating -> disabled "Calibrate (Running...)".
+	h.calibrating.Store(true)
+	sub = findSub(h.BuildMenu(false, false), "Audience A/V Sync")
+	if running := findItem(sub.Submenu, "Calibrate (Running...)"); running == nil || !running.Disabled {
+		t.Fatalf("expected disabled Calibrate (Running...), got %+v", running)
+	}
+}
+
+func TestAVSyncCalibrateCLIFlagHelpers(t *testing.T) {
+	if !hasAVSyncCalibrateFlag([]string{"-av-sync-calibrate"}) || !hasAVSyncCalibrateFlag([]string{"--av-sync-calibrate=true"}) {
+		t.Fatal("expected hasAVSyncCalibrateFlag true")
+	}
+	if hasAVSyncCalibrateFlag([]string{"-av-sync-calibrate=false"}) || hasAVSyncCalibrateFlag([]string{"-av-sync=true"}) {
+		t.Fatal("expected hasAVSyncCalibrateFlag false")
+	}
+	if got := parseConfigPathArg([]string{"-config", "C:\\tmp\\c.json"}); got != "C:\\tmp\\c.json" {
+		t.Fatalf("parseConfigPathArg = %q", got)
+	}
+	if got := parseConfigPathArg([]string{"--config=C:\\tmp\\d.json"}); got != "C:\\tmp\\d.json" {
+		t.Fatalf("parseConfigPathArg = %q", got)
+	}
+}

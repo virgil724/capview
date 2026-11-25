@@ -25,6 +25,10 @@ type Config struct {
 	MirrorTargetMS int
 	// Sync is an optional audience A/V synchronization controller.
 	Sync *avsync.Controller
+	// DownstreamLookup optionally resolves (downstreamMS, calibrated) for a
+	// mirror endpoint whenever a mirror starts or switches. When nil, defaults
+	// to DefaultDownstreamMS(mirrorName).
+	DownstreamLookup func(mirrorID, mirrorName string) (float64, bool)
 	// SyntheticSyncTest generates a 48 kHz 1 Hz 33ms 1 kHz (-12 dBFS) sine beep
 	// pinned to SyncEpochQPC instead of reading from a physical WASAPI capture
 	// device, feeding both local playback and the audio mirror pipeline.
@@ -41,9 +45,10 @@ type Passthrough struct {
 	InputRate  int
 	OutputRate int
 
-	ring           *Ring
-	sync           *avsync.Controller
-	freq           int64
+	ring             *Ring
+	sync             *avsync.Controller
+	downstreamLookup func(mirrorID, mirrorName string) (float64, bool)
+	freq             int64
 	mirrorTargetMS int
 	tap            atomic.Pointer[mirrorTap] // non-nil while a mirror is running
 	mirMu sync.Mutex                // serializes SetMirror; guards mir and mirClosed
@@ -96,10 +101,14 @@ func (p *Passthrough) gain() float32 {
 
 // mirrorState tracks one running mirror output goroutine.
 type mirrorState struct {
-	id, name string
-	tap      *mirrorTap
-	stop     atomic.Bool
-	done     chan struct{}
+	id, name        string
+	desc, adapter   string
+	tap             *mirrorTap
+	calib           atomic.Pointer[calibrationInjector]
+	renderBufMS     float64
+	pureStreamLatMS float64
+	stop            atomic.Bool
+	done            chan struct{}
 }
 
 // ErrMirrorIsMainOutput is returned when the mirror endpoint is the same
@@ -179,6 +188,21 @@ func (p *Passthrough) MirrorID() string {
 		return ""
 	default:
 		return p.mir.id
+	}
+}
+
+// MirrorName returns the friendly name of the running mirror, or "" if none.
+func (p *Passthrough) MirrorName() string {
+	p.mirMu.Lock()
+	defer p.mirMu.Unlock()
+	if p.mir == nil {
+		return ""
+	}
+	select {
+	case <-p.mir.done:
+		return ""
+	default:
+		return p.mir.name
 	}
 }
 

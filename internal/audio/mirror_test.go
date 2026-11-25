@@ -48,15 +48,15 @@ func TestAdaptiveMirrorReadFrames(t *testing.T) {
 	}
 }
 
-func TestMirrorEndpointExtraLatencyMS(t *testing.T) {
-	if got := mirrorEndpointExtraLatencyMS("CABLE Input (VB-Audio Virtual Cable)"); got != VirtualCableLoopbackMS {
-		t.Fatalf("VB-Cable extra latency = %v, want %v", got, VirtualCableLoopbackMS)
+func TestDefaultDownstreamMSHeuristic(t *testing.T) {
+	if got := DefaultDownstreamMS("CABLE Input (VB-Audio Virtual Cable)"); got != DefaultVirtualCableDownstreamMS {
+		t.Fatalf("VB-Cable default downstream = %v, want %v", got, DefaultVirtualCableDownstreamMS)
 	}
-	if got := mirrorEndpointExtraLatencyMS("VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)"); got != VirtualCableLoopbackMS {
-		t.Fatalf("VoiceMeeter extra latency = %v, want %v", got, VirtualCableLoopbackMS)
+	if got := DefaultDownstreamMS("VoiceMeeter Input (VB-Audio VoiceMeeter VAIO)"); got != DefaultVirtualCableDownstreamMS {
+		t.Fatalf("VoiceMeeter default downstream = %v, want %v", got, DefaultVirtualCableDownstreamMS)
 	}
-	if got := mirrorEndpointExtraLatencyMS("Speakers (FiiO BTR5 1.1)"); got != 0 {
-		t.Fatalf("physical speakers extra latency = %v, want 0", got)
+	if got := DefaultDownstreamMS("Speakers (FiiO BTR5 1.1)"); got != 0 {
+		t.Fatalf("physical speakers default downstream = %v, want 0", got)
 	}
 }
 

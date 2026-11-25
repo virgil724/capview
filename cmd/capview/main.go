@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/virgil724/capview/internal/audio"
@@ -45,6 +47,13 @@ func main() {
 		}
 		return
 	}
+	if hasAVSyncCalibrateFlag(os.Args[1:]) {
+		if err := runAVSyncCalibrateCLI(os.Args[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := runView(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		win.ShowErrorBox("capview", err.Error())
@@ -63,6 +72,100 @@ func hasVcamAdminFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+func hasAVSyncCalibrateFlag(args []string) bool {
+	for _, a := range args {
+		switch {
+		case a == "-av-sync-calibrate", a == "--av-sync-calibrate":
+			return true
+		case strings.HasPrefix(a, "-av-sync-calibrate="), strings.HasPrefix(a, "--av-sync-calibrate="):
+			v := strings.ToLower(strings.TrimSpace(a[strings.IndexByte(a, '=')+1:]))
+			return v != "false" && v != "0"
+		}
+	}
+	return false
+}
+
+func runAVSyncCalibrateCLI(args []string) error {
+	fs := flag.NewFlagSet("capview-calibrate", flag.ContinueOnError)
+	_ = fs.Bool("av-sync-calibrate", true, "measure downstream audio mirror latency and persist to config.json")
+	calibIn := fs.String("av-sync-calibrate-in", "", "optional capture endpoint ID, name, or substring for calibration (default: auto-pair)")
+	audioMirror := fs.String("audio-mirror", "", "mirror playback endpoint ID, name, or substring (default: saved audio_mirror_id)")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to config.json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, _ := config.Load(*cfgPath)
+	mirrorID := cfg.AudioMirrorID
+	if strings.TrimSpace(*audioMirror) != "" {
+		id, err := resolveMirror(*audioMirror)
+		if err != nil {
+			return err
+		}
+		mirrorID = id
+	}
+	if strings.TrimSpace(mirrorID) == "" {
+		return errors.New("no audio mirror endpoint configured; pass -audio-mirror <name|id> or select one in config.json")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := audio.CalibrateEndpoints(ctx, mirrorID, *calibIn)
+	if err != nil {
+		return err
+	}
+
+	setConfigDownstreamMS(&cfg, res.MirrorID, res.DownstreamMS)
+	if err := config.Save(*cfgPath, cfg); err != nil {
+		return fmt.Errorf("save calibrated downstream latency to %s: %w", *cfgPath, err)
+	}
+
+	printCalibrationReport(os.Stdout, res, *cfgPath)
+	return nil
+}
+
+func setConfigDownstreamMS(cfg *config.Config, mirrorID string, ms float64) {
+	if cfg == nil || mirrorID == "" {
+		return
+	}
+	if cfg.AudioMirrorDownstreamMS == nil {
+		cfg.AudioMirrorDownstreamMS = make(map[string]float64)
+	}
+	for k := range cfg.AudioMirrorDownstreamMS {
+		if strings.EqualFold(k, mirrorID) && k != mirrorID {
+			delete(cfg.AudioMirrorDownstreamMS, k)
+		}
+	}
+	cfg.AudioMirrorDownstreamMS[mirrorID] = ms
+}
+
+func printCalibrationReport(w io.Writer, res audio.CalibrationResult, cfgPath string) {
+	fmt.Fprintf(w, "avsync calibrate: mirror %q [%s] -> capture %q [%s]\n",
+		res.MirrorName, res.MirrorID, res.CaptureName, res.CaptureID)
+	fmt.Fprintf(w, "  render:  %d Hz | buf %.2f ms | streamLat %.2f ms\n",
+		res.RenderRate, res.RenderBufferMS, res.RenderStreamLatMS)
+	fmt.Fprintf(w, "  capture: %d Hz | buf %.2f ms | period %.2f ms | avgAge %.2f ms | halfBuf %.2f ms | noise %.5f\n",
+		res.CaptureRate, res.CaptureBufferMS, res.CapturePeriodMS, res.CaptureAvgAgeMS, res.CaptureHalfBufMS, res.NoiseFloor)
+	for _, p := range res.Pulses {
+		status := "missed"
+		if p.Detected {
+			if p.Inlier {
+				status = "ok"
+			} else {
+				status = "outlier"
+			}
+		}
+		fmt.Fprintf(w, "  pulse %d: %-7s | peak %.3f | pinRT %.2f ms | fromSubmit %.2f ms | downstream %.2f ms\n",
+			p.Index, status, p.PeakAmp, p.RawRoundtripMS, p.RawFromSubmitMS, p.DownstreamMS)
+	}
+	fmt.Fprintf(w, "  result:  %d/%d valid (%d inliers) | medianPinRT %.2f ms + capAge %.2f ms - halfBuf %.2f ms => downstream_audio_ms = %.1f ms\n",
+		res.ValidCount, len(res.Pulses), res.InlierCount, res.MedianRoundtripMS, res.CaptureAvgAgeMS, res.CaptureHalfBufMS, res.DownstreamMS)
+	if cfgPath != "" {
+		fmt.Fprintf(w, "  saved:   %s\n", cfgPath)
+	}
 }
 
 func runVcamAdmin(args []string) error {
@@ -205,6 +308,10 @@ type appHost struct {
 	syncTest       bool
 	syncEpochQPC   int64
 	mirrorTargetMS int
+	calibrating    atomic.Bool
+
+	// Optional endpoint listing override for deterministic menu unit tests.
+	listEndpointsFn func() (inputs, outputs []audio.EndpointInfo, err error)
 
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
@@ -267,6 +374,11 @@ func (h *appHost) startAudio() {
 		MirrorID:          h.cfg.AudioMirrorID,
 		MirrorTargetMS:    h.mirrorTargetMS,
 		Sync:              h.avSync,
+		DownstreamLookup: func(mirrorID, mirrorName string) (float64, bool) {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			return audio.ResolveDownstreamMS(mirrorID, mirrorName, h.cfg.AudioMirrorDownstreamMS)
+		},
 		SyntheticSyncTest: h.syncTest,
 		SyncEpochQPC:      h.syncEpochQPC,
 	})
@@ -431,6 +543,76 @@ func formatSyncOffsetLabel(ms int) string {
 	return fmt.Sprintf("Current Offset: %+d ms", ms)
 }
 
+func formatDownstreamLabel(ms float64, calibrated bool) string {
+	if calibrated {
+		return fmt.Sprintf("Downstream: %.1f ms (calibrated)", ms)
+	}
+	return fmt.Sprintf("Downstream: %.1f ms (default)", ms)
+}
+
+// startCalibrateAsync launches downstream audio latency calibration on a
+// background goroutine so the viewer UI thread and local audio/video playback
+// are never blocked or disturbed.
+func (h *appHost) startCalibrateAsync(captureID string) {
+	if !h.calibrating.CompareAndSwap(false, true) {
+		return
+	}
+	h.mu.Lock()
+	aud := h.aud
+	mirrorID := h.cfg.AudioMirrorID
+	cfgPath := h.cfgPath
+	h.mu.Unlock()
+
+	if aud != nil {
+		if id := aud.MirrorID(); id != "" {
+			mirrorID = id
+		}
+	}
+	if mirrorID == "" {
+		h.calibrating.Store(false)
+		win.ShowErrorBox("capview", "Audio Mirror Output must be enabled before calibrating.")
+		return
+	}
+
+	go func() {
+		defer h.calibrating.Store(false)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		var (
+			res audio.CalibrationResult
+			err error
+		)
+		if aud != nil && aud.MirrorID() != "" {
+			res, err = aud.CalibrateMirror(ctx, captureID)
+		} else {
+			res, err = audio.CalibrateEndpoints(ctx, mirrorID, captureID)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "avsync calibration failed: %v\n", err)
+			win.ShowErrorBox("capview", fmt.Sprintf("Audio latency calibration failed:\n%v", err))
+			return
+		}
+
+		h.mu.Lock()
+		setConfigDownstreamMS(&h.cfg, res.MirrorID, res.DownstreamMS)
+		if h.avSync != nil {
+			h.avSync.SetAudioDownstreamMS(res.DownstreamMS, true)
+		}
+		saveErr := config.Save(cfgPath, h.cfg)
+		h.mu.Unlock()
+
+		printCalibrationReport(os.Stdout, res, cfgPath)
+		if saveErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to save calibrated latency: %v\n", saveErr)
+		}
+		win.ShowInfoBox("capview", fmt.Sprintf(
+			"Audience A/V Sync calibrated.\n\nMirror: %s\nCapture: %s\nDownstream audio latency: %.1f ms (%d/%d pulses)",
+			res.MirrorName, res.CaptureName, res.DownstreamMS, res.InlierCount, len(res.Pulses),
+		))
+	}()
+}
+
 func (h *appHost) Audio() render.AudioControl {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -492,7 +674,11 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 	}
 
 	// 3. Audio input & output submenus.
-	inInfos, outInfos, _ := audio.ListEndpointInfos()
+	listEps := audio.ListEndpointInfos
+	if h.listEndpointsFn != nil {
+		listEps = h.listEndpointsFn
+	}
+	inInfos, outInfos, _ := listEps()
 	var inEps, outEps []string
 	for _, e := range inInfos {
 		inEps = append(inEps, e.Name)
@@ -623,36 +809,105 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 		})
 	}
 
-	items = append(items, render.MenuItem{
-		Label: "Audience A/V Sync",
-		Submenu: []render.MenuItem{
-			{
-				ID:      addAction(func() (bool, bool, bool) { h.toggleAVSync(); return false, false, false }),
-				Label:   "Auto Sync",
-				Checked: h.cfg.AVSyncEnabled,
-			},
-			{Separator: true},
-			{
-				ID:       addAction(func() (bool, bool, bool) { h.adjustAVSyncOffset(+10); return false, false, false }),
-				Label:    "Delay Audio +10 ms",
-				Disabled: h.cfg.AVSyncOffsetMS >= avsync.MaxOffsetMS,
-			},
-			{
-				ID:       addAction(func() (bool, bool, bool) { h.adjustAVSyncOffset(-10); return false, false, false }),
-				Label:    "Delay Video +10 ms",
-				Disabled: h.cfg.AVSyncOffsetMS <= avsync.MinOffsetMS,
-			},
-			{
-				ID:       addAction(func() (bool, bool, bool) { h.resetAVSyncOffset(); return false, false, false }),
-				Label:    "Reset Offset (0 ms)",
-				Disabled: h.cfg.AVSyncOffsetMS == 0,
-			},
-			{Separator: true},
-			{
-				Label:    formatSyncOffsetLabel(h.cfg.AVSyncOffsetMS),
-				Disabled: true,
-			},
+	syncMenu := []render.MenuItem{
+		{
+			ID:      addAction(func() (bool, bool, bool) { h.toggleAVSync(); return false, false, false }),
+			Label:   "Auto Sync",
+			Checked: h.cfg.AVSyncEnabled,
 		},
+	}
+
+	// Self-calibration: enabled when an audio mirror output is configured/active.
+	var mirrorEP audio.EndpointInfo
+	if curMirror != "" {
+		for _, ep := range outInfos {
+			if strings.EqualFold(ep.ID, curMirror) {
+				mirrorEP = ep
+				break
+			}
+		}
+		if mirrorEP.ID == "" {
+			mirrorEP.ID = curMirror
+			if h.aud != nil {
+				mirrorEP.Name = h.aud.MirrorName()
+			}
+		}
+	}
+	canCalibrate := mirrorEP.ID != "" && (audRunning || h.aud == nil)
+	switch {
+	case h.calibrating.Load():
+		syncMenu = append(syncMenu, render.MenuItem{
+			Label:    "Calibrate (Running...)",
+			Disabled: true,
+		})
+	case !canCalibrate:
+		syncMenu = append(syncMenu, render.MenuItem{
+			Label:    "Calibrate",
+			Disabled: true,
+		})
+	default:
+		if paired, ok := audio.PairCalibrationCapture(mirrorEP, inInfos); ok {
+			pairedID := paired.ID
+			syncMenu = append(syncMenu, render.MenuItem{
+				ID:    addAction(func() (bool, bool, bool) { h.startCalibrateAsync(pairedID); return false, false, false }),
+				Label: "Calibrate",
+			})
+		} else {
+			var calWith []render.MenuItem
+			for _, in := range inInfos {
+				if in.ID == "" {
+					continue
+				}
+				inID := in.ID
+				calWith = append(calWith, render.MenuItem{
+					ID:    addAction(func() (bool, bool, bool) { h.startCalibrateAsync(inID); return false, false, false }),
+					Label: in.Name,
+				})
+			}
+			if len(calWith) == 0 {
+				calWith = []render.MenuItem{{Label: "(none)", Disabled: true}}
+			}
+			syncMenu = append(syncMenu, render.MenuItem{
+				Label:   "Calibrate With",
+				Submenu: calWith,
+			})
+		}
+	}
+
+	syncMenu = append(syncMenu,
+		render.MenuItem{Separator: true},
+		render.MenuItem{
+			ID:       addAction(func() (bool, bool, bool) { h.adjustAVSyncOffset(+10); return false, false, false }),
+			Label:    "Delay Audio +10 ms",
+			Disabled: h.cfg.AVSyncOffsetMS >= avsync.MaxOffsetMS,
+		},
+		render.MenuItem{
+			ID:       addAction(func() (bool, bool, bool) { h.adjustAVSyncOffset(-10); return false, false, false }),
+			Label:    "Delay Video +10 ms",
+			Disabled: h.cfg.AVSyncOffsetMS <= avsync.MinOffsetMS,
+		},
+		render.MenuItem{
+			ID:       addAction(func() (bool, bool, bool) { h.resetAVSyncOffset(); return false, false, false }),
+			Label:    "Reset Offset (0 ms)",
+			Disabled: h.cfg.AVSyncOffsetMS == 0,
+		},
+		render.MenuItem{Separator: true},
+		render.MenuItem{
+			Label:    formatSyncOffsetLabel(h.cfg.AVSyncOffsetMS),
+			Disabled: true,
+		},
+	)
+	if mirrorEP.ID != "" {
+		dsMS, dsCal := audio.ResolveDownstreamMS(mirrorEP.ID, mirrorEP.Name, h.cfg.AudioMirrorDownstreamMS)
+		syncMenu = append(syncMenu, render.MenuItem{
+			Label:    formatDownstreamLabel(dsMS, dsCal),
+			Disabled: true,
+		})
+	}
+
+	items = append(items, render.MenuItem{
+		Label:   "Audience A/V Sync",
+		Submenu: syncMenu,
 	})
 
 	items = append(items,
@@ -927,11 +1182,32 @@ func matchMirror(v string, outs []audio.EndpointInfo) (string, error) {
 	return "", fmt.Errorf("no audio playback endpoint matching %q", v)
 }
 
+func parseConfigPathArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-config" || a == "--config" {
+			if i+1 < len(args) && strings.TrimSpace(args[i+1]) != "" {
+				return args[i+1]
+			}
+		} else if strings.HasPrefix(a, "-config=") {
+			if v := strings.TrimSpace(a[len("-config="):]); v != "" {
+				return v
+			}
+		} else if strings.HasPrefix(a, "--config=") {
+			if v := strings.TrimSpace(a[len("--config="):]); v != "" {
+				return v
+			}
+		}
+	}
+	return config.DefaultPath()
+}
+
 func runView(args []string) error {
-	cfgPath := config.DefaultPath()
+	cfgPath := parseConfigPathArg(args)
 	cfg, _ := config.Load(cfgPath)
 
 	fs := flag.NewFlagSet("capview", flag.ExitOnError)
+	_ = fs.String("config", cfgPath, "path to config.json")
 	device := fs.String("device", cfg.Device, "Media Foundation video device name, substring, or 'auto'")
 	size := fs.String("size", fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), "capture resolution WxH")
 	fps := fs.Float64("fps", cfg.FPS, "target capture frame rate")
@@ -956,6 +1232,8 @@ func runView(args []string) error {
 	spoutName := fs.String("spout-name", "capview", "Spout2 sender name")
 	avSyncOn := fs.Bool("av-sync", cfg.AVSyncEnabled, "auto-sync audience outputs (virtual camera, Spout2, audio mirror)")
 	avSyncOffset := fs.Int("av-sync-offset", cfg.AVSyncOffsetMS, "manual audience A/V sync offset in ms (+ delays audio, - delays video; [-200..200])")
+	_ = fs.Bool("av-sync-calibrate", false, "calibrate downstream audio mirror latency, save to config.json, and exit")
+	_ = fs.String("av-sync-calibrate-in", "", "optional capture endpoint name/substring/ID for -av-sync-calibrate (default: auto-pair)")
 	syncTest := fs.Bool("sync-test", false, "in synthetic mode, emit synchronized 1 Hz white flash + 1 kHz beep test signal")
 	mirrorTargetMS := fs.Int("audio-mirror-target-ms", 0, "optional audio mirror ring target fill duration in ms (0 = default)")
 	if err := fs.Parse(args); err != nil {
