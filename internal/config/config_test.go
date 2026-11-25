@@ -95,3 +95,54 @@ func TestSpoutEnabledKey(t *testing.T) {
 		t.Fatalf("Load spout_enabled = %v, %v", got.SpoutEnabled, err)
 	}
 }
+
+func TestAVSyncConfigFields(t *testing.T) {
+	def := Default()
+	if !def.AVSyncEnabled || def.AVSyncOffsetMS != 0 {
+		t.Fatalf("unexpected AVSync defaults: enabled=%v offset=%d", def.AVSyncEnabled, def.AVSyncOffsetMS)
+	}
+
+	p := filepath.Join(t.TempDir(), "config.json")
+	// Legacy config missing av_sync_enabled must default to true.
+	if err := os.WriteFile(p, []byte(`{"width":1920,"height":1080}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(p)
+	if err != nil || !got.AVSyncEnabled || got.AVSyncOffsetMS != 0 {
+		t.Fatalf("legacy config load: enabled=%v offset=%d err=%v", got.AVSyncEnabled, got.AVSyncOffsetMS, err)
+	}
+
+	// Explicit false + offset round-trip and snake_case JSON keys.
+	got.AVSyncEnabled = false
+	got.AVSyncOffsetMS = -30
+	if err := Save(p, got); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"av_sync_enabled": false`) || !strings.Contains(string(raw), `"av_sync_offset_ms": -30`) {
+		t.Fatalf("missing snake_case av_sync keys in JSON:\n%s", raw)
+	}
+	got2, err := Load(p)
+	if err != nil || got2.AVSyncEnabled || got2.AVSyncOffsetMS != -30 {
+		t.Fatalf("round-trip mismatch: enabled=%v offset=%d err=%v", got2.AVSyncEnabled, got2.AVSyncOffsetMS, err)
+	}
+
+	// Out-of-range offsets clamp to [-200, +200].
+	if err := os.WriteFile(p, []byte(`{"av_sync_offset_ms": 500}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clampedHi, _ := Load(p)
+	if clampedHi.AVSyncOffsetMS != 200 {
+		t.Fatalf("high clamp = %d, want 200", clampedHi.AVSyncOffsetMS)
+	}
+	if err := os.WriteFile(p, []byte(`{"av_sync_offset_ms": -999}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clampedLo, _ := Load(p)
+	if clampedLo.AVSyncOffsetMS != -200 {
+		t.Fatalf("low clamp = %d, want -200", clampedLo.AVSyncOffsetMS)
+	}
+}

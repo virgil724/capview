@@ -416,6 +416,11 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 					line += fmt.Sprintf(" | vol %d%%", int(a.Volume()*100+0.5))
 				}
 			}
+			if sr, ok := cfg.Host.(interface{ SyncStatsLine() string }); ok {
+				if sl := sr.SyncStatsLine(); sl != "" {
+					line += " | " + sl
+				}
+			}
 			win.SetWindowTitle(hwnd, "capview | "+line)
 			if cfg.PrintStats {
 				fmt.Println(line)

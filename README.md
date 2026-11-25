@@ -86,7 +86,7 @@ Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, S
 
 ### Controls
 
-- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Audio Mirror Output, Fullscreen, VRR/VSync, Mute, Spout Output, Virtual Camera, Quit)
+- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Audio Mirror Output, Fullscreen, VRR/VSync, Mute, Spout Output, Virtual Camera, Audience A/V Sync, Quit)
 - `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s; engages Independent Flip / VRR for <1 ms display latency)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
 - `M`: Mute / unmute audio
@@ -110,6 +110,15 @@ The sender is pure Go (no Spout DLL): a separate thread with its own D3D11 devic
   - **One-time UAC elevation**: Enabling for the first time (or when the bundled `capview_vcam.dll` version/hash changes) prompts UAC once to run `capview.exe -vcam-install`, deploying the COM DLL to `C:\ProgramData\capview\`, setting `LocalService` ACLs, and registering the CLSID in `HKLM`. Everyday **Enable** / **Disable** afterwards runs with **zero admin privileges**.
   - **Standby placeholder**: When capture is idle or paused, the COM source outputs a dark `"capview"` placeholder frame at the negotiated mode (`1080p60`, `1080p30`, `720p60`, `720p30`).
 - **TODO (Code Signing)**: Release binaries (`capview.exe` and `capview_vcam.dll`) are not yet Authenticode-signed. Adding an Authenticode signing step to the release workflow is tracked before public distribution to avoid Microsoft Defender SmartScreen prompts and WDAC/HVCI `svchost.exe` load restrictions.
+
+### Audience A/V Sync
+
+When sharing gameplay to an audience (Virtual Camera / Spout2 + Audio Mirror such as VB-Cable), `capview` automatically aligns the audience video and audio paths on a common QPC clock without adding any buffering or delay to your local monitor or local speakers/headphones:
+
+- **Enabled by default** (`"av_sync_enabled": true`, CLI `-av-sync=true|false`) and affects **audience outputs only**; when either audience audio or audience video is off, sync stays idle (`0 ms` compensation).
+- **Delays only the faster path**: when audience video is faster than the audio mirror (common case), frames pass through a bounded 8-frame QPC-scheduled staging delay queue after the non-blocking tap (never holding `IMFSample`); when audio is faster, the audio mirror ring target smoothly rises via subtle micro-resampling. Changes are slew-rate-limited (`3 ms/s`) to avoid stutters or clicks.
+- **Manual fine-tune**: right-click → **`Audience A/V Sync`** (`Auto Sync`, `Delay Audio +10 ms`, `Delay Video +10 ms`, `Reset Offset (0 ms)`) or `"av_sync_offset_ms"` (`[-200..+200]`, positive delays audio further, negative delays video further) lets you trim downstream app latency (e.g. Meet/Zoom internal processing).
+- **Built-in test signal**: `-source synthetic -sync-test` emits a QPC-locked 1 Hz white flash + 1 kHz `-12 dBFS` beep through both video and audio mirror pipelines for end-to-end verification.
 
 ## Roadmap
 

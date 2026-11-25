@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/virgil724/capview/internal/audio"
+	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
@@ -191,6 +192,12 @@ type appHost struct {
 	vcam    *vcam.Controller
 	vcamShm string
 
+	// Audience A/V synchronization (affects audience bypass outputs only).
+	avSync         *avsync.Controller
+	syncTest       bool
+	syncEpochQPC   int64
+	mirrorTargetMS int
+
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
 }
@@ -204,6 +211,8 @@ func (h *appHost) startVideo(sourceKind string) error {
 		Format:        h.cfg.Format,
 		AutoReconnect: true,
 		Mailbox:       h.mailbox,
+		SyncTest:      h.syncTest,
+		SyncEpochQPC:  h.syncEpochQPC,
 	}
 	var (
 		src *capture.Source
@@ -243,11 +252,15 @@ func (h *appHost) startAudio() {
 		hint = h.vid.Mode.Device
 	}
 	aud, err := audio.Start(audio.Config{
-		InputDevice:  h.cfg.AudioIn,
-		OutputDevice: h.cfg.AudioOut,
-		VideoHint:    hint,
-		Volume:       h.cfg.Volume,
-		MirrorID:     h.cfg.AudioMirrorID,
+		InputDevice:       h.cfg.AudioIn,
+		OutputDevice:      h.cfg.AudioOut,
+		VideoHint:         hint,
+		Volume:            h.cfg.Volume,
+		MirrorID:          h.cfg.AudioMirrorID,
+		MirrorTargetMS:    h.mirrorTargetMS,
+		Sync:              h.avSync,
+		SyntheticSyncTest: h.syncTest,
+		SyncEpochQPC:      h.syncEpochQPC,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: audio passthrough disabled: %v\n", err)
@@ -299,8 +312,12 @@ func (h *appHost) startSpout() error {
 		return nil
 	}
 	h.stopSpout() // clear a sender that died on its own
+	fps := h.cfg.FPS
+	if h.vid != nil && h.vid.Mode.FPS > 0 {
+		fps = h.vid.Mode.FPS
+	}
 	tap := capture.NewRawTap()
-	out, err := render.StartSpout(h.spoutName, tap, h.freq, h.printStats)
+	out, err := render.StartSpoutWithSync(h.spoutName, tap, h.freq, h.printStats, h.avSync, fps)
 	if err != nil {
 		return err
 	}
@@ -359,6 +376,51 @@ func (h *appHost) ModeLabel() string {
 		return h.vid.Mode.String() + " (" + st + ")"
 	}
 	return h.vid.Mode.String()
+}
+
+func (h *appHost) SyncStatsLine() string {
+	if h.avSync == nil {
+		return ""
+	}
+	return h.avSync.Snapshot().FormatStats()
+}
+
+func (h *appHost) toggleAVSync() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.AVSyncEnabled = !h.cfg.AVSyncEnabled
+	if h.avSync != nil {
+		h.avSync.SetAutoEnabled(h.cfg.AVSyncEnabled)
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) adjustAVSyncOffset(deltaMS int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	next := avsync.ClampOffsetMS(h.cfg.AVSyncOffsetMS + deltaMS)
+	h.cfg.AVSyncOffsetMS = next
+	if h.avSync != nil {
+		h.avSync.SetManualOffsetMS(next)
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func (h *appHost) resetAVSyncOffset() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.cfg.AVSyncOffsetMS = 0
+	if h.avSync != nil {
+		h.avSync.SetManualOffsetMS(0)
+	}
+	_ = config.Save(h.cfgPath, h.cfg)
+}
+
+func formatSyncOffsetLabel(ms int) string {
+	if ms == 0 {
+		return "Current Offset: 0 ms"
+	}
+	return fmt.Sprintf("Current Offset: %+d ms", ms)
 }
 
 func (h *appHost) Audio() render.AudioControl {
@@ -551,6 +613,38 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 		})
 	}
 
+	items = append(items, render.MenuItem{
+		Label: "Audience A/V Sync",
+		Submenu: []render.MenuItem{
+			{
+				ID:      addAction(func() (bool, bool, bool) { h.toggleAVSync(); return false, false, false }),
+				Label:   "Auto Sync",
+				Checked: h.cfg.AVSyncEnabled,
+			},
+			{Separator: true},
+			{
+				ID:       addAction(func() (bool, bool, bool) { h.adjustAVSyncOffset(+10); return false, false, false }),
+				Label:    "Delay Audio +10 ms",
+				Disabled: h.cfg.AVSyncOffsetMS >= avsync.MaxOffsetMS,
+			},
+			{
+				ID:       addAction(func() (bool, bool, bool) { h.adjustAVSyncOffset(-10); return false, false, false }),
+				Label:    "Delay Video +10 ms",
+				Disabled: h.cfg.AVSyncOffsetMS <= avsync.MinOffsetMS,
+			},
+			{
+				ID:       addAction(func() (bool, bool, bool) { h.resetAVSyncOffset(); return false, false, false }),
+				Label:    "Reset Offset (0 ms)",
+				Disabled: h.cfg.AVSyncOffsetMS == 0,
+			},
+			{Separator: true},
+			{
+				Label:    formatSyncOffsetLabel(h.cfg.AVSyncOffsetMS),
+				Disabled: true,
+			},
+		},
+	})
+
 	items = append(items,
 		render.MenuItem{Separator: true},
 		render.MenuItem{
@@ -633,6 +727,7 @@ func (h *appHost) startVirtualCameraLocked() error {
 		FriendlyName: vcam.DefaultFriendlyName,
 		ShmMode:      h.vcamShm,
 		FPS:          fps,
+		Sync:         h.avSync,
 	})
 	if err != nil {
 		return err
@@ -819,6 +914,10 @@ func runView(args []string) error {
 	duration := fs.Duration("duration", 0, "optional run duration before clean exit (e.g. 20s)")
 	spoutOn := fs.Bool("spout", cfg.SpoutEnabled, "publish the video as a Spout2 sender (e.g. OBS Spout2 Capture)")
 	spoutName := fs.String("spout-name", "capview", "Spout2 sender name")
+	avSyncOn := fs.Bool("av-sync", cfg.AVSyncEnabled, "auto-sync audience outputs (virtual camera, Spout2, audio mirror)")
+	avSyncOffset := fs.Int("av-sync-offset", cfg.AVSyncOffsetMS, "manual audience A/V sync offset in ms (+ delays audio, - delays video; [-200..200])")
+	syncTest := fs.Bool("sync-test", false, "in synthetic mode, emit synchronized 1 Hz white flash + 1 kHz beep test signal")
+	mirrorTargetMS := fs.Int("audio-mirror-target-ms", 0, "optional audio mirror ring target fill duration in ms (0 = default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -889,6 +988,12 @@ func runView(args []string) error {
 	if setFlags["vcam"] {
 		cfg.VcamEnabled = *vcamFlag
 	}
+	if setFlags["av-sync"] {
+		cfg.AVSyncEnabled = *avSyncOn
+	}
+	if setFlags["av-sync-offset"] {
+		cfg.AVSyncOffsetMS = avsync.ClampOffsetMS(*avSyncOffset)
+	}
 
 	if srcKind == "synthetic" {
 		if !setFlags["size"] {
@@ -902,6 +1007,10 @@ func runView(args []string) error {
 		}
 	}
 
+	if srcKind == "synthetic" && *syncTest && !setFlags["no-audio"] {
+		cfg.AudioDisabled = false
+	}
+
 	if vcam.Available() {
 		vcam.CleanupOldDLLs(vcam.InstallDir)
 	}
@@ -911,16 +1020,30 @@ func runView(args []string) error {
 	tap := capture.NewTap()
 	mb.AddSink(tap)
 
+	syncCtrl := avsync.NewController(avsync.Options{
+		AutoEnabled:    cfg.AVSyncEnabled,
+		ManualOffsetMS: cfg.AVSyncOffsetMS,
+		LogClamp:       func(msg string) { fmt.Fprintln(os.Stderr, msg) },
+	})
+	var syncEpochQPC int64
+	if srcKind == "synthetic" && *syncTest {
+		syncEpochQPC = win.QPC()
+	}
+
 	host := &appHost{
-		cfg:        cfg,
-		cfgPath:    cfgPath,
-		freq:       win.QPCFrequency(),
-		mailbox:    mb,
-		tap:        tap,
-		diag:       *printStats,
-		spoutName:  *spoutName,
-		printStats: *printStats,
-		vcamShm:    *vcamShm,
+		cfg:            cfg,
+		cfgPath:        cfgPath,
+		freq:           win.QPCFrequency(),
+		mailbox:        mb,
+		tap:            tap,
+		diag:           *printStats,
+		spoutName:      *spoutName,
+		printStats:     *printStats,
+		vcamShm:        *vcamShm,
+		avSync:         syncCtrl,
+		syncTest:       srcKind == "synthetic" && *syncTest,
+		syncEpochQPC:   syncEpochQPC,
+		mirrorTargetMS: *mirrorTargetMS,
 	}
 	if err := host.startVideo(srcKind); err != nil {
 		return err
@@ -959,7 +1082,7 @@ func runView(args []string) error {
 	}
 	defer host.stopVirtualCamera()
 
-	if srcKind != "synthetic" {
+	if srcKind != "synthetic" || host.syncTest {
 		host.startAudio()
 		defer host.stopAudio()
 	}
