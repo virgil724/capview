@@ -326,6 +326,9 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 		black    = [4]float32{0, 0, 0, 1}
 		tracker  = stats.New(120, cfg.Freq)
 	)
+	if cfg.PrintStats {
+		defer func() { fmt.Println(tracker.RunSummary()) }()
+	}
 
 	statsTicker := time.NewTicker(time.Second)
 	defer statsTicker.Stop()
@@ -413,6 +416,11 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 					line += fmt.Sprintf(" | vol %d%%", int(a.Volume()*100+0.5))
 				}
 			}
+			if sr, ok := cfg.Host.(interface{ SyncStatsLine() string }); ok {
+				if sl := sr.SyncStatsLine(); sl != "" {
+					line += " | " + sl
+				}
+			}
 			win.SetWindowTitle(hwnd, "capview | "+line)
 			if cfg.PrintStats {
 				fmt.Println(line)
@@ -444,6 +452,7 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				var err error
 				tex0, srv0, tex1, srv1, err = createVideoTextures(dev, f.FourCC, f.Width, f.Height)
 				if err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 				texW, texH, texFmt = f.Width, f.Height, f.FourCC
@@ -452,17 +461,27 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 			// Upload CPU frame -> GPU dynamic texture(s).
 			if f.FourCC == "NV12" {
 				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width, f.Height); err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 				if err := uploadPlane(ctx, tex1, f.Plane1, f.Stride1, f.Width, f.Height/2); err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 			} else {
 				if err := uploadPlane(ctx, tex0, f.Plane0, f.Stride0, f.Width*2, f.Height); err != nil {
+					f.Release()
 					return FinalState{}, err
 				}
 			}
-			f.Release() // hand the capture buffer back to Media Foundation
+			// Under VSync, sc.Present(1, 0) can block 8-16 ms waiting for vblank,
+			// so release the capture buffer right after upload to avoid holding
+			// the driver IMFSample across vblank. Under VRR/LowLat (!useVSync),
+			// Present returns immediately, so defer Release until after Present
+			// so secondary sinks (Spout/Virtual Camera) do not contend with draw and present.
+			if useVSync {
+				f.Release()
+			}
 
 			// Draw full-screen triangle with aspect-preserving viewport.
 			ctx.OMSetRenderTargets(rtv)
@@ -494,6 +513,10 @@ func Run(cfg Config, mailbox *capture.Mailbox) (FinalState, error) {
 				pErr = sc.Present(1, 0)
 			}
 			presentQPC := win.QPC()
+			// Without VSync, hand the capture buffer back only now: secondary
+			// outputs (Spout, Virtual Camera) copy it once the viewer releases it,
+			// and their copy must not compete with this frame's draw and present.
+			f.Release() // no-op if already released above
 			if pErr != nil && !errors.Is(pErr, win.ErrOccluded) {
 				return FinalState{}, fmt.Errorf("present: %w", pErr)
 			}

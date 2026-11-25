@@ -54,13 +54,30 @@ func NewRing(capFrames, targetFrames, maxFrames int) *Ring {
 
 // Write appends interleaved stereo float32 frames (len(lr) == frames*2).
 func (r *Ring) Write(lr []float32) {
-	frames := len(lr) / 2
-	if frames == 0 {
+	if len(lr)/2 == 0 {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.writeLocked(lr)
+}
 
+// TryWrite is Write without waiting: it returns false (writing nothing) if
+// the reader currently holds the lock.
+func (r *Ring) TryWrite(lr []float32) bool {
+	if len(lr)/2 == 0 {
+		return true
+	}
+	if !r.mu.TryLock() {
+		return false
+	}
+	defer r.mu.Unlock()
+	r.writeLocked(lr)
+	return true
+}
+
+func (r *Ring) writeLocked(lr []float32) {
+	frames := len(lr) / 2
 	// If incoming data would exceed maxFrames, drop oldest frames down to targetFrames.
 	if r.avail+frames > r.maxFrames {
 		drop := r.avail + frames - r.targetFrames
@@ -118,6 +135,25 @@ func (r *Ring) Stats() (avail int, overruns, underruns uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.avail, r.overruns, r.underruns
+}
+
+// SetBounds dynamically adjusts targetFrames and maxFrames within [1, capFrames].
+// Used by audience audio mirror A/V sync to shift the ring target fill level
+// smoothly without reallocating or dropping audio.
+func (r *Ring) SetBounds(targetFrames, maxFrames int) {
+	r.mu.Lock()
+	if maxFrames <= 0 || maxFrames > r.capFrames {
+		maxFrames = r.capFrames
+	}
+	if targetFrames <= 0 {
+		targetFrames = 1
+	}
+	if targetFrames > maxFrames {
+		targetFrames = maxFrames
+	}
+	r.targetFrames = targetFrames
+	r.maxFrames = maxFrames
+	r.mu.Unlock()
 }
 
 // DecodeStereo converts raw capture bytes into interleaved stereo float32 [-1, 1].

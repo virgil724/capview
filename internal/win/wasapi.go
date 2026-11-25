@@ -58,15 +58,19 @@ const (
 const (
 	vtEnumAudioEndpoints      = 3 // IMMDeviceEnumerator
 	vtGetDefaultAudioEndpoint = 4
+	vtEnumGetDevice           = 5
 	vtCollectionCount         = 3 // IMMDeviceCollection
 	vtCollectionItem          = 4
 	vtDeviceActivate          = 3 // IMMDevice
 	vtOpenPropertyStore       = 4
+	vtDeviceGetId             = 5
 	vtPropStoreGetValue       = 5 // IPropertyStore
 	vtACInitialize            = 3 // IAudioClient
 	vtACGetBufferSize         = 4
+	vtACGetStreamLatency      = 5
 	vtACGetPadding            = 6
 	vtACGetMixFormat          = 8
+	vtACGetDevicePeriod       = 9
 	vtACStart                 = 10
 	vtACStop                  = 11
 	vtACSetEventHandle        = 13
@@ -90,8 +94,13 @@ type propVariant struct {
 	_   uintptr
 }
 
+// AUDCLNT_E_DEVICE_INVALIDATED: the endpoint was unplugged, disabled or
+// reconfigured; the IAudioClient must be discarded.
+const AUDCLNT_E_DEVICE_INVALIDATED HRESULT = 0x88890004
+
 // Endpoint is an active audio endpoint; caller must Release Device.
 type Endpoint struct {
+	ID     string // IMMDevice::GetId endpoint ID string (stable across reboots)
 	Name   string
 	Device Object
 }
@@ -118,7 +127,7 @@ func AudioEndpoints(flow int) ([]Endpoint, error) {
 		if hr(col.call(vtCollectionItem, uintptr(i), uintptr(unsafe.Pointer(&d)))) != nil {
 			continue
 		}
-		out = append(out, Endpoint{Name: endpointName(d), Device: d})
+		out = append(out, Endpoint{ID: endpointID(d), Name: endpointName(d), Device: d})
 	}
 	return out, nil
 }
@@ -134,7 +143,35 @@ func DefaultAudioEndpoint(flow int) (Endpoint, error) {
 	if err := hr(en.call(vtGetDefaultAudioEndpoint, uintptr(flow), EConsole, uintptr(unsafe.Pointer(&d)))); err != nil {
 		return Endpoint{}, err
 	}
-	return Endpoint{Name: endpointName(d), Device: d}, nil
+	return Endpoint{ID: endpointID(d), Name: endpointName(d), Device: d}, nil
+}
+
+// AudioEndpointByID opens the endpoint with the given IMMDevice ID
+// (IMMDeviceEnumerator::GetDevice).
+func AudioEndpointByID(id string) (Endpoint, error) {
+	en, err := CoCreate(&CLSID_MMDeviceEnumerator, &IID_IMMDeviceEnumerator)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	defer en.Release()
+	wid, err := windows.UTF16PtrFromString(id)
+	if err != nil {
+		return Endpoint{}, err
+	}
+	var d Object
+	if err := hr(en.call(vtEnumGetDevice, uintptr(unsafe.Pointer(wid)), uintptr(unsafe.Pointer(&d)))); err != nil {
+		return Endpoint{}, err
+	}
+	return Endpoint{ID: endpointID(d), Name: endpointName(d), Device: d}, nil
+}
+
+func endpointID(d Object) string {
+	var p *uint16
+	if hr(d.call(vtDeviceGetId, uintptr(unsafe.Pointer(&p)))) != nil || p == nil {
+		return ""
+	}
+	defer procCoTaskMemFree.Call(uintptr(unsafe.Pointer(p)))
+	return windows.UTF16PtrToString(p)
 }
 
 func endpointName(d Object) string {
@@ -248,6 +285,62 @@ func NewAudioClient(device Object, bufferHNS int64) (*AudioClient, error) {
 	return c, nil
 }
 
+// NewAudioClientStereoFloat activates an endpoint in shared event-driven mode
+// with a caller-chosen stereo float32 stream at rate Hz. The audio engine
+// converts to the device mix format (AUTOCONVERTPCM | SRC_DEFAULT_QUALITY),
+// so the stream rate need not match the endpoint's.
+func NewAudioClientStereoFloat(device Object, bufferHNS int64, rate int) (*AudioClient, error) {
+	var ac Object
+	if err := hr(device.call(vtDeviceActivate, uintptr(unsafe.Pointer(&IID_IAudioClient)), 1, 0, uintptr(unsafe.Pointer(&ac)))); err != nil {
+		return nil, fmt.Errorf("activate audio client: %w", err)
+	}
+	const (
+		channels   = 2
+		bits       = 32
+		blockAlign = channels * bits / 8
+	)
+	// WAVEFORMATEXTENSIBLE (40 bytes).
+	var wfx [40]byte
+	binary.LittleEndian.PutUint16(wfx[0:], 0xfffe)
+	binary.LittleEndian.PutUint16(wfx[2:], channels)
+	binary.LittleEndian.PutUint32(wfx[4:], uint32(rate))
+	binary.LittleEndian.PutUint32(wfx[8:], uint32(rate*blockAlign))
+	binary.LittleEndian.PutUint16(wfx[12:], blockAlign)
+	binary.LittleEndian.PutUint16(wfx[14:], bits)
+	binary.LittleEndian.PutUint16(wfx[16:], 22)   // cbSize
+	binary.LittleEndian.PutUint16(wfx[18:], bits) // wValidBitsPerSample
+	binary.LittleEndian.PutUint32(wfx[20:], 0x3)  // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+	binary.LittleEndian.PutUint32(wfx[24:], subtypeIEEEFloat.Data1)
+	binary.LittleEndian.PutUint16(wfx[28:], subtypeIEEEFloat.Data2)
+	binary.LittleEndian.PutUint16(wfx[30:], subtypeIEEEFloat.Data3)
+	copy(wfx[32:40], subtypeIEEEFloat.Data4[:])
+
+	c := &AudioClient{Object: ac, Format: WaveFormat{Channels: channels, Rate: rate, Bits: bits, Float: true, BlockAlign: blockAlign}}
+	const (
+		eventCallback     = 0x00040000
+		autoConvertPCM    = 0x80000000
+		srcDefaultQuality = 0x08000000
+	)
+	if err := hr(ac.call(vtACInitialize, 0, eventCallback|autoConvertPCM|srcDefaultQuality, uintptr(bufferHNS), 0, uintptr(unsafe.Pointer(&wfx[0])), 0)); err != nil {
+		ac.Release()
+		return nil, fmt.Errorf("initialize audio client: %w", err)
+	}
+	var frames uint32
+	ac.call(vtACGetBufferSize, uintptr(unsafe.Pointer(&frames)))
+	c.Frames = int(frames)
+	ev, err := windows.CreateEvent(nil, 0, 0, nil)
+	if err != nil {
+		ac.Release()
+		return nil, err
+	}
+	c.Event = ev
+	if err := hr(ac.call(vtACSetEventHandle, uintptr(ev))); err != nil {
+		c.Close()
+		return nil, err
+	}
+	return c, nil
+}
+
 func (c *AudioClient) Close() {
 	c.Release()
 	windows.CloseHandle(c.Event)
@@ -260,6 +353,19 @@ func (c *AudioClient) Padding() (int, error) {
 	var n uint32
 	err := hr(c.call(vtACGetPadding, uintptr(unsafe.Pointer(&n))))
 	return int(n), err
+}
+
+// StreamLatency returns IAudioClient::GetStreamLatency in 100ns (HNS) units.
+func (c *AudioClient) StreamLatency() (int64, error) {
+	var hns int64
+	err := hr(c.call(vtACGetStreamLatency, uintptr(unsafe.Pointer(&hns))))
+	return hns, err
+}
+
+// DevicePeriod returns IAudioClient::GetDevicePeriod (default, minimum) in 100ns (HNS) units.
+func (c *AudioClient) DevicePeriod() (defaultHNS, minHNS int64, err error) {
+	err = hr(c.call(vtACGetDevicePeriod, uintptr(unsafe.Pointer(&defaultHNS)), uintptr(unsafe.Pointer(&minHNS))))
+	return defaultHNS, minHNS, err
 }
 
 func (c *AudioClient) Service(iid *GUID) (Object, error) {

@@ -82,16 +82,43 @@ go build -ldflags="-s -w" -o capview-cli.exe ./cmd/capview
 .\capview.exe
 ```
 
-Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
+Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, Spout output, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
 
 ### Controls
 
-- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Fullscreen, VRR/VSync, Mute, Quit)
+- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Audio Mirror Output, Fullscreen, VRR/VSync, Mute, Spout Output, Virtual Camera, Audience A/V Sync, Quit)
 - `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s; engages Independent Flip / VRR for <1 ms display latency)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
 - `M`: Mute / unmute audio
 - `Up` / `Down` / Mouse Wheel: Volume +/- 5%
 - `ESC` / `Q`: Quit
+
+### Spout2 output (OBS)
+
+Right-click → **Spout Output** (or `-spout`, saved as `spout_enabled`) publishes the video as a Spout2 sender named `capview` (`-spout-name` to change it). In OBS add a **Spout2 Capture** source ([obs-spout2-plugin](https://github.com/Off-World-Live/obs-spout2-plugin)) and pick `capview`. Off by default; turning it off unregisters the sender and the OBS source goes blank.
+
+The sender is pure Go (no Spout DLL): a separate thread with its own D3D11 device converts NV12/YUY2 to a BGRA legacy shared texture, fed by a drop-oldest copy of each captured frame, so the viewer never waits for it. `go run ./tools/spoutcheck` lists senders, measures the sender frame rate and saves a received frame as PNG without OBS.
+
+## Windows 11 x64 Virtual Camera
+
+`capview` can expose your live capture feed as **`capview Virtual Camera`** to Windows Camera, Google Meet, Chrome, OBS, Teams, and Zoom via `MFCreateVirtualCamera` (`MFVirtualCameraLifetime_Session` + `MFVirtualCameraAccess_CurrentUser`).
+
+- **Supported platform**: **Windows 11 x64 (`windows/amd64`) only** (disabled/hidden on Windows ARM64 and Linux).
+- **Bundle layout**: Keep `capview_vcam.dll` in the same directory as `capview.exe`.
+- **Usage**:
+  - Right-click the viewer window → **`Virtual Camera`** ▸ **`Enable`** / **`Disable`** / **`Uninstall`** (or pass `-vcam` on the CLI; saved as `"vcam_enabled"` in `config.json`, `false` by default).
+  - **One-time UAC elevation**: Enabling for the first time (or when the bundled `capview_vcam.dll` version/hash changes) prompts UAC once to run `capview.exe -vcam-install`, deploying the COM DLL to `C:\ProgramData\capview\`, setting `LocalService` ACLs, and registering the CLSID in `HKLM`. Everyday **Enable** / **Disable** afterwards runs with **zero admin privileges**.
+  - **Standby placeholder**: When capture is idle or paused, the COM source outputs a dark `"capview"` placeholder frame at the negotiated mode (`1080p60`, `1080p30`, `720p60`, `720p30`).
+- **TODO (Code Signing)**: Release binaries (`capview.exe` and `capview_vcam.dll`) are not yet Authenticode-signed. Adding an Authenticode signing step to the release workflow is tracked before public distribution to avoid Microsoft Defender SmartScreen prompts and WDAC/HVCI `svchost.exe` load restrictions.
+
+### Audience A/V Sync
+
+When sharing gameplay to an audience (Virtual Camera / Spout2 + Audio Mirror such as VB-Cable), `capview` automatically aligns the audience video and audio paths on a common QPC clock without adding any buffering or delay to your local monitor or local speakers/headphones:
+
+- **Enabled by default** (`"av_sync_enabled": true`, CLI `-av-sync=true|false`) and affects **audience outputs only**; when either audience audio or audience video is off, sync stays idle (`0 ms` compensation).
+- **Delays only the faster path**: when audience video is faster than the audio mirror (common case), frames pass through a bounded 16-frame QPC-scheduled staging delay queue (15-frame max delay + 1 jitter slot = up to `125 ms` @ 120 fps / `250 ms` @ 60 fps, lazily allocated only while delaying) after the non-blocking tap (never holding `IMFSample`); when audio is faster, the audio mirror ring target smoothly rises via subtle micro-resampling. Changes are slew-rate-limited (`3 ms/s`) to avoid stutters or clicks.
+- **Manual fine-tune**: right-click → **`Audience A/V Sync`** (`Auto Sync`, `Delay Audio +10 ms`, `Delay Video +10 ms`, `Reset Offset (0 ms)`) or `"av_sync_offset_ms"` (`[-200..+200]`, positive delays audio further, negative delays video further) lets you trim downstream app latency (e.g. Meet/Zoom internal processing).
+- **Built-in test signal**: `-source synthetic -sync-test` emits a QPC-locked 1 Hz white flash + 1 kHz `-12 dBFS` beep through both video and audio mirror pipelines for end-to-end verification.
 
 ## Roadmap
 

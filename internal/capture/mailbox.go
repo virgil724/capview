@@ -19,6 +19,8 @@ type Config struct {
 	Format        string  // "auto" (NV12 preferred, then YUY2), "NV12", or "YUY2"
 	AutoReconnect bool    // automatically retry if signal drops or device resets
 	Mailbox       *Mailbox
+	SyncTest      bool  // synthetic mode: emit 1 Hz white flash pinned to SyncEpochQPC
+	SyncEpochQPC  int64 // shared QPC epoch for synchronized flash + beep test
 }
 
 // Mode is the native capture mode negotiated with the device.
@@ -62,6 +64,8 @@ type Mailbox struct {
 	taken   Frame // frame handed to the consumer by the last Take
 	dropped atomic.Uint64
 	notify  chan struct{}
+	sinks   sinkSet   // secondary consumers (see tap.go)
+	fan     fanWorker // copies frames to the sinks off the capture thread
 }
 
 // NewMailbox creates a latest-frame mailbox.
@@ -99,7 +103,22 @@ func (m *Mailbox) Discard() {
 	}
 }
 
+// Close discards any pending frame and shuts down the fan-out worker,
+// releasing any queued fan-out job. Safe to call more than once.
+func (m *Mailbox) Close() {
+	m.Discard()
+	m.fan.close()
+}
+
 func (m *Mailbox) publish(f Frame) {
+	// Fan-out: enabled sinks copy the frame on the fan-out goroutine once
+	// the display path has released it (see fanWorker). The capture buffer
+	// is reference-counted so whichever side finishes last releases it.
+	var job *fanJob
+	if sinks := m.fanOut(); len(sinks) > 0 {
+		job = prepareFanOut(&f, sinks)
+	}
+
 	m.mu.Lock()
 	if m.hasNew {
 		m.dropped.Add(1)
@@ -111,6 +130,10 @@ func (m *Mailbox) publish(f Frame) {
 	select {
 	case m.notify <- struct{}{}:
 	default:
+	}
+
+	if job != nil {
+		m.fan.submit(job)
 	}
 }
 

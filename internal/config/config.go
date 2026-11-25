@@ -16,30 +16,41 @@ type Config struct {
 	Format        string  `json:"format"`
 	AudioIn       string  `json:"audio_in"`
 	AudioOut      string  `json:"audio_out"`
+	AudioMirrorID string  `json:"audio_mirror_id"` // playback endpoint ID for the mirror copy; "" = off
 	AudioDisabled bool    `json:"audio_disabled"`
 	Volume        float32 `json:"volume"`
 	Muted         bool    `json:"muted"`
 	VSync         bool    `json:"vsync"`
 	Fullscreen    bool    `json:"fullscreen"`
 	Display       string  `json:"display"`
+	VcamEnabled   bool    `json:"vcam_enabled"`
 	WinX          int32   `json:"win_x,omitempty"`
 	WinY          int32   `json:"win_y,omitempty"`
 	WinW          int32   `json:"win_w,omitempty"`
 	WinH          int32   `json:"win_h,omitempty"`
+	// SpoutEnabled publishes the capture as a Spout2 sender (Windows).
+	SpoutEnabled bool `json:"spout_enabled"`
+	// AVSyncEnabled automatically synchronizes audience outputs (audio mirror,
+	// virtual camera, Spout2) without adding any latency to local playback.
+	AVSyncEnabled bool `json:"av_sync_enabled"`
+	// AVSyncOffsetMS is a manual fine-tune offset in milliseconds for audience
+	// outputs (+ delays audio further, - delays video further; clamped [-200..200]).
+	AVSyncOffsetMS int `json:"av_sync_offset_ms"`
 }
 
 // Default returns sensible defaults for first launch.
 func Default() Config {
 	return Config{
-		Device:   "auto",
-		Width:    1920,
-		Height:   1080,
-		FPS:      60,
-		Format:   "auto",
-		AudioIn:  "auto",
-		AudioOut: "default",
-		Volume:   1.0,
-		Display:  "primary",
+		Device:        "auto",
+		Width:         1920,
+		Height:        1080,
+		FPS:           60,
+		Format:        "auto",
+		AudioIn:       "auto",
+		AudioOut:      "default",
+		Volume:        1.0,
+		Display:       "primary",
+		AVSyncEnabled: true,
 	}
 }
 
@@ -85,6 +96,11 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Volume <= 0 || cfg.Volume > 1 {
 		cfg.Volume = 1.0
+	}
+	if cfg.AVSyncOffsetMS < -200 {
+		cfg.AVSyncOffsetMS = -200
+	} else if cfg.AVSyncOffsetMS > 200 {
+		cfg.AVSyncOffsetMS = 200
 	}
 	return cfg, nil
 }
