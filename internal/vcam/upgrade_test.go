@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -209,7 +210,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 
 	t.Run("fresh", func(t *testing.T) {
 		ops := &fakeDeployOps{files: map[string][]byte{src: []byte("v1")}, fixedNow: fixed}
-		res, err := deployDLL(src, dst, UpgradeAuto, ops)
+		res, err := deployDLL(src, dst, UpgradeAuto, BackendMF, ops)
 		if err != nil || res.Tier != "fresh" || string(ops.files[dst]) != "v1" {
 			t.Fatalf("fresh failed: res=%+v err=%v", res, err)
 		}
@@ -217,7 +218,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 
 	t.Run("noop_same_hash", func(t *testing.T) {
 		ops := &fakeDeployOps{files: map[string][]byte{src: []byte("v1"), dst: []byte("v1")}, fixedNow: fixed}
-		res, err := deployDLL(src, dst, UpgradeAuto, ops)
+		res, err := deployDLL(src, dst, UpgradeAuto, BackendMF, ops)
 		if err != nil || res.Tier != "noop" || ops.stoppedCount != 0 {
 			t.Fatalf("noop failed: res=%+v err=%v stops=%d", res, err, ops.stoppedCount)
 		}
@@ -225,7 +226,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 
 	t.Run("tier1_rename", func(t *testing.T) {
 		ops := &fakeDeployOps{files: map[string][]byte{src: []byte("v2"), dst: []byte("v1")}, fixedNow: fixed}
-		res, err := deployDLL(src, dst, UpgradeAuto, ops)
+		res, err := deployDLL(src, dst, UpgradeAuto, BackendMF, ops)
 		if err != nil || res.Tier != "rename" {
 			t.Fatalf("tier1 rename failed: res=%+v err=%v", res, err)
 		}
@@ -247,7 +248,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 			renameErr: errors.New("sharing violation"),
 			fixedNow:  fixed,
 		}
-		res, err := deployDLL(src, dst, UpgradeAuto, ops)
+		res, err := deployDLL(src, dst, UpgradeAuto, BackendMF, ops)
 		if err != nil || res.Tier != "frameserver-restart" {
 			t.Fatalf("tier2 fallback failed: res=%+v err=%v", res, err)
 		}
@@ -262,7 +263,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 			renameErr: errors.New("locked"),
 			fixedNow:  fixed,
 		}
-		if _, err := deployDLL(src, dst, UpgradeRename, ops); err == nil {
+		if _, err := deployDLL(src, dst, UpgradeRename, BackendMF, ops); err == nil {
 			t.Fatal("expected error when UpgradeRename fails")
 		}
 		if ops.stoppedCount != 0 {
@@ -272,7 +273,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 
 	t.Run("forced_restart_even_same_hash", func(t *testing.T) {
 		ops := &fakeDeployOps{files: map[string][]byte{src: []byte("v1"), dst: []byte("v1")}, fixedNow: fixed}
-		res, err := deployDLL(src, dst, UpgradeRestart, ops)
+		res, err := deployDLL(src, dst, UpgradeRestart, BackendMF, ops)
 		if err != nil || res.Tier != "frameserver-restart" || ops.stoppedCount != 1 || ops.startedCount != 1 {
 			t.Fatalf("forced restart failed: res=%+v err=%v stop=%d start=%d", res, err, ops.stoppedCount, ops.startedCount)
 		}
@@ -284,7 +285,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 			copyErr:  errors.New("disk full"),
 			fixedNow: fixed,
 		}
-		if _, err := deployDLL(src, dst, UpgradeAuto, ops); err == nil {
+		if _, err := deployDLL(src, dst, UpgradeAuto, BackendMF, ops); err == nil {
 			t.Fatal("expected error when copy fails")
 		}
 		if string(ops.files[dst]) != "v1" {
@@ -298,7 +299,7 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 			removeErr: errors.New("access denied"),
 			fixedNow:  fixed,
 		}
-		tier, err := removeInstalledDLL(dst, UpgradeAuto, ops1)
+		tier, err := removeInstalledDLL(dst, UpgradeAuto, BackendMF, ops1)
 		if err != nil || tier != "rename-deferred" || len(ops1.rebootDel) != 1 {
 			t.Fatalf("uninstall rename fallback failed: tier=%q err=%v reboot=%v", tier, err, ops1.rebootDel)
 		}
@@ -310,11 +311,61 @@ func TestDeployDLLModesAndFallbacks(t *testing.T) {
 			fixedNow:  fixed,
 		}
 		// Once FrameServer stops, removeFile succeeds in real life; simulate by clearing removeErr via restart mode test or custom ops.
-		if _, err := removeInstalledDLL(dst, UpgradeAuto, ops2); err == nil {
+		if _, err := removeInstalledDLL(dst, UpgradeAuto, BackendMF, ops2); err == nil {
 			t.Fatal("expected error when removeErr stays set after FrameServer stop")
 		}
 		if ops2.stoppedCount != 1 || ops2.startedCount != 1 {
 			t.Fatalf("expected FrameServer stop+start on fallback, stop=%d start=%d", ops2.stoppedCount, ops2.startedCount)
+		}
+	})
+
+	t.Run("dshow_deploy_never_touches_frameserver_and_explains_close_apps", func(t *testing.T) {
+		ops := &fakeDeployOps{
+			files:     map[string][]byte{src: []byte("v2"), dst: []byte("v1")},
+			renameErr: errors.New("sharing violation"),
+			fixedNow:  fixed,
+		}
+		_, err := deployDLL(src, dst, UpgradeAuto, BackendDShow, ops)
+		if err == nil {
+			t.Fatal("expected error when DirectShow tier-1 rename fails")
+		}
+		if ops.stoppedCount != 0 || ops.startedCount != 0 {
+			t.Fatalf("BackendDShow must never stop/start FrameServer: stop=%d start=%d", ops.stoppedCount, ops.startedCount)
+		}
+		if !strings.Contains(err.Error(), "OBS") || !strings.Contains(err.Error(), "close applications") {
+			t.Fatalf("expected actionable close-apps error message, got: %v", err)
+		}
+
+		// Even UpgradeRestart mode must not touch FrameServer for BackendDShow.
+		opsRestart := &fakeDeployOps{
+			files:     map[string][]byte{src: []byte("v2"), dst: []byte("v1")},
+			renameErr: errors.New("locked"),
+			fixedNow:  fixed,
+		}
+		if _, err := deployDLL(src, dst, UpgradeRestart, BackendDShow, opsRestart); err == nil {
+			t.Fatal("expected error on BackendDShow UpgradeRestart when rename fails")
+		}
+		if opsRestart.stoppedCount != 0 || opsRestart.startedCount != 0 {
+			t.Fatalf("BackendDShow UpgradeRestart must never touch FrameServer: stop=%d start=%d", opsRestart.stoppedCount, opsRestart.startedCount)
+		}
+	})
+
+	t.Run("dshow_uninstall_never_touches_frameserver_and_explains_close_apps", func(t *testing.T) {
+		ops := &fakeDeployOps{
+			files:     map[string][]byte{dst: []byte("v1")},
+			removeErr: errors.New("locked"),
+			renameErr: errors.New("locked"),
+			fixedNow:  fixed,
+		}
+		_, err := removeInstalledDLL(dst, UpgradeAuto, BackendDShow, ops)
+		if err == nil {
+			t.Fatal("expected error when DirectShow uninstall rename fails")
+		}
+		if ops.stoppedCount != 0 || ops.startedCount != 0 {
+			t.Fatalf("BackendDShow uninstall must never stop/start FrameServer: stop=%d start=%d", ops.stoppedCount, ops.startedCount)
+		}
+		if !strings.Contains(err.Error(), "OBS") || !strings.Contains(err.Error(), "close applications") {
+			t.Fatalf("expected actionable close-apps error message, got: %v", err)
 		}
 	})
 }

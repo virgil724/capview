@@ -26,8 +26,18 @@ import (
 	"golang.org/x/sys/windows/svc/mgr"
 )
 
-// Available reports whether Windows 11 x64 Virtual Camera is supported on this platform build.
+// Available reports whether Windows x64 Virtual Camera (Win11 MF or Win10 DirectShow)
+// is supported on this platform build.
 func Available() bool { return true }
+
+// DetectOSBackend inspects the running Windows build (via RtlGetVersion) and
+// MFIsVirtualCameraTypeSupported to choose the single expected backend:
+// BackendMF on Windows 11 (build >= 22000 + MF support) or BackendDShow on Windows 10.
+func DetectOSBackend() (winBuild uint32, mfSupported bool, expected Backend) {
+	build, _ := win.WindowsBuildNumber()
+	mfOK, _ := win.IsVirtualCameraSupported()
+	return build, mfOK, SelectExpectedBackend(build, mfOK)
+}
 
 // ShmWriter publishes tightly-packed NV12 frames into cross-session shared memory.
 type ShmWriter struct {
@@ -300,8 +310,10 @@ func (w *ShmWriter) Close() {
 	}
 }
 
-// Controller manages the running Windows 11 virtual camera and tap-to-SHM pump.
+// Controller manages the running Windows virtual camera (Win11 MF or Win10 DirectShow)
+// and tap-to-SHM pump.
 type Controller struct {
+	backend      Backend
 	shm          *ShmWriter
 	tap          *capture.Tap
 	sync         *avsync.Controller
@@ -324,8 +336,12 @@ func (c *Controller) getFPS() float64 {
 	return v
 }
 
-// Start creates and starts the Windows 11 virtual camera (Session + CurrentUser)
+// Start opens shared memory, optionally starts MFCreateVirtualCamera (on Win11 MF mode),
 // and pumps frames from tap into shared memory.
+// In DirectShow mode (Win10 or BackendDShow), MFCreateVirtualCamera is never called:
+// Start opens SHM (Active=0 until the first WriteNV12) and pumps frames through the
+// shared avsync VideoDelayQueue; Stop clears delayQ and sets Active=0 so the resident
+// DirectShow filter immediately outputs the dark "capview" placeholder.
 func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 	if tap == nil {
 		return nil, errors.New("vcam: nil capture tap")
@@ -336,7 +352,17 @@ func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 	if opts.FPS <= 0 {
 		opts.FPS = 60
 	}
-	if !opts.SkipMFRegistration {
+
+	backend := opts.Backend
+	if opts.SkipMFRegistration {
+		backend = BackendDShow
+	} else if backend == "" || backend == BackendAuto {
+		_, _, backend = DetectOSBackend()
+	} else if backend != BackendMF && backend != BackendDShow {
+		return nil, fmt.Errorf("invalid runtime virtual camera backend %q (expected auto, mf, or dshow)", backend)
+	}
+
+	if backend == BackendMF {
 		ok, err := win.IsVirtualCameraSupported()
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
@@ -352,6 +378,7 @@ func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 	}
 
 	c := &Controller{
+		backend:  backend,
 		shm:      shm,
 		tap:      tap,
 		sync:     opts.Sync,
@@ -365,7 +392,7 @@ func Start(tap *capture.Tap, opts Options) (*Controller, error) {
 		c.freq = 10_000_000
 	}
 
-	if !opts.SkipMFRegistration {
+	if backend == BackendMF {
 		c.mfStopCh = make(chan struct{})
 		c.mfDone = make(chan struct{})
 		ready := make(chan error, 1)
@@ -430,6 +457,11 @@ func (c *Controller) runMF(friendlyName string, ready chan<- error) {
 
 func (c *Controller) runPump() {
 	defer close(c.pumpDone)
+	defer func() {
+		if c.delayQ != nil {
+			c.delayQ.Reset()
+		}
+	}()
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	stopTimer := func() {
@@ -540,6 +572,7 @@ func (c *Controller) Stats() Stats {
 		return Stats{}
 	}
 	return Stats{
+		Backend:        c.backend,
 		FramesWritten:  c.shm.frames.Load(),
 		ShmBackend:     c.shm.backend,
 		ShmGlobalErr:   c.shm.globalErr,
@@ -602,8 +635,13 @@ func qpcToHNS(qpc, freq int64) int64 {
 	return qpc/freq*10_000_000 + (qpc%freq)*10_000_000/freq
 }
 
-const clsidInprocSubkey = `SOFTWARE\Classes\CLSID\` + SourceCLSID + `\InprocServer32`
-const clsidSubkey = `SOFTWARE\Classes\CLSID\` + SourceCLSID
+const (
+	clsidMFSubkey              = `SOFTWARE\Classes\CLSID\` + SourceCLSID
+	clsidMFInprocSubkey        = clsidMFSubkey + `\InprocServer32`
+	clsidDShowSubkey           = `SOFTWARE\Classes\CLSID\` + SourceDShowCLSID
+	clsidDShowInprocSubkey     = clsidDShowSubkey + `\InprocServer32`
+	dshowCategoryInstanceSubkey = `SOFTWARE\Classes\CLSID\` + VideoInputDeviceCategoryCLSID + `\Instance\` + SourceDShowCLSID
+)
 
 // BundledDLLPath returns the path to the bundled capview_vcam.dll next to capview.exe
 // (or override if provided).
@@ -618,58 +656,94 @@ func BundledDLLPath(override string) (string, error) {
 	return filepath.Join(filepath.Dir(exe), BundledDLLName), nil
 }
 
-// IsInstalled reports whether the COM DLL is registered in HKLM and present on disk.
+// IsInstalled reports whether the matching OS backend is validly registered in HKLM and present on disk.
 func IsInstalled() bool {
 	return CheckInstallStatus("").Installed
 }
 
-// CheckInstallStatus inspects HKLM COM registration and compares the deployed
-// C:\ProgramData\capview\capview_vcam.dll against the bundled DLL next to capview.exe.
-func CheckInstallStatus(bundledOverride string) InstallStatus {
-	st := InstallStatus{
-		InstalledPath: InstalledDLLPath,
+func inspectInprocCLSID(clsidKey, inprocKey string) (keyExists, valid bool, regPath string) {
+	kBase, err := registry.OpenKey(registry.LOCAL_MACHINE, clsidKey, registry.QUERY_VALUE)
+	if err != nil {
+		return false, false, ""
 	}
+	kBase.Close()
+	keyExists = true
+
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, inprocKey, registry.QUERY_VALUE)
+	if err != nil {
+		return true, false, ""
+	}
+	regPath, _, _ = k.GetStringValue("")
+	model, _, _ := k.GetStringValue("ThreadingModel")
+	k.Close()
+
+	valid = strings.EqualFold(filepath.Clean(regPath), filepath.Clean(InstalledDLLPath)) &&
+		strings.EqualFold(model, "Both")
+	return keyExists, valid, regPath
+}
+
+func inspectDShowCategory() (exists, valid bool) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, dshowCategoryInstanceSubkey, registry.QUERY_VALUE)
+	if err != nil {
+		return false, false
+	}
+	clsidVal, _, _ := k.GetStringValue("CLSID")
+	k.Close()
+	return true, strings.EqualFold(strings.TrimSpace(clsidVal), SourceDShowCLSID)
+}
+
+// CheckInstallStatus inspects OS version, MF support, HKLM MF & DirectShow registrations,
+// and compares the deployed C:\ProgramData\capview\capview_vcam.dll against the bundled DLL.
+func CheckInstallStatus(bundledOverride string) InstallStatus {
+	return CheckInstallStatusForBackend(bundledOverride, BackendAuto)
+}
+
+// CheckInstallStatusForBackend checks install status against either auto-detected OS backend
+// or an explicit requested backend override.
+func CheckInstallStatusForBackend(bundledOverride string, requested Backend) InstallStatus {
+	build, mfOK, _ := DetectOSBackend()
+	mfExists, mfValid, mfPath := inspectInprocCLSID(clsidMFSubkey, clsidMFInprocSubkey)
+	dsExists, dsValid, dsPath := inspectInprocCLSID(clsidDShowSubkey, clsidDShowInprocSubkey)
+	dsCatExists, dsCatValid := inspectDShowCategory()
+
+	in := StatusInput{
+		WindowsBuild:            build,
+		MFSupported:             mfOK,
+		RequestedBackend:        requested,
+		MFKeyExists:             mfExists,
+		MFValid:                 mfValid,
+		MFRegisteredPath:        mfPath,
+		DShowCLSIDExists:        dsExists,
+		DShowCLSIDValid:         dsValid && dsCatValid,
+		DShowRegisteredPath:     dsPath,
+		DShowCategoryRegistered: dsCatExists,
+		InstalledPath:           InstalledDLLPath,
+	}
+
 	if bPath, err := BundledDLLPath(bundledOverride); err == nil {
-		st.BundledPath = bPath
+		in.BundledPath = bPath
 		if ok, _ := fileExists(bPath); ok {
-			st.BundledExists = true
+			in.BundledExists = true
 			if h, err := FileSHA256(bPath); err == nil {
-				st.BundledSHA256 = h
+				in.BundledSHA256 = h
 			}
 			if v, err := win.GetFileVersion(bPath); err == nil {
-				st.BundledVersion = v.String()
+				in.BundledVersion = v.String()
 			}
 		}
 	}
 
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, clsidInprocSubkey, registry.QUERY_VALUE)
-	if err == nil {
-		regPath, _, _ := k.GetStringValue("")
-		model, _, _ := k.GetStringValue("ThreadingModel")
-		k.Close()
-		st.RegisteredPath = regPath
-		if strings.EqualFold(filepath.Clean(regPath), filepath.Clean(InstalledDLLPath)) &&
-			strings.EqualFold(model, "Both") {
-			if ok, _ := fileExists(InstalledDLLPath); ok {
-				st.Installed = true
-				if h, err := FileSHA256(InstalledDLLPath); err == nil {
-					st.InstalledSHA256 = h
-				}
-				if v, err := win.GetFileVersion(InstalledDLLPath); err == nil {
-					st.InstalledVersion = v.String()
-				}
-			}
+	if ok, _ := fileExists(InstalledDLLPath); ok {
+		in.InstalledExists = true
+		if h, err := FileSHA256(InstalledDLLPath); err == nil {
+			in.InstalledSHA256 = h
+		}
+		if v, err := win.GetFileVersion(InstalledDLLPath); err == nil {
+			in.InstalledVersion = v.String()
 		}
 	}
 
-	if st.Installed {
-		if !st.BundledExists {
-			st.UpToDate = true
-		} else if st.BundledSHA256 != "" && st.BundledSHA256 == st.InstalledSHA256 {
-			st.UpToDate = true
-		}
-	}
-	return st
+	return EvaluateInstallStatus(in)
 }
 
 type winDeployOps struct{}
@@ -696,6 +770,9 @@ func controlFrameServer(start bool) error {
 
 	s, err := m.OpenService("FrameServer")
 	if err != nil {
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return nil
+		}
 		return fmt.Errorf("open FrameServer service: %w", err)
 	}
 	defer s.Close()
@@ -767,7 +844,8 @@ func runRegsvr32(args ...string) error {
 }
 
 // Install performs elevated installation or upgrade of capview_vcam.dll,
-// HKLM COM registration, NTFS ACL setup, and SHM file pre-creation.
+// OS-aware HKLM COM/DirectShow registration (cleaning any stale opposite-backend
+// registration first), NTFS ACL setup, and SHM file pre-creation.
 func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 	if log == nil {
 		log = io.Discard
@@ -779,6 +857,16 @@ func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 	if ok, err := fileExists(srcDLL); err != nil || !ok {
 		return UpgradeResult{}, fmt.Errorf("%w: %s", ErrBundledDLLMissing, srcDLL)
 	}
+
+	winBuild, mfOK, osBackend := DetectOSBackend()
+	targetBackend := opts.Backend
+	if targetBackend == "" || targetBackend == BackendAuto {
+		targetBackend = osBackend
+	}
+	if targetBackend != BackendMF && targetBackend != BackendDShow && targetBackend != BackendBoth {
+		return UpgradeResult{}, fmt.Errorf("invalid install backend %q (expected auto, mf, dshow, or both)", targetBackend)
+	}
+
 	var oldVer string
 	if v, err := win.GetFileVersion(InstalledDLLPath); err == nil {
 		oldVer = v.String()
@@ -788,7 +876,8 @@ func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 		newVer = v.String()
 	}
 
-	fmt.Fprintf(log, "vcam-install: bundled=%s version=%s mode=%s\n", srcDLL, newVer, opts.UpgradeMode)
+	fmt.Fprintf(log, "vcam-install: os_build=%d mf_supported=%v backend=%s bundled=%s version=%s mode=%s\n",
+		winBuild, mfOK, targetBackend, srcDLL, newVer, opts.UpgradeMode)
 
 	if err := os.MkdirAll(InstallDir, 0o755); err != nil {
 		return UpgradeResult{}, fmt.Errorf("mkdir %s: %w", InstallDir, err)
@@ -801,10 +890,11 @@ func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 		fmt.Fprintf(log, "vcam-install: cleaned %d leftover .old DLL(s)\n", cleaned)
 	}
 
-	res, err := deployDLL(srcDLL, InstalledDLLPath, opts.UpgradeMode, winDeployOps{})
+	res, err := deployDLL(srcDLL, InstalledDLLPath, opts.UpgradeMode, targetBackend, winDeployOps{})
 	if err != nil {
 		return UpgradeResult{}, err
 	}
+	res.Backend = targetBackend
 	res.OldVersion = oldVer
 	res.NewVersion = newVer
 	fmt.Fprintf(log, "vcam-install: deployed %s via tier=%s (sha256=%s)\n", InstalledDLLPath, res.Tier, res.NewSHA256)
@@ -812,22 +902,57 @@ func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 		fmt.Fprintf(log, "vcam-install: previous DLL moved to %s (pending cleanup)\n", res.OldBackup)
 	}
 
-	if err := runRegsvr32("/s", InstalledDLLPath); err != nil {
+	// Cleanly unregister any stale opposite backend first so single-backend installs never leave duplicates.
+	switch targetBackend {
+	case BackendMF:
+		_ = runRegsvr32("/s", "/u", "/n", "/i:dshow", InstalledDLLPath)
+		if err := deleteRegistryTree(registry.LOCAL_MACHINE, dshowCategoryInstanceSubkey); err != nil {
+			return UpgradeResult{}, fmt.Errorf("clean stale DShow category key: %w", err)
+		}
+		if err := deleteRegistryTree(registry.LOCAL_MACHINE, clsidDShowSubkey); err != nil {
+			return UpgradeResult{}, fmt.Errorf("clean stale DShow CLSID key: %w", err)
+		}
+	case BackendDShow:
+		_ = runRegsvr32("/s", "/u", "/n", "/i:mf", InstalledDLLPath)
+		if err := deleteRegistryTree(registry.LOCAL_MACHINE, clsidMFSubkey); err != nil {
+			return UpgradeResult{}, fmt.Errorf("clean stale MF CLSID key: %w", err)
+		}
+	}
+
+	if err := runRegsvr32("/s", "/n", "/i:"+string(targetBackend), InstalledDLLPath); err != nil {
 		return UpgradeResult{}, err
 	}
 
-	// Verify HKLM registration points to InstalledDLLPath with ThreadingModel=Both.
-	k, err := registry.OpenKey(registry.LOCAL_MACHINE, clsidInprocSubkey, registry.QUERY_VALUE)
-	if err != nil {
-		return UpgradeResult{}, fmt.Errorf("verify HKLM %s: %w", clsidInprocSubkey, err)
+	// Verify HKLM registration matches targetBackend.
+	mfExists, mfValid, mfPath := inspectInprocCLSID(clsidMFSubkey, clsidMFInprocSubkey)
+	dsExists, dsValid, dsPath := inspectInprocCLSID(clsidDShowSubkey, clsidDShowInprocSubkey)
+	dsCatExists, dsCatValid := inspectDShowCategory()
+
+	switch targetBackend {
+	case BackendMF:
+		if !mfValid {
+			return UpgradeResult{}, fmt.Errorf("MF HKLM registration verification failed (exists=%v path=%q)", mfExists, mfPath)
+		}
+		if dsExists || dsCatExists {
+			return UpgradeResult{}, fmt.Errorf("unexpected leftover DirectShow registration after MF install (clsid=%v cat=%v)", dsExists, dsCatExists)
+		}
+		fmt.Fprintf(log, "vcam-install: registered MF CLSID %s -> %s (ThreadingModel=Both)\n", SourceCLSID, mfPath)
+	case BackendDShow:
+		if !dsValid || !dsCatValid {
+			return UpgradeResult{}, fmt.Errorf("DirectShow HKLM registration verification failed (clsid=%v valid=%v cat=%v catValid=%v path=%q)",
+				dsExists, dsValid, dsCatExists, dsCatValid, dsPath)
+		}
+		if mfExists {
+			return UpgradeResult{}, fmt.Errorf("unexpected leftover MF registration after DirectShow install")
+		}
+		fmt.Fprintf(log, "vcam-install: registered DirectShow filter %s -> %s (VideoInputDeviceCategory)\n", SourceDShowCLSID, dsPath)
+	case BackendBoth:
+		if !mfValid || !dsValid || !dsCatValid {
+			return UpgradeResult{}, fmt.Errorf("dual HKLM registration verification failed (mfValid=%v dsValid=%v dsCatValid=%v)",
+				mfValid, dsValid, dsCatValid)
+		}
+		fmt.Fprintf(log, "vcam-install: registered BOTH MF (%s) and DirectShow (%s) -> %s\n", SourceCLSID, SourceDShowCLSID, mfPath)
 	}
-	regPath, _, _ := k.GetStringValue("")
-	model, _, _ := k.GetStringValue("ThreadingModel")
-	k.Close()
-	if !strings.EqualFold(filepath.Clean(regPath), filepath.Clean(InstalledDLLPath)) || !strings.EqualFold(model, "Both") {
-		return UpgradeResult{}, fmt.Errorf("unexpected HKLM registration: path=%q ThreadingModel=%q", regPath, model)
-	}
-	fmt.Fprintf(log, "vcam-install: registered CLSID %s -> %s (ThreadingModel=%s)\n", SourceCLSID, regPath, model)
 
 	// Pre-create / verify SHM file permissions so non-admin runtime always succeeds.
 	shmSA, freeShmSA, err := win.SecurityAttributesFromSDDL(ShmFileSDDL)
@@ -848,28 +973,44 @@ func Install(opts InstallOptions, log io.Writer) (UpgradeResult, error) {
 	return res, nil
 }
 
-// Uninstall performs elevated COM unregistration, removes ProgramData files
-// (using rename-to-.old or FrameServer stop/start if locked), and disables vcam_enabled in config.
+// Uninstall performs elevated COM/DirectShow unregistration (both MF and DirectShow
+// if present), removes ProgramData files (using rename-to-.old or FrameServer
+// stop/start if locked), and disables vcam_enabled in config.
 func Uninstall(opts UninstallOptions, log io.Writer) error {
 	if log == nil {
 		log = io.Discard
 	}
+	// Detect whether MF or DirectShow-only is registered before deleting keys so
+	// DirectShow-only uninstall never touches Windows FrameServer.
+	mfExists, _, _ := inspectInprocCLSID(clsidMFSubkey, clsidMFInprocSubkey)
+	dsExists, _, _ := inspectInprocCLSID(clsidDShowSubkey, clsidDShowInprocSubkey)
+	dsCatExists, _ := inspectDShowCategory()
+	_, _, osBackend := DetectOSBackend()
+	uninstallBackend := osBackend
+	if mfExists {
+		uninstallBackend = BackendMF
+	} else if dsExists || dsCatExists {
+		uninstallBackend = BackendDShow
+	}
+
 	if ok, _ := fileExists(InstalledDLLPath); ok {
-		if err := runRegsvr32("/s", "/u", InstalledDLLPath); err != nil {
-			fmt.Fprintf(log, "vcam-uninstall: regsvr32 /u warning: %v\n", err)
+		if err := runRegsvr32("/s", "/u", "/n", "/i:all", InstalledDLLPath); err != nil {
+			fmt.Fprintf(log, "vcam-uninstall: regsvr32 /u /n /i:all warning: %v\n", err)
 		}
 	}
-	if err := deleteRegistryTree(registry.LOCAL_MACHINE, clsidSubkey); err != nil {
-		return fmt.Errorf("remove HKLM %s: %w", clsidSubkey, err)
+	for _, key := range []string{clsidMFSubkey, dshowCategoryInstanceSubkey, clsidDShowSubkey} {
+		if err := deleteRegistryTree(registry.LOCAL_MACHINE, key); err != nil {
+			return fmt.Errorf("remove HKLM %s: %w", key, err)
+		}
 	}
-	fmt.Fprintf(log, "vcam-uninstall: unregistered CLSID %s\n", SourceCLSID)
+	fmt.Fprintf(log, "vcam-uninstall: unregistered MF (%s) and DirectShow (%s)\n", SourceCLSID, SourceDShowCLSID)
 
 	if err := os.Remove(ShmFilePath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		fmt.Fprintf(log, "vcam-uninstall: remove %s warning: %v\n", ShmFilePath, err)
 	}
 	CleanupOldDLLs(InstallDir)
 
-	tier, err := removeInstalledDLL(InstalledDLLPath, opts.UpgradeMode, winDeployOps{})
+	tier, err := removeInstalledDLL(InstalledDLLPath, opts.UpgradeMode, uninstallBackend, winDeployOps{})
 	if err != nil {
 		return err
 	}
@@ -915,7 +1056,7 @@ func deleteRegistryTree(root registry.Key, subkey string) error {
 }
 
 // RunElevatedInstall prompts for UAC once and executes `capview.exe -vcam-install`.
-func RunElevatedInstall(bundledDLL string) error {
+func RunElevatedInstall(bundledDLL string, backend Backend) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
@@ -930,6 +1071,9 @@ func RunElevatedInstall(bundledDLL string) error {
 
 	var args []string
 	args = append(args, "-vcam-install")
+	if backend != "" && backend != BackendAuto {
+		args = append(args, fmt.Sprintf("-vcam-backend %s", backend))
+	}
 	if bundledDLL != "" {
 		args = append(args, fmt.Sprintf(`-vcam-dll "%s"`, strings.TrimRight(bundledDLL, `\`)))
 	}

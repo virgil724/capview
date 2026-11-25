@@ -67,9 +67,10 @@ func hasVcamAdminFlag(args []string) bool {
 
 func runVcamAdmin(args []string) error {
 	fs := flag.NewFlagSet("capview-vcam", flag.ContinueOnError)
-	doInstall := fs.Bool("vcam-install", false, "install/upgrade and register Windows 11 x64 virtual camera COM DLL")
-	doUninstall := fs.Bool("vcam-uninstall", false, "unregister and remove Windows 11 x64 virtual camera COM DLL")
+	doInstall := fs.Bool("vcam-install", false, "install/upgrade and register Windows x64 virtual camera COM DLL (Win11 MF / Win10 DirectShow)")
+	doUninstall := fs.Bool("vcam-uninstall", false, "unregister and remove Windows x64 virtual camera COM DLL")
 	dllPath := fs.String("vcam-dll", "", "optional path to bundled capview_vcam.dll")
+	backendStr := fs.String("vcam-backend", "auto", "virtual camera backend: auto, mf, dshow, or both")
 	upgradeModeStr := fs.String("vcam-upgrade-mode", "auto", "DLL upgrade mode: auto, rename, or restart")
 	logPath := fs.String("vcam-log", "", "optional log file path")
 	cfgPath := fs.String("vcam-config", config.DefaultPath(), "config.json path for uninstall")
@@ -96,11 +97,17 @@ func runVcamAdmin(args []string) error {
 		fmt.Fprintf(logW, "error: %v\n", err)
 		return err
 	}
+	backend, err := vcam.ParseBackend(*backendStr)
+	if err != nil {
+		fmt.Fprintf(logW, "error: %v\n", err)
+		return err
+	}
 
 	if *doInstall {
 		_, err := vcam.Install(vcam.InstallOptions{
 			BundledDLL:  *dllPath,
 			UpgradeMode: mode,
+			Backend:     backend,
 		}, logW)
 		if err != nil {
 			fmt.Fprintf(logW, "error: %v\n", err)
@@ -188,9 +195,10 @@ type appHost struct {
 	spoutTap   *capture.RawTap
 	spout      *render.SpoutOutput
 
-	// Windows 11 Virtual Camera output (nil when off).
-	vcam    *vcam.Controller
-	vcamShm string
+	// Windows Virtual Camera output (Win11 MF / Win10 DirectShow; nil when off).
+	vcam        *vcam.Controller
+	vcamShm     string
+	vcamBackend vcam.Backend
 
 	// Audience A/V synchronization (affects audience bypass outputs only).
 	avSync         *avsync.Controller
@@ -588,15 +596,17 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 
 	if vcam.Available() {
 		vcamOn := h.vcam != nil
-		vcamInstalled := vcam.IsInstalled()
+		st := vcam.CheckInstallStatusForBackend("", h.vcamBackend)
+		enableLabel := st.MenuEnableLabel()
+		needsOSReinstall := st.Mismatch && (st.MismatchReason == vcam.MismatchOSBackendChanged || st.MismatchReason == vcam.MismatchDualRegistered)
 		items = append(items, render.MenuItem{
 			Label: "Virtual Camera",
 			Submenu: []render.MenuItem{
 				{
 					ID:       addAction(func() (bool, bool, bool) { h.enableVirtualCamera(); return false, false, false }),
-					Label:    "Enable",
-					Checked:  vcamOn,
-					Disabled: vcamOn,
+					Label:    enableLabel,
+					Checked:  vcamOn && !needsOSReinstall,
+					Disabled: vcamOn && !needsOSReinstall,
 				},
 				{
 					ID:       addAction(func() (bool, bool, bool) { h.disableVirtualCamera(); return false, false, false }),
@@ -607,7 +617,7 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 				{
 					ID:       addAction(func() (bool, bool, bool) { h.uninstallVirtualCamera(); return false, false, false }),
 					Label:    "Uninstall",
-					Disabled: !vcamInstalled,
+					Disabled: !st.AnyRegistered,
 				},
 			},
 		})
@@ -748,13 +758,14 @@ func (h *appHost) startVirtualCameraLocked() error {
 		ShmMode:      h.vcamShm,
 		FPS:          fps,
 		Sync:         h.avSync,
+		Backend:      h.vcamBackend,
 	})
 	if err != nil {
 		return err
 	}
 	h.vcam = vc
 	st := vc.Stats()
-	fmt.Printf("virtual_camera: enabled (shm=%s event=%s link=%q)\n", st.ShmBackend, st.EventMode, st.SymbolicLink)
+	fmt.Printf("virtual_camera: enabled (backend=%s shm=%s event=%s link=%q)\n", st.Backend, st.ShmBackend, st.EventMode, st.SymbolicLink)
 	return nil
 }
 
@@ -774,20 +785,28 @@ func (h *appHost) stopVirtualCamera() {
 }
 
 func (h *appHost) enableVirtualCamera() {
+	st := vcam.CheckInstallStatusForBackend("", h.vcamBackend)
+	needsInstall := st.NeedsInstallOrReinstall()
+
 	h.mu.Lock()
-	if h.vcam != nil {
+	if h.vcam != nil && !needsInstall {
 		h.mu.Unlock()
 		return
 	}
+	if h.vcam != nil && needsInstall {
+		h.stopVirtualCameraLocked()
+	}
 	h.mu.Unlock()
 
-	st := vcam.CheckInstallStatus("")
-	if !st.Installed || (st.BundledExists && !st.UpToDate) {
+	if needsInstall {
+		if st.MismatchDetail != "" {
+			fmt.Fprintf(os.Stderr, "virtual_camera: %s; triggering capview.exe UAC reinstall\n", st.MismatchDetail)
+		}
 		if !st.BundledExists {
 			win.ShowErrorBox("capview", fmt.Sprintf("Cannot enable Virtual Camera:\n%v (%s)", vcam.ErrBundledDLLMissing, st.BundledPath))
 			return
 		}
-		if err := vcam.RunElevatedInstall(st.BundledPath); err != nil {
+		if err := vcam.RunElevatedInstall(st.BundledPath, h.vcamBackend); err != nil {
 			if errors.Is(err, vcam.ErrUserCancelled) {
 				fmt.Fprintln(os.Stderr, "virtual_camera: setup cancelled by user")
 				return
@@ -928,7 +947,8 @@ func runView(args []string) error {
 	volume := fs.Float64("volume", float64(cfg.Volume), "initial audio volume (0.0 to 1.0)")
 	renderer := fs.String("renderer", "d3d11", "render backend: d3d11 or vulkan")
 	source := fs.String("source", "mf", "video source: mf or synthetic")
-	vcamFlag := fs.Bool("vcam", cfg.VcamEnabled, "enable Windows 11 x64 Virtual Camera output")
+	vcamFlag := fs.Bool("vcam", cfg.VcamEnabled, "enable Windows x64 Virtual Camera output (Win11 MF / Win10 DirectShow)")
+	vcamBackendStr := fs.String("vcam-backend", "auto", "virtual camera runtime backend: auto, mf, or dshow")
 	vcamShm := fs.String("vcam-shm", "auto", "virtual camera shared memory mode: auto, global, file, local")
 	vkInfo := fs.Bool("vkinfo", false, "print Vulkan device/extension/present-mode capabilities and exit")
 	duration := fs.Duration("duration", 0, "optional run duration before clean exit (e.g. 20s)")
@@ -953,6 +973,10 @@ func runView(args []string) error {
 	srcKind := strings.ToLower(strings.TrimSpace(*source))
 	if srcKind != "mf" && srcKind != "synthetic" {
 		return fmt.Errorf("invalid -source %q (expected mf or synthetic)", *source)
+	}
+	vcamBackend, err := vcam.ParseRuntimeBackend(*vcamBackendStr)
+	if err != nil {
+		return err
 	}
 
 	// Only override saved config fields for flags explicitly provided on CLI.
@@ -1033,6 +1057,10 @@ func runView(args []string) error {
 
 	if vcam.Available() {
 		vcam.CleanupOldDLLs(vcam.InstallDir)
+		if st := vcam.CheckInstallStatusForBackend("", vcamBackend); st.Mismatch && st.AnyRegistered {
+			fmt.Fprintf(os.Stderr, "warning: virtual camera registration mismatch: %s — right-click the capview window -> Virtual Camera -> %s (capview.exe reinstalls automatically via UAC; no separate installer needed)\n",
+				st.MismatchDetail, st.MenuEnableLabel())
+		}
 	}
 
 	mb := capture.NewMailbox()
@@ -1060,6 +1088,7 @@ func runView(args []string) error {
 		spoutName:      *spoutName,
 		printStats:     *printStats,
 		vcamShm:        *vcamShm,
+		vcamBackend:    vcamBackend,
 		avSync:         syncCtrl,
 		syncTest:       srcKind == "synthetic" && *syncTest,
 		syncEpochQPC:   syncEpochQPC,
@@ -1078,9 +1107,12 @@ func runView(args []string) error {
 			fmt.Fprintf(os.Stderr, "warning: virtual camera unavailable on this architecture\n")
 			host.cfg.VcamEnabled = false
 		} else {
-			st := vcam.CheckInstallStatus("")
-			if !st.Installed || (st.BundledExists && !st.UpToDate) {
-				msg := "virtual camera is not installed or needs upgrade (right-click Virtual Camera -> Enable, or run capview -vcam-install)"
+			st := vcam.CheckInstallStatusForBackend("", vcamBackend)
+			if st.NeedsInstallOrReinstall() {
+				msg := fmt.Sprintf("virtual camera is not installed or needs upgrade — right-click the capview window -> Virtual Camera -> %s (capview.exe installs automatically via UAC; no separate installer needed)", st.MenuEnableLabel())
+				if st.MismatchDetail != "" {
+					msg = fmt.Sprintf("virtual camera registration mismatch: %s — right-click the capview window -> Virtual Camera -> %s (capview.exe reinstalls automatically via UAC; no separate installer needed)", st.MismatchDetail, st.MenuEnableLabel())
+				}
 				if setFlags["vcam"] {
 					return errors.New(msg)
 				}

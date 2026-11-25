@@ -1,5 +1,6 @@
-// Package vcam manages the Windows 11 x64 MFCreateVirtualCamera lifecycle,
-// lock-free shared-memory frame IPC, and elevated COM DLL installation/upgrades.
+// Package vcam manages the Windows x64 virtual camera lifecycle (Windows 11
+// Media Foundation and Windows 10 DirectShow), lock-free shared-memory frame
+// IPC, and elevated COM DLL installation/upgrades.
 package vcam
 
 import (
@@ -12,8 +13,14 @@ import (
 )
 
 const (
-	// SourceCLSID is the COM CLSID of the capview virtual camera media source DLL.
+	// SourceCLSID is the COM CLSID of the capview Media Foundation media source.
 	SourceCLSID = "{7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A03}"
+
+	// SourceDShowCLSID is the COM CLSID of the capview DirectShow capture filter.
+	SourceDShowCLSID = "{7E4B8A12-3D5C-4F91-B2A7-9C6E1D4F8A04}"
+
+	// VideoInputDeviceCategoryCLSID is DirectShow's CLSID_VideoInputDeviceCategory.
+	VideoInputDeviceCategoryCLSID = "{860BB310-5D01-11d0-BD3B-00A0C911CE86}"
 
 	// DefaultFriendlyName is the device name advertised to Windows and capture apps.
 	DefaultFriendlyName = "capview Virtual Camera"
@@ -94,12 +101,14 @@ type Options struct {
 	FriendlyName       string
 	ShmMode            string // "auto" (default), "global", "file", "local"
 	FPS                float64
+	Backend            Backend // "" / BackendAuto (default), BackendMF, BackendDShow
 	SkipMFRegistration bool
 	Sync               *avsync.Controller
 }
 
 // Stats reports runtime virtual camera metrics.
 type Stats struct {
+	Backend        Backend
 	FramesWritten  uint64
 	ShmBackend     string
 	ShmGlobalErr   string
@@ -108,24 +117,35 @@ type Stats struct {
 	SymbolicLink   string
 }
 
-// InstallStatus describes the COM registration and bundled/installed DLL state.
+// InstallStatus describes the COM registration, OS backend match, and bundled/installed DLL state.
 type InstallStatus struct {
-	Installed        bool
-	UpToDate         bool
-	BundledExists    bool
-	BundledPath      string
-	BundledVersion   string
-	BundledSHA256    string
-	InstalledPath    string
-	InstalledVersion string
-	InstalledSHA256  string
-	RegisteredPath   string
+	Installed         bool
+	AnyRegistered     bool
+	UpToDate          bool
+	ExpectedBackend   Backend
+	RegisteredBackend Backend
+	MFRegistered      bool
+	DShowRegistered   bool
+	Mismatch          bool
+	MismatchReason    MismatchReason
+	MismatchDetail    string
+	WindowsBuild      uint32
+	MFSupported       bool
+	BundledExists     bool
+	BundledPath       string
+	BundledVersion    string
+	BundledSHA256     string
+	InstalledPath     string
+	InstalledVersion  string
+	InstalledSHA256   string
+	RegisteredPath    string
 }
 
 // InstallOptions configures elevated installation/upgrade.
 type InstallOptions struct {
 	BundledDLL  string
 	UpgradeMode UpgradeMode
+	Backend     Backend // "" / BackendAuto (default), BackendMF, BackendDShow, BackendBoth
 }
 
 // UninstallOptions configures elevated uninstallation.
@@ -136,6 +156,7 @@ type UninstallOptions struct {
 
 // UpgradeResult records the outcome of deploying/upgrading capview_vcam.dll.
 type UpgradeResult struct {
+	Backend      Backend
 	Tier         string // "fresh", "noop", "rename", "frameserver-restart"
 	OldBackup    string
 	OldVersion   string
