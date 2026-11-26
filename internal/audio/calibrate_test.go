@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"errors"
 	"math"
 	"testing"
 )
@@ -270,5 +271,131 @@ func TestCalibrationInjectorNoDoubleCountTimestamp(t *testing.T) {
 		if math.Abs(gotDiffMS-wantDiffMS) > 0.05 {
 			t.Fatalf("pulse %d: EmitNS-SubmitNS = %.3f ms, want %.3f ms", ep.Index, gotDiffMS, wantDiffMS)
 		}
+	}
+}
+
+func TestResolveCapturePacketTimingAndAgeTracker(t *testing.T) {
+	const (
+		rate     = 48000
+		frames   = 480 // 10.0 ms packet duration
+		pktDurNS = int64(10_000_000)
+		nowNS    = int64(5_000_000_000) // 5.0 s
+	)
+
+	// 1. Valid QPC timestamp (16.0 ms old).
+	validQPC := (nowNS - 16_000_000) / 100
+	startNS, ageMS, usedQPC := resolveCapturePacketTiming(nowNS, validQPC, false, frames, rate)
+	if !usedQPC || startNS != nowNS-16_000_000 || math.Abs(ageMS-16.0) > 1e-6 {
+		t.Fatalf("valid QPC: got (%d, %.3f, %v), want (%d, 16.0, true)", startNS, ageMS, usedQPC, nowNS-16_000_000)
+	}
+
+	// 2. Boundary ages: 0 ms and exactly 500 ms are valid.
+	start0, age0, ok0 := resolveCapturePacketTiming(nowNS, nowNS/100, false, frames, rate)
+	if !ok0 || start0 != nowNS || age0 != 0 {
+		t.Fatalf("0ms boundary: got (%d, %.3f, %v), want (%d, 0, true)", start0, age0, ok0, nowNS)
+	}
+	start500, age500, ok500 := resolveCapturePacketTiming(nowNS, (nowNS-500_000_000)/100, false, frames, rate)
+	if !ok500 || start500 != nowNS-500_000_000 || math.Abs(age500-500.0) > 1e-6 {
+		t.Fatalf("500ms boundary: got (%d, %.3f, %v), want (%d, 500.0, true)", start500, age500, ok500, nowNS-500_000_000)
+	}
+
+	// 3. BufferFlagsTimestampErr != 0 -> fallback to nowNS - pktDurNS.
+	startErr, ageErr, okErr := resolveCapturePacketTiming(nowNS, validQPC, true, frames, rate)
+	if okErr || startErr != nowNS-pktDurNS || math.Abs(ageErr-10.0) > 1e-6 {
+		t.Fatalf("timestampErr fallback: got (%d, %.3f, %v), want (%d, 10.0, false)", startErr, ageErr, okErr, nowNS-pktDurNS)
+	}
+
+	// 4. pk.QPC == 0 -> fallback.
+	startZero, ageZero, okZero := resolveCapturePacketTiming(nowNS, 0, false, frames, rate)
+	if okZero || startZero != nowNS-pktDurNS || math.Abs(ageZero-10.0) > 1e-6 {
+		t.Fatalf("qpc==0 fallback: got (%d, %.3f, %v), want (%d, 10.0, false)", startZero, ageZero, okZero, nowNS-pktDurNS)
+	}
+
+	// 5. Out-of-range QPC: negative age (future timestamp) -> fallback.
+	futureQPC := (nowNS + 1_000_000) / 100 // 1 ms in the future
+	startFut, ageFut, okFut := resolveCapturePacketTiming(nowNS, futureQPC, false, frames, rate)
+	if okFut || startFut != nowNS-pktDurNS || math.Abs(ageFut-10.0) > 1e-6 {
+		t.Fatalf("future QPC fallback: got (%d, %.3f, %v), want (%d, 10.0, false)", startFut, ageFut, okFut, nowNS-pktDurNS)
+	}
+
+	// 6. Out-of-range QPC: age > 500ms (wild/stale timestamp) -> fallback.
+	staleQPC := (nowNS - 501_000_000) / 100
+	startStale, ageStale, okStale := resolveCapturePacketTiming(nowNS, staleQPC, false, frames, rate)
+	if okStale || startStale != nowNS-pktDurNS || math.Abs(ageStale-10.0) > 1e-6 {
+		t.Fatalf("stale >500ms QPC fallback: got (%d, %.3f, %v), want (%d, 10.0, false)", startStale, ageStale, okStale, nowNS-pktDurNS)
+	}
+
+	// 7. Overflow-prone huge QPC -> fallback safely.
+	startHuge, ageHuge, okHuge := resolveCapturePacketTiming(nowNS, math.MaxInt64, false, frames, rate)
+	if okHuge || startHuge != nowNS-pktDurNS || math.Abs(ageHuge-10.0) > 1e-6 {
+		t.Fatalf("huge QPC fallback: got (%d, %.3f, %v), want (%d, 10.0, false)", startHuge, ageHuge, okHuge, nowNS-pktDurNS)
+	}
+
+	// 8. captureAgeTracker uniform accumulation across mixed valid + fallback packets:
+	// wild QPC values must NEVER poison sumMS, and fallback packets must be counted.
+	var tr captureAgeTracker
+	// 2 valid packets: 15ms and 25ms
+	if s, ok := tr.Observe(nowNS, (nowNS-15_000_000)/100, false, frames, rate); !ok || s != nowNS-15_000_000 {
+		t.Fatalf("observe valid 1: s=%d ok=%v", s, ok)
+	}
+	if s, ok := tr.Observe(nowNS, (nowNS-25_000_000)/100, false, frames, rate); !ok || s != nowNS-25_000_000 {
+		t.Fatalf("observe valid 2: s=%d ok=%v", s, ok)
+	}
+	// 4 fallback packets (each contributes pktDurMS = 10.0 ms):
+	// timestampErr, qpc==0, wild +2000ms stale, wild -100ms future
+	if _, ok := tr.Observe(nowNS, (nowNS-15_000_000)/100, true, frames, rate); ok {
+		t.Fatal("expected fallback on timestampErr")
+	}
+	if _, ok := tr.Observe(nowNS, 0, false, frames, rate); ok {
+		t.Fatal("expected fallback on qpc==0")
+	}
+	if _, ok := tr.Observe(nowNS, (nowNS-2_000_000_000)/100, false, frames, rate); ok {
+		t.Fatal("expected fallback on >500ms wild QPC")
+	}
+	if _, ok := tr.Observe(nowNS, (nowNS+100_000_000)/100, false, frames, rate); ok {
+		t.Fatal("expected fallback on negative-age QPC")
+	}
+
+	wantCount := 6
+	wantAvg := (15.0 + 25.0 + 10.0 + 10.0 + 10.0 + 10.0) / 6.0
+	if tr.count != wantCount {
+		t.Fatalf("tracker count = %d, want %d", tr.count, wantCount)
+	}
+	if math.Abs(tr.AvgMS()-wantAvg) > 1e-6 {
+		t.Fatalf("tracker AvgMS = %.6f, want %.6f (wild QPC poisoned or fallback uncounted)", tr.AvgMS(), wantAvg)
+	}
+}
+
+func TestResolveMainOutputIDAndStandaloneMirrorGuard(t *testing.T) {
+	outs := []EndpointInfo{
+		{ID: "{out-default}", Name: "Speakers (Realtek(R) Audio)"},
+		{ID: "{out-fiio}", Name: "Speakers (FiiO BTR5 1.1)"},
+		{ID: "{out-cable}", Name: "CABLE Input (VB-Audio Virtual Cable)"},
+	}
+
+	if got := ResolveMainOutputID("", outs, "{out-default}"); got != "{out-default}" {
+		t.Fatalf("empty audioOut -> %q, want {out-default}", got)
+	}
+	if got := ResolveMainOutputID("default", outs, "{out-default}"); got != "{out-default}" {
+		t.Fatalf("default audioOut -> %q, want {out-default}", got)
+	}
+	if got := ResolveMainOutputID("FiiO BTR5", outs, "{out-default}"); got != "{out-fiio}" {
+		t.Fatalf("substring audioOut -> %q, want {out-fiio}", got)
+	}
+	if got := ResolveMainOutputID("{OUT-FIIO}", outs, "{out-default}"); got != "{out-fiio}" {
+		t.Fatalf("exact ID audioOut -> %q, want {out-fiio}", got)
+	}
+
+	// Reject configured main output (case-insensitive).
+	if err := ValidateStandaloneCalibrationMirror("{OUT-FIIO}", "{out-fiio}", "{out-default}"); !errors.Is(err, ErrMirrorIsMainOutput) {
+		t.Fatalf("main output not rejected: got %v, want ErrMirrorIsMainOutput", err)
+	}
+	// Reject system default playback speaker even when mainOutputID differs.
+	if err := ValidateStandaloneCalibrationMirror("{OUT-DEFAULT}", "{out-fiio}", "{out-default}"); !errors.Is(err, ErrMirrorIsMainOutput) {
+		t.Fatalf("default speaker not rejected: got %v, want ErrMirrorIsMainOutput", err)
+	}
+	// Allow VB-Cable mirror endpoint.
+	if err := ValidateStandaloneCalibrationMirror("{out-cable}", "{out-fiio}", "{out-default}"); err != nil {
+		t.Fatalf("VB-Cable mirror unexpectedly rejected: %v", err)
 	}
 }

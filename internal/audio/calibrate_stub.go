@@ -19,3 +19,8 @@ func (p *Passthrough) CalibrateMirror(ctx context.Context, captureID string) (Ca
 func CalibrateEndpoints(ctx context.Context, mirrorID, captureID string) (CalibrationResult, error) {
 	return CalibrationResult{}, errors.New("audio mirror calibration is only supported on Windows")
 }
+
+// DefaultOutputEndpointID is unsupported on non-Windows platforms.
+func DefaultOutputEndpointID() (string, error) {
+	return "", errors.New("default audio output endpoint ID is only supported on Windows")
+}

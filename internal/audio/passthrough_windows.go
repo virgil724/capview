@@ -51,6 +51,22 @@ func ListEndpointInfos() (inputs, outputs []EndpointInfo, err error) {
 	return inputs, outputs, err
 }
 
+// DefaultOutputEndpointID returns the MMDevice ID of the Windows default
+// console audio playback (render) endpoint.
+func DefaultOutputEndpointID() (string, error) {
+	var id string
+	err := withCOM(func() error {
+		ep, e := win.DefaultAudioEndpoint(win.ERender)
+		if e != nil {
+			return e
+		}
+		defer ep.Device.Release()
+		id = ep.ID
+		return nil
+	})
+	return id, err
+}
+
 func withCOM(f func() error) error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

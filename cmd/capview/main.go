@@ -92,6 +92,7 @@ func runAVSyncCalibrateCLI(args []string) error {
 	_ = fs.Bool("av-sync-calibrate", true, "measure downstream audio mirror latency and persist to config.json")
 	calibIn := fs.String("av-sync-calibrate-in", "", "optional capture endpoint ID, name, or substring for calibration (default: auto-pair)")
 	audioMirror := fs.String("audio-mirror", "", "mirror playback endpoint ID, name, or substring (default: saved audio_mirror_id)")
+	audioOut := fs.String("audio-out", "", "main audio playback device to guard against calibrating (default: saved audio_out)")
 	cfgPath := fs.String("config", config.DefaultPath(), "path to config.json")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -108,6 +109,14 @@ func runAVSyncCalibrateCLI(args []string) error {
 	}
 	if strings.TrimSpace(mirrorID) == "" {
 		return errors.New("no audio mirror endpoint configured; pass -audio-mirror <name|id> or select one in config.json")
+	}
+
+	mainOutSpec := cfg.AudioOut
+	if strings.TrimSpace(*audioOut) != "" {
+		mainOutSpec = *audioOut
+	}
+	if err := validateStandaloneCalibrationTarget(mirrorID, mainOutSpec, "", audio.ListEndpointInfos, audio.DefaultOutputEndpointID); err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -127,19 +136,53 @@ func runAVSyncCalibrateCLI(args []string) error {
 	return nil
 }
 
-func setConfigDownstreamMS(cfg *config.Config, mirrorID string, ms float64) {
-	if cfg == nil || mirrorID == "" {
-		return
-	}
-	if cfg.AudioMirrorDownstreamMS == nil {
-		cfg.AudioMirrorDownstreamMS = make(map[string]float64)
-	}
-	for k := range cfg.AudioMirrorDownstreamMS {
-		if strings.EqualFold(k, mirrorID) && k != mirrorID {
-			delete(cfg.AudioMirrorDownstreamMS, k)
+func validateStandaloneCalibrationTarget(
+	mirrorID, audioOut, activeMainOutID string,
+	listEps func() ([]audio.EndpointInfo, []audio.EndpointInfo, error),
+	defaultOutFn func() (string, error),
+) error {
+	var defaultOutID string
+	if defaultOutFn != nil {
+		if id, err := defaultOutFn(); err == nil {
+			defaultOutID = id
 		}
 	}
-	cfg.AudioMirrorDownstreamMS[mirrorID] = ms
+	mainOutID := activeMainOutID
+	if mainOutID == "" {
+		want := strings.TrimSpace(audioOut)
+		if want == "" || strings.EqualFold(want, "default") {
+			mainOutID = defaultOutID
+		} else if listEps != nil {
+			if _, outs, err := listEps(); err == nil {
+				mainOutID = audio.ResolveMainOutputID(audioOut, outs, defaultOutID)
+			} else {
+				return fmt.Errorf("resolve main audio output %q: %w", audioOut, err)
+			}
+		}
+	}
+	return audio.ValidateStandaloneCalibrationMirror(mirrorID, mainOutID, defaultOutID)
+}
+
+func setDownstreamMapEntry(m *map[string]float64, mirrorID string, ms float64) {
+	if m == nil || mirrorID == "" {
+		return
+	}
+	if *m == nil {
+		*m = make(map[string]float64)
+	}
+	for k := range *m {
+		if strings.EqualFold(k, mirrorID) && k != mirrorID {
+			delete(*m, k)
+		}
+	}
+	(*m)[mirrorID] = ms
+}
+
+func setConfigDownstreamMS(cfg *config.Config, mirrorID string, ms float64) {
+	if cfg == nil {
+		return
+	}
+	setDownstreamMapEntry(&cfg.AudioMirrorDownstreamMS, mirrorID, ms)
 }
 
 func printCalibrationReport(w io.Writer, res audio.CalibrationResult, cfgPath string) {
@@ -309,12 +352,92 @@ type appHost struct {
 	syncEpochQPC   int64
 	mirrorTargetMS int
 	calibrating    atomic.Bool
+	calibWG        sync.WaitGroup
+	ctx            context.Context
 
-	// Optional endpoint listing override for deterministic menu unit tests.
-	listEndpointsFn func() (inputs, outputs []audio.EndpointInfo, err error)
+	// Dedicated lock protecting the in-memory downstream latency snapshot used
+	// by audio.Config.DownstreamLookup so synchronous mirror callbacks during
+	// SetMirror (while h.mu is held) NEVER acquire h.mu.
+	// Lock order invariant: h.mu -> h.downstreamMu (leaf).
+	downstreamMu sync.RWMutex
+	downstreamMS map[string]float64
+
+	// Optional overrides for deterministic unit tests (nil uses real implementations).
+	listEndpointsFn   func() (inputs, outputs []audio.EndpointInfo, err error)
+	defaultOutputIDFn func() (string, error)
+	calibrateFn       func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error)
+	showErrorBoxFn    func(title, msg string)
+	showInfoBoxFn     func(title, msg string)
 
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
+}
+
+func (h *appHost) baseContext() context.Context {
+	if h.ctx != nil {
+		return h.ctx
+	}
+	return context.Background()
+}
+
+func (h *appHost) showErrorBox(title, msg string) {
+	if h.showErrorBoxFn != nil {
+		h.showErrorBoxFn(title, msg)
+		return
+	}
+	win.ShowErrorBox(title, msg)
+}
+
+func (h *appHost) showInfoBox(title, msg string) {
+	if h.showInfoBoxFn != nil {
+		h.showInfoBoxFn(title, msg)
+		return
+	}
+	win.ShowInfoBox(title, msg)
+}
+
+// syncDownstreamFromConfigLocked clones h.cfg.AudioMirrorDownstreamMS into the
+// lock-isolated downstreamMS map. Callers hold h.mu (or run before concurrent
+// access starts).
+func (h *appHost) syncDownstreamFromConfigLocked() {
+	var cp map[string]float64
+	if len(h.cfg.AudioMirrorDownstreamMS) > 0 {
+		cp = make(map[string]float64, len(h.cfg.AudioMirrorDownstreamMS))
+		for k, v := range h.cfg.AudioMirrorDownstreamMS {
+			cp[k] = v
+		}
+	}
+	h.downstreamMu.Lock()
+	h.downstreamMS = cp
+	h.downstreamMu.Unlock()
+}
+
+// setDownstreamMSLocked persists a calibrated downstream latency into both
+// h.cfg.AudioMirrorDownstreamMS and the lock-isolated downstreamMS snapshot.
+// Callers hold h.mu.
+func (h *appHost) setDownstreamMSLocked(mirrorID string, ms float64) {
+	setConfigDownstreamMS(&h.cfg, mirrorID, ms)
+	h.downstreamMu.Lock()
+	setDownstreamMapEntry(&h.downstreamMS, mirrorID, ms)
+	h.downstreamMu.Unlock()
+}
+
+// lookupDownstreamMS resolves downstream audio latency for a mirror endpoint
+// without ever acquiring h.mu, preventing reentrant deadlocks when invoked
+// synchronously from SetMirror / mirror startup.
+func (h *appHost) lookupDownstreamMS(mirrorID, mirrorName string) (float64, bool) {
+	h.downstreamMu.RLock()
+	defer h.downstreamMu.RUnlock()
+	return audio.ResolveDownstreamMS(mirrorID, mirrorName, h.downstreamMS)
+}
+
+// activeMirrorIDLocked returns the currently active mirror endpoint ID.
+// Callers hold h.mu.
+func (h *appHost) activeMirrorIDLocked() string {
+	if h.aud != nil {
+		return h.aud.MirrorID()
+	}
+	return h.cfg.AudioMirrorID
 }
 
 func (h *appHost) startVideo(sourceKind string) error {
@@ -362,6 +485,7 @@ func (h *appHost) startAudio() {
 	if h.cfg.AudioDisabled {
 		return
 	}
+	h.syncDownstreamFromConfigLocked()
 	hint := h.cfg.Device
 	if h.vid != nil {
 		hint = h.vid.Mode.Device
@@ -374,11 +498,7 @@ func (h *appHost) startAudio() {
 		MirrorID:          h.cfg.AudioMirrorID,
 		MirrorTargetMS:    h.mirrorTargetMS,
 		Sync:              h.avSync,
-		DownstreamLookup: func(mirrorID, mirrorName string) (float64, bool) {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			return audio.ResolveDownstreamMS(mirrorID, mirrorName, h.cfg.AudioMirrorDownstreamMS)
-		},
+		DownstreamLookup:  h.lookupDownstreamMS,
 		SyntheticSyncTest: h.syncTest,
 		SyncEpochQPC:      h.syncEpochQPC,
 	})
@@ -560,43 +680,82 @@ func (h *appHost) startCalibrateAsync(captureID string) {
 	h.mu.Lock()
 	aud := h.aud
 	mirrorID := h.cfg.AudioMirrorID
+	audioOut := h.cfg.AudioOut
 	cfgPath := h.cfgPath
+	listEps := h.listEndpointsFn
+	defaultOutFn := h.defaultOutputIDFn
+	calibFn := h.calibrateFn
+	var activeMainOutID string
+	if aud != nil {
+		activeMainOutID = aud.OutputID
+	}
 	h.mu.Unlock()
 
+	useLiveMirror := false
 	if aud != nil {
 		if id := aud.MirrorID(); id != "" {
 			mirrorID = id
+			useLiveMirror = true
 		}
 	}
 	if mirrorID == "" {
 		h.calibrating.Store(false)
-		win.ShowErrorBox("capview", "Audio Mirror Output must be enabled before calibrating.")
+		h.showErrorBox("capview", "Audio Mirror Output must be enabled before calibrating.")
 		return
 	}
 
+	if !useLiveMirror {
+		if listEps == nil {
+			listEps = audio.ListEndpointInfos
+		}
+		if defaultOutFn == nil {
+			defaultOutFn = audio.DefaultOutputEndpointID
+		}
+		if err := validateStandaloneCalibrationTarget(mirrorID, audioOut, activeMainOutID, listEps, defaultOutFn); err != nil {
+			h.calibrating.Store(false)
+			fmt.Fprintf(os.Stderr, "avsync calibration rejected: %v\n", err)
+			h.showErrorBox("capview", fmt.Sprintf("Audio latency calibration failed:\n%v", err))
+			return
+		}
+	}
+
+	h.calibWG.Add(1)
 	go func() {
+		defer h.calibWG.Done()
 		defer h.calibrating.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+		parentCtx := h.baseContext()
+		ctx, cancel := context.WithTimeout(parentCtx, 15*time.Second)
 		defer cancel()
 
 		var (
 			res audio.CalibrationResult
 			err error
 		)
-		if aud != nil && aud.MirrorID() != "" {
+		switch {
+		case calibFn != nil:
+			res, err = calibFn(ctx, mirrorID, captureID)
+		case useLiveMirror:
 			res, err = aud.CalibrateMirror(ctx, captureID)
-		} else {
+		default:
 			res, err = audio.CalibrateEndpoints(ctx, mirrorID, captureID)
 		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(parentCtx.Err(), context.Canceled) {
+				return
+			}
 			fmt.Fprintf(os.Stderr, "avsync calibration failed: %v\n", err)
-			win.ShowErrorBox("capview", fmt.Sprintf("Audio latency calibration failed:\n%v", err))
+			h.showErrorBox("capview", fmt.Sprintf("Audio latency calibration failed:\n%v", err))
+			return
+		}
+		if errors.Is(parentCtx.Err(), context.Canceled) {
 			return
 		}
 
 		h.mu.Lock()
-		setConfigDownstreamMS(&h.cfg, res.MirrorID, res.DownstreamMS)
-		if h.avSync != nil {
+		h.setDownstreamMSLocked(res.MirrorID, res.DownstreamMS)
+		activeMirror := h.activeMirrorIDLocked()
+		if activeMirror != "" && strings.EqualFold(activeMirror, res.MirrorID) && h.avSync != nil {
 			h.avSync.SetAudioDownstreamMS(res.DownstreamMS, true)
 		}
 		saveErr := config.Save(cfgPath, h.cfg)
@@ -606,7 +765,10 @@ func (h *appHost) startCalibrateAsync(captureID string) {
 		if saveErr != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to save calibrated latency: %v\n", saveErr)
 		}
-		win.ShowInfoBox("capview", fmt.Sprintf(
+		if errors.Is(parentCtx.Err(), context.Canceled) {
+			return
+		}
+		h.showInfoBox("capview", fmt.Sprintf(
 			"Audience A/V Sync calibrated.\n\nMirror: %s\nCapture: %s\nDownstream audio latency: %.1f ms (%d/%d pulses)",
 			res.MirrorName, res.CaptureName, res.DownstreamMS, res.InlierCount, len(res.Pulses),
 		))
@@ -1356,6 +1518,9 @@ func runView(args []string) error {
 		syncEpochQPC = win.QPC()
 	}
 
+	viewCtx, cancelView := context.WithCancel(context.Background())
+	defer cancelView()
+
 	host := &appHost{
 		cfg:            cfg,
 		cfgPath:        cfgPath,
@@ -1371,7 +1536,9 @@ func runView(args []string) error {
 		syncTest:       srcKind == "synthetic" && *syncTest,
 		syncEpochQPC:   syncEpochQPC,
 		mirrorTargetMS: *mirrorTargetMS,
+		ctx:            viewCtx,
 	}
+	host.syncDownstreamFromConfigLocked()
 	if err := host.startVideo(srcKind); err != nil {
 		return err
 	}
@@ -1449,6 +1616,11 @@ func runView(args []string) error {
 		Duration:   *duration,
 		Host:       host,
 	}, host.mailbox)
+
+	// Cancel any in-flight background calibration before stopping audio/saving
+	// config so shutdown exits silently without popping up error dialogs.
+	cancelView()
+	host.calibWG.Wait()
 
 	// Persist user preferences on clean exit (skip when running synthetic spike tests).
 	if srcKind != "synthetic" {

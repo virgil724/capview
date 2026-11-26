@@ -3,8 +3,13 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/virgil724/capview/internal/audio"
 	"github.com/virgil724/capview/internal/avsync"
@@ -223,5 +228,316 @@ func TestAVSyncCalibrateCLIFlagHelpers(t *testing.T) {
 	}
 	if got := parseConfigPathArg([]string{"--config=C:\\tmp\\d.json"}); got != "C:\\tmp\\d.json" {
 		t.Fatalf("parseConfigPathArg = %q", got)
+	}
+}
+
+func TestDownstreamLookupNoDeadlockWhileHostLocked(t *testing.T) {
+	cfg := config.Default()
+	cfg.AudioMirrorDownstreamMS = map[string]float64{
+		"{out-cable}": 67.1,
+	}
+	h := &appHost{cfg: cfg}
+	h.syncDownstreamFromConfigLocked()
+
+	// Hold h.mu (simulating switchAudioMirror -> aud.SetMirror -> synchronous
+	// runMirror startup calling audio.Config.DownstreamLookup).
+	h.mu.Lock()
+	done := make(chan struct{})
+	var gotMS float64
+	var gotCal bool
+	var defMS float64
+	var defCal bool
+	go func() {
+		defer close(done)
+		gotMS, gotCal = h.lookupDownstreamMS("{OUT-CABLE}", "CABLE Input (VB-Audio Virtual Cable)")
+		defMS, defCal = h.lookupDownstreamMS("{out-other}", "CABLE Input (VB-Audio Virtual Cable)")
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		h.mu.Unlock()
+		t.Fatal("DEADLOCK: lookupDownstreamMS blocked while h.mu was held")
+	}
+	h.mu.Unlock()
+
+	if !gotCal || gotMS != 67.1 {
+		t.Fatalf("calibrated lookup = (%.1f, %v), want (67.1, true)", gotMS, gotCal)
+	}
+	if defCal || defMS != audio.DefaultVirtualCableDownstreamMS {
+		t.Fatalf("default lookup = (%.1f, %v), want (%.1f, false)", defMS, defCal, audio.DefaultVirtualCableDownstreamMS)
+	}
+
+	// Verify concurrent writers (under h.mu) and readers (lookupDownstreamMS)
+	// stay synchronized with zero races and zero deadlocks.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			h.mu.Lock()
+			h.setDownstreamMSLocked("{out-cable}", 50.0+float64(i%20))
+			h.mu.Unlock()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 200; i++ {
+			ms, cal := h.lookupDownstreamMS("{out-cable}", "CABLE Input (VB-Audio Virtual Cable)")
+			if !cal || ms < 50.0 || ms > 70.0 {
+				t.Errorf("unexpected lookup during concurrent updates: (%.1f, %v)", ms, cal)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+
+	// Final value in h.cfg and lookupDownstreamMS must match exactly.
+	h.mu.Lock()
+	h.setDownstreamMSLocked("{out-cable}", 63.4)
+	cfgVal := h.cfg.AudioMirrorDownstreamMS["{out-cable}"]
+	h.mu.Unlock()
+	lookVal, lookCal := h.lookupDownstreamMS("{out-cable}", "CABLE Input (VB-Audio Virtual Cable)")
+	if !lookCal || cfgVal != 63.4 || lookVal != 63.4 {
+		t.Fatalf("post-update sync mismatch: cfg=%.1f lookup=(%.1f, %v)", cfgVal, lookVal, lookCal)
+	}
+}
+
+func TestValidateStandaloneCalibrationTargetRejectsMainAndDefault(t *testing.T) {
+	fakeEps := func() ([]audio.EndpointInfo, []audio.EndpointInfo, error) {
+		return []audio.EndpointInfo{
+				{ID: "{in-cable}", Name: "CABLE Output (VB-Audio Virtual Cable)"},
+			}, []audio.EndpointInfo{
+				{ID: "{out-default}", Name: "Speakers (Realtek(R) Audio)"},
+				{ID: "{out-fiio}", Name: "Speakers (FiiO BTR5 1.1)"},
+				{ID: "{out-cable}", Name: "CABLE Input (VB-Audio Virtual Cable)"},
+			}, nil
+	}
+	fakeDef := func() (string, error) { return "{out-default}", nil }
+
+	// 1. CLI / standalone guard rejects system default speaker when AudioOut="default".
+	if err := validateStandaloneCalibrationTarget("{out-default}", "default", "", fakeEps, fakeDef); !errors.Is(err, audio.ErrMirrorIsMainOutput) {
+		t.Fatalf("expected ErrMirrorIsMainOutput for default speaker, got %v", err)
+	}
+	// 2. Rejects configured AudioOut even when different from system default.
+	if err := validateStandaloneCalibrationTarget("{out-fiio}", "FiiO BTR5", "", fakeEps, fakeDef); !errors.Is(err, audio.ErrMirrorIsMainOutput) {
+		t.Fatalf("expected ErrMirrorIsMainOutput for configured main output, got %v", err)
+	}
+	// 3. Rejects system default speaker even when AudioOut is another device.
+	if err := validateStandaloneCalibrationTarget("{out-default}", "FiiO BTR5", "", fakeEps, fakeDef); !errors.Is(err, audio.ErrMirrorIsMainOutput) {
+		t.Fatalf("expected ErrMirrorIsMainOutput for system default speaker, got %v", err)
+	}
+	// 4. Rejects activeMainOutID.
+	if err := validateStandaloneCalibrationTarget("{out-fiio}", "default", "{out-fiio}", fakeEps, fakeDef); !errors.Is(err, audio.ErrMirrorIsMainOutput) {
+		t.Fatalf("expected ErrMirrorIsMainOutput for activeMainOutID, got %v", err)
+	}
+	// 5. Allows VB-Cable mirror endpoint.
+	if err := validateStandaloneCalibrationTarget("{out-cable}", "FiiO BTR5", "", fakeEps, fakeDef); err != nil {
+		t.Fatalf("expected VB-Cable mirror to be allowed, got %v", err)
+	}
+
+	// 6. GUI standalone path (h.aud == nil) rejects main output & default speaker
+	// without ever launching calibration.
+	for _, tc := range []struct {
+		name     string
+		audioOut string
+		mirrorID string
+	}{
+		{name: "system default speaker", audioOut: "default", mirrorID: "{out-default}"},
+		{name: "configured main output", audioOut: "FiiO BTR5", mirrorID: "{out-fiio}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calibCalled atomic.Bool
+			var errBoxes atomic.Int32
+			cfg := config.Default()
+			cfg.AudioOut = tc.audioOut
+			cfg.AudioMirrorID = tc.mirrorID
+			h := &appHost{
+				cfg:               cfg,
+				listEndpointsFn:   fakeEps,
+				defaultOutputIDFn: fakeDef,
+				calibrateFn: func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error) {
+					calibCalled.Store(true)
+					return audio.CalibrationResult{}, nil
+				},
+				showErrorBoxFn: func(title, msg string) { errBoxes.Add(1) },
+				showInfoBoxFn:  func(title, msg string) {},
+			}
+			h.startCalibrateAsync("")
+			h.calibWG.Wait()
+			if calibCalled.Load() {
+				t.Fatal("calibrateFn must NOT be invoked for main/default speaker")
+			}
+			if errBoxes.Load() != 1 {
+				t.Fatalf("expected 1 error box for rejected speaker, got %d", errBoxes.Load())
+			}
+			if h.calibrating.Load() {
+				t.Fatal("calibrating flag must be cleared after rejection")
+			}
+		})
+	}
+}
+
+func TestStartCalibrateAsyncStaleMirrorIDGuard(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	ctrl := avsync.NewController(avsync.Options{AutoEnabled: true})
+	ctrl.SetAudioDownstreamMS(35.0, false)
+
+	cfg := config.Default()
+	cfg.AudioOut = "default"
+	cfg.AudioMirrorID = "{out-cable-a}"
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var infoBoxes atomic.Int32
+	var errBoxes atomic.Int32
+
+	h := &appHost{
+		cfg:     cfg,
+		cfgPath: cfgPath,
+		avSync:  ctrl,
+		listEndpointsFn: func() ([]audio.EndpointInfo, []audio.EndpointInfo, error) {
+			return nil, []audio.EndpointInfo{
+				{ID: "{out-default}", Name: "Speakers (Realtek)"},
+				{ID: "{out-cable-a}", Name: "CABLE-A Input (VB-Audio Cable A)"},
+				{ID: "{out-cable-b}", Name: "CABLE-B Input (VB-Audio Cable B)"},
+			}, nil
+		},
+		defaultOutputIDFn: func() (string, error) { return "{out-default}", nil },
+		calibrateFn: func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error) {
+			close(started)
+			<-release
+			return audio.CalibrationResult{
+				MirrorID:     mirrorID,
+				MirrorName:   "CABLE-A Input (VB-Audio Cable A)",
+				CaptureID:    "{in-cable-a}",
+				CaptureName:  "CABLE-A Output (VB-Audio Cable A)",
+				DownstreamMS: 67.1,
+				ValidCount:   8,
+				InlierCount:  8,
+			}, nil
+		},
+		showErrorBoxFn: func(title, msg string) { errBoxes.Add(1) },
+		showInfoBoxFn:  func(title, msg string) { infoBoxes.Add(1) },
+	}
+	h.syncDownstreamFromConfigLocked()
+
+	h.startCalibrateAsync("{in-cable-a}")
+	<-started
+
+	// Switch active mirror mid-calibration to CABLE-B with its own downstream latency.
+	h.mu.Lock()
+	h.cfg.AudioMirrorID = "{out-cable-b}"
+	ctrl.SetAudioDownstreamMS(22.0, false)
+	h.mu.Unlock()
+
+	close(release)
+	h.calibWG.Wait()
+
+	if errBoxes.Load() != 0 {
+		t.Fatalf("unexpected error boxes: %d", errBoxes.Load())
+	}
+	// Active avSync controller MUST keep CABLE-B's 22.0 ms (not overwritten by stale CABLE-A 67.1 ms).
+	snap := ctrl.Snapshot()
+	if snap.AudioDownstreamMS != 22.0 || snap.AudioDownstreamCalibrated {
+		t.Fatalf("stale calibration overwrote active mirror sync state: got (%.1f, cal=%v), want (22.0, cal=false)",
+			snap.AudioDownstreamMS, snap.AudioDownstreamCalibrated)
+	}
+	// CABLE-A's measured latency IS still persisted under CABLE-A's ID in memory and config.json.
+	ms, cal := h.lookupDownstreamMS("{out-cable-a}", "CABLE-A Input (VB-Audio Cable A)")
+	if !cal || ms != 67.1 {
+		t.Fatalf("expected CABLE-A persisted in lookup map: got (%.1f, %v), want (67.1, true)", ms, cal)
+	}
+	saved, err := config.Load(cfgPath)
+	if err != nil || saved.AudioMirrorDownstreamMS["{out-cable-a}"] != 67.1 {
+		t.Fatalf("expected CABLE-A saved in config.json: got %+v err=%v", saved.AudioMirrorDownstreamMS, err)
+	}
+
+	// Now calibrate CABLE-B without switching away: active avSync controller MUST update.
+	h.calibrateFn = func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error) {
+		return audio.CalibrationResult{
+			MirrorID:     mirrorID,
+			MirrorName:   "CABLE-B Input (VB-Audio Cable B)",
+			CaptureID:    "{in-cable-b}",
+			CaptureName:  "CABLE-B Output (VB-Audio Cable B)",
+			DownstreamMS: 58.4,
+			ValidCount:   8,
+			InlierCount:  8,
+		}, nil
+	}
+	h.startCalibrateAsync("{in-cable-b}")
+	h.calibWG.Wait()
+	snap = ctrl.Snapshot()
+	if snap.AudioDownstreamMS != 58.4 || !snap.AudioDownstreamCalibrated {
+		t.Fatalf("matching mirror calibration did not update active sync state: got (%.1f, cal=%v), want (58.4, cal=true)",
+			snap.AudioDownstreamMS, snap.AudioDownstreamCalibrated)
+	}
+}
+
+func TestStartCalibrateAsyncContextCanceledSilent(t *testing.T) {
+	viewCtx, cancelView := context.WithCancel(context.Background())
+	defer cancelView()
+
+	cfg := config.Default()
+	cfg.AudioOut = "default"
+	cfg.AudioMirrorID = "{out-cable}"
+
+	started := make(chan struct{})
+	var errBoxes atomic.Int32
+	var infoBoxes atomic.Int32
+
+	h := &appHost{
+		cfg:     cfg,
+		cfgPath: filepath.Join(t.TempDir(), "config.json"),
+		ctx:     viewCtx,
+		listEndpointsFn: func() ([]audio.EndpointInfo, []audio.EndpointInfo, error) {
+			return nil, []audio.EndpointInfo{
+				{ID: "{out-default}", Name: "Speakers (Realtek)"},
+				{ID: "{out-cable}", Name: "CABLE Input (VB-Audio Virtual Cable)"},
+			}, nil
+		},
+		defaultOutputIDFn: func() (string, error) { return "{out-default}", nil },
+		calibrateFn: func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error) {
+			close(started)
+			<-ctx.Done()
+			return audio.CalibrationResult{}, ctx.Err()
+		},
+		showErrorBoxFn: func(title, msg string) { errBoxes.Add(1) },
+		showInfoBoxFn:  func(title, msg string) { infoBoxes.Add(1) },
+	}
+
+	h.startCalibrateAsync("")
+	<-started
+	cancelView()
+
+	waitDone := make(chan struct{})
+	go func() {
+		h.calibWG.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startCalibrateAsync did not exit after runView context cancellation")
+	}
+
+	if errBoxes.Load() != 0 {
+		t.Fatalf("expected 0 error boxes on context.Canceled shutdown, got %d", errBoxes.Load())
+	}
+	if infoBoxes.Load() != 0 {
+		t.Fatalf("expected 0 info boxes on context.Canceled shutdown, got %d", infoBoxes.Load())
+	}
+	if h.calibrating.Load() {
+		t.Fatal("calibrating flag must be false after cancellation")
+	}
+
+	// Contrast: a real non-canceled error while context is active DOES show an error box.
+	h.ctx = context.Background()
+	h.calibrateFn = func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error) {
+		return audio.CalibrationResult{}, audio.ErrCalibrationTooFewPulses
+	}
+	h.startCalibrateAsync("")
+	h.calibWG.Wait()
+	if errBoxes.Load() != 1 {
+		t.Fatalf("expected 1 error box for real calibration failure, got %d", errBoxes.Load())
 	}
 }

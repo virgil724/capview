@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unicode"
+
+	"github.com/virgil724/capview/internal/avsync"
 )
 
 // DefaultVirtualCableDownstreamMS is the conservative heuristic downstream
@@ -25,9 +27,92 @@ const (
 	calibWarmupMS       = 500.0
 	calibTailMS         = 260.0
 	calibPulseAmp       = 0.25118864 // -12 dBFS
-	calibMinValidPulses = 3
-	calibMaxDownstream  = 250.0
+	calibMinValidPulses   = 3
+	calibMaxDownstream    = 250.0
+	maxCapturePacketAgeNS = 500_000_000 // 500 ms upper bound for valid WASAPI capture QPC age
 )
+
+// ResolveMainOutputID resolves a configured main audio output selector (such as
+// config.AudioOut: "", "default", endpoint ID, exact name, or substring) to its
+// endpoint ID using outputs and defaultOutputID.
+func ResolveMainOutputID(audioOut string, outputs []EndpointInfo, defaultOutputID string) string {
+	want := strings.TrimSpace(audioOut)
+	if want == "" || strings.EqualFold(want, "default") {
+		return defaultOutputID
+	}
+	for _, ep := range outputs {
+		if strings.EqualFold(ep.ID, want) || strings.EqualFold(ep.Name, want) {
+			return ep.ID
+		}
+	}
+	low := strings.ToLower(want)
+	for _, ep := range outputs {
+		if strings.Contains(strings.ToLower(ep.Name), low) {
+			return ep.ID
+		}
+	}
+	return ""
+}
+
+// ValidateStandaloneCalibrationMirror rejects standalone calibration targets
+// that point at either the configured main audio output endpoint or the system
+// default playback speaker endpoint, preventing calibration pulses from ever
+// playing into local speakers.
+func ValidateStandaloneCalibrationMirror(mirrorID, mainOutputID, defaultOutputID string) error {
+	if MirrorIsMainOutput(mirrorID, mainOutputID) {
+		return fmt.Errorf("%w: cannot calibrate the main audio output device", ErrMirrorIsMainOutput)
+	}
+	if MirrorIsMainOutput(mirrorID, defaultOutputID) {
+		return fmt.Errorf("%w: cannot calibrate the system default playback speaker", ErrMirrorIsMainOutput)
+	}
+	return nil
+}
+
+// resolveCapturePacketTiming validates a WASAPI capture packet's QPC timestamp
+// (in 100 ns HNS units) against nowNS and computes its packet start timestamp
+// and delivery age (ms). A QPC timestamp is accepted only when timestampErr is
+// false, qpcHNS > 0, and 0 <= nowNS-capNS <= 500ms; otherwise startNS falls
+// back to nowNS - pktDurNS. Packet age is always computed from the final
+// validated startNS so abnormal QPC values can never poison age averages and
+// fallback packets are counted uniformly.
+func resolveCapturePacketTiming(nowNS, qpcHNS int64, timestampErr bool, frames, rate int) (startNS int64, ageMS float64, usedQPC bool) {
+	var pktDurNS int64
+	if frames > 0 && rate > 0 {
+		pktDurNS = int64(frames) * 1_000_000_000 / int64(rate)
+	}
+	startNS = nowNS - pktDurNS
+	if !timestampErr && qpcHNS > 0 && qpcHNS <= math.MaxInt64/100 {
+		capNS := avsync.HNSToNS(qpcHNS)
+		ageNS := nowNS - capNS
+		if ageNS >= 0 && ageNS <= maxCapturePacketAgeNS {
+			startNS = capNS
+			usedQPC = true
+		}
+	}
+	ageMS = float64(nowNS-startNS) / 1e6
+	return startNS, ageMS, usedQPC
+}
+
+// captureAgeTracker accumulates validated capture packet delivery ages across
+// both QPC-timestamped and fallback packets.
+type captureAgeTracker struct {
+	sumMS float64
+	count int
+}
+
+func (t *captureAgeTracker) Observe(nowNS, qpcHNS int64, timestampErr bool, frames, rate int) (startNS int64, usedQPC bool) {
+	startNS, ageMS, usedQPC := resolveCapturePacketTiming(nowNS, qpcHNS, timestampErr, frames, rate)
+	t.sumMS += ageMS
+	t.count++
+	return startNS, usedQPC
+}
+
+func (t *captureAgeTracker) AvgMS() float64 {
+	if t.count == 0 {
+		return 0
+	}
+	return t.sumMS / float64(t.count)
+}
 
 // ErrCalibrationTooFewPulses is returned when fewer than calibMinValidPulses
 // test pulses are detected on the capture endpoint.
@@ -266,7 +351,7 @@ type PulseMeasurement struct {
 	OnsetNS         int64
 	RawRoundtripMS  float64 // OnsetNS - EmitNS (ms)
 	RawFromSubmitMS float64 // OnsetNS - SubmitNS (ms)
-	DownstreamMS    float64 // RawRoundtripMS - CaptureHalfBufMS (ms)
+	DownstreamMS    float64 // clamp(RawRoundtripMS + CaptureAvgAgeMS - CaptureHalfBufMS) (ms)
 }
 
 // CalibrationResult summarizes a completed downstream audio latency calibration.

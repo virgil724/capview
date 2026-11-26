@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"runtime"
 	"strings"
 	"time"
@@ -108,6 +107,11 @@ func CalibrateEndpoints(ctx context.Context, mirrorID, captureID string) (Calibr
 	}
 	if !found {
 		return CalibrationResult{}, fmt.Errorf("mirror playback endpoint %q not found", mirrorID)
+	}
+	if defaultOutID, err := DefaultOutputEndpointID(); err == nil && defaultOutID != "" {
+		if err := ValidateStandaloneCalibrationMirror(mirrorEP.ID, "", defaultOutID); err != nil {
+			return CalibrationResult{}, err
+		}
 	}
 
 	capEP, err := resolveCalibrationCaptureEndpoint(mirrorEP, captureID)
@@ -375,12 +379,11 @@ func captureCalibrationLoop(ctx context.Context, captureID string, freq int64, i
 	defer cl.Stop()
 
 	var (
-		chunks       []CapturedChunk
-		decBuf       []float32
-		drainEnd     time.Time
-		draining     bool
-		ageSumMS     float64
-		ageCount     int
+		chunks     []CapturedChunk
+		decBuf     []float32
+		drainEnd   time.Time
+		draining   bool
+		ageTracker captureAgeTracker
 	)
 
 	// Hard upper bound so calibration can never hang.
@@ -427,18 +430,7 @@ func captureCalibrationLoop(ctx context.Context, captureID string, freq int64, i
 			}
 			if pk.Frames > 0 {
 				nowNS := avsync.QPCTicksToNS(win.QPC(), freq)
-				var startNS int64
-				if pk.Flags&win.BufferFlagsTimestampErr == 0 && pk.QPC > 0 {
-					startNS = avsync.HNSToNS(pk.QPC)
-					ageSumMS += float64(nowNS-startNS) / 1e6
-					ageCount++
-					// Sanity check: if driver QPC timestamp is wild (>500ms off from nowNS), fall back.
-					if math.Abs(float64(nowNS-startNS)) > 500_000_000 {
-						startNS = nowNS - int64(pk.Frames)*1_000_000_000/int64(inFmt.Rate)
-					}
-				} else {
-					startNS = nowNS - int64(pk.Frames)*1_000_000_000/int64(inFmt.Rate)
-				}
+				startNS, _ := ageTracker.Observe(nowNS, pk.QPC, pk.Flags&win.BufferFlagsTimestampErr != 0, pk.Frames, inFmt.Rate)
 
 				mono := make([]float32, pk.Frames)
 				if pk.Flags&win.BufferFlagsSilent == 0 {
@@ -457,10 +449,7 @@ func captureCalibrationLoop(ctx context.Context, captureID string, freq int64, i
 		}
 	}
 
-	var avgAgeMS float64
-	if ageCount > 0 {
-		avgAgeMS = ageSumMS / float64(ageCount)
-	}
+	avgAgeMS := ageTracker.AvgMS()
 	return captureRunResult{
 		chunks:    chunks,
 		bufMS:     bufMS,
