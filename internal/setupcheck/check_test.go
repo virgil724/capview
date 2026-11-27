@@ -475,6 +475,21 @@ func TestCheckAVSyncCalibrationStates(t *testing.T) {
 		}
 	})
 
+	t.Run("configured VB-Cable uncalibrated with Auto Sync disabled -> Warning includes disabled hint", func(t *testing.T) {
+		cfg := config.Default()
+		cfg.AudioMirrorID = "{out-cable}"
+		cfg.AVSyncEnabled = false
+		rep := Evaluate(cfg, probes)
+		it, _ := rep.Find(CheckAVSyncCalibration)
+		if it.Status != StatusWarning || !strings.Contains(it.Summary, "35 ms") {
+			t.Fatalf("expected StatusWarning with 35 ms default, got %+v", it)
+		}
+		joined := strings.Join(it.Details, "\n")
+		if !strings.Contains(joined, "Auto Sync is currently disabled") {
+			t.Fatalf("expected Auto Sync disabled hint in details, got %q", joined)
+		}
+	})
+
 	t.Run("no mirror configured -> Optional", func(t *testing.T) {
 		cfg := config.Default()
 		cfg.AudioMirrorDownstreamMS = map[string]float64{"{out-cable}": 67.1}

@@ -598,6 +598,9 @@ func checkAVSyncCalibration(goos string, cfg config.Config, outputs []audio.Endp
 	if !mirrorConnected && len(outputs) > 0 {
 		item.Details = append(item.Details, "Note: configured mirror endpoint is not currently connected.")
 	}
+	if !cfg.AVSyncEnabled {
+		item.Details = append(item.Details, "Note: Auto Sync is currently disabled (enable Right-click -> Audience A/V Sync -> Auto Sync).")
+	}
 	item.Action = "Run Right-click -> Audience A/V Sync -> Calibrate to measure exact downstream audio latency."
 	return item
 }

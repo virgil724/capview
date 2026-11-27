@@ -150,6 +150,7 @@ func readPEFileVersion(path string) string {
 	min := uint16(info.FileVersionMS & 0xFFFF)
 	patch := uint16(info.FileVersionLS >> 16)
 	build := uint16(info.FileVersionLS & 0xFFFF)
+	runtime.KeepAlive(buf)
 	if build == 0 {
 		return fmt.Sprintf("%d.%d.%d", maj, min, patch)
 	}
