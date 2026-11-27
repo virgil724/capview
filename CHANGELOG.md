@@ -2,7 +2,9 @@
 
 All notable changes to `capview` are documented in this file.
 
-## [0.2.0] - Unreleased (draft)
+## [Unreleased]
+
+## [0.2.0] - 2026-11-27
 
 ### Added
 - **Windows x64 Virtual Camera (Windows 11 & Windows 10)**:
@@ -18,7 +20,7 @@ All notable changes to `capview` are documented in this file.
   - Uses EMA-smoothed capture-to-emit latency estimates and slew-rate-limited (`3 ms/s`) two-way compensation applied only to the faster path: a bounded 24-frame QPC-scheduled staging delay queue on video bypass outputs (23-frame max + 1 jitter headroom slot = up to `191.7 ms` @ 120 fps / `383.3 ms` @ 60 fps) and smooth adaptive micro-resampling on the 25 ms audio mirror ring.
   - One-click downstream audio latency self-calibration: right-click **`Audience A/V Sync ▸ Calibrate`** (or **`Calibrate With`**) and CLI `-av-sync-calibrate` / `-av-sync-calibrate-in` inject 8 quiet `1 kHz` test pulses into the mirror output only (zero sound to local speakers), measure median loopback latency, and persist per-endpoint `audio_mirror_downstream_ms`. Uncalibrated VB-Cable / virtual-cable endpoints apply a conservative `35.0 ms` heuristic default (`0.0 ms` for physical outputs).
   - Manual trim via right-click **`Audience A/V Sync`** (`Auto Sync`, `Delay Audio +10 ms`, `Delay Video +10 ms`, `Reset Offset (0 ms)`), persisted `av_sync_enabled` (default `true`) and `av_sync_offset_ms` (`[-200..+200]`), `-stats` sync & downstream telemetry, and built-in `-source synthetic -sync-test` (`1 Hz` white flash + `1 kHz` `-12 dBFS` beep).
-- **Setup Check (Windows, companion PR)**: right-click **`Setup Check...`** and `capview setup-check` one-stop check for VB-Cable, OBS / `obs-spout2-plugin`, Virtual Camera registration, and Audience A/V Sync calibration status.
+- **Setup Check (Windows)**: right-click **`Setup Check...`** and `capview setup-check` one-stop check for VB-Cable, OBS / `obs-spout2-plugin`, Virtual Camera registration, and Audience A/V Sync calibration status.
 - **Linux build** (pure Go, no cgo; Vulkan and `libwayland-client` loaded with `purego`):
   - Wayland viewer window (`xdg-shell` fullscreen, keyboard/pointer, `-display` to pick the fullscreen output, idle cursor hiding via `wp_cursor_shape_v1`).
   - Zero-copy V4L2 capture through [caplat](https://github.com/virgil724/caplat)'s `capture/v4l2` (frames hold their MMAP buffer until rendered).
@@ -54,6 +56,7 @@ All notable changes to `capview` are documented in this file.
 - Native Win32 right-click menu for live device, resolution/FPS, audio, fullscreen, and VSync switching, plus persistent config in `%APPDATA%\capview\config.json`.
 - GitHub Actions CI and automated `windows/amd64` + `windows/arm64` releases with `SHA256SUMS.txt`.
 
+[Unreleased]: https://github.com/virgil724/capview/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/virgil724/capview/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/virgil724/capview/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/virgil724/capview/releases/tag/v0.1.0

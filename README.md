@@ -97,7 +97,7 @@ Settings (device, resolution/FPS, audio input/output, audio mirror, volume, mute
 
 Play locally at full VRR speed (~23 ms) while sharing your capture feed to friends, calls, or streams — **zero added latency** to your local monitor or headphones.
 
-> **One-stop check**: Right-click → **`Setup Check...`** (or run `capview-cli.exe setup-check`) inspects VB-Cable, OBS / `obs-spout2-plugin`, Virtual Camera registration, and Audience A/V Sync calibration status in one view *(added in the companion Setup Check PR)*.
+> **One-stop check**: Right-click → **`Setup Check...`** (or run `capview-cli.exe setup-check`) inspects VB-Cable, OBS / `obs-spout2-plugin`, Virtual Camera registration, and Audience A/V Sync calibration status in one view.
 
 Pick the setup that matches where your audience is watching:
 

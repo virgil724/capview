@@ -1,6 +1,6 @@
 # v0.2.0 Verification Checklist
 
-Release candidate baseline: `main` @ `574f710` (plus companion Setup Check PR A & release PR B).
+Release candidate baseline: `main` @ `574f710` (plus PR #9 `6ea5504` Setup Check & PR #10 `f51e16e` v0.2.0 release readiness).
 
 ---
 
@@ -111,6 +111,6 @@ Perform these manual checks on real hardware before converting the draft `v0.2.0
 - [ ] **`Spout Output`**: Toggle ON and verify OBS **Spout2 Capture** receives `capview` immediately; toggle OFF and verify the sender unregisters cleanly and OBS clears.
 - [ ] **`Virtual Camera`**: Verify **`Enable`**, **`Disable`**, and **`Uninstall`** states update accurately (and **`Reinstall (OS Changed)`** triggers cleanly if OS mismatch is simulated/encountered).
 - [ ] **`Audience A/V Sync`**: Verify **`Auto Sync`** toggle, **`Calibrate`** (and **`Calibrate With`** submenu when multiple capture devices exist), **`Delay Audio +10 ms`**, **`Delay Video +10 ms`**, and **`Reset Offset (0 ms)`** all update labels/checkmarks and persist cleanly.
-- [ ] **`Setup Check...`** *(after companion PR A merges)*: Click **`Setup Check...`** in the right-click menu and run `.\capview-cli.exe setup-check`.
+- [ ] **`Setup Check...`**: Click **`Setup Check...`** in the right-click menu and run `.\capview-cli.exe setup-check`.
   - **Expected**: Accurately reports status for VB-Cable (`CABLE Input` / `CABLE Output`), OBS & `obs-spout2-plugin`, Virtual Camera DLL / OS registration, and Audience A/V Sync calibration without crashing or mutating settings.
-- [ ] **Pre-tag docs cleanup**: After both PR #9 (Setup Check) and PR #10 (v0.2.0 release readiness) are merged and before tagging `v0.2.0`, remove the `*(companion PR)*` / `*(added in the companion Setup Check PR)*` parentheticals from `README.md`, `CHANGELOG.md`, and `docs/release-v0.2.0-draft.md`.
+- [x] **Pre-tag docs cleanup**: Removed temporary pre-merge annotations from `README.md`, `CHANGELOG.md`, `docs/release-v0.2.0-draft.md`, and `docs/verification-checklist-v0.2.0.md` after PR #9 (`6ea5504`) and PR #10 (`f51e16e`) merged.
