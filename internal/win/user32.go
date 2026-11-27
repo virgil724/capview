@@ -350,6 +350,20 @@ func ShowInfoBox(title, message string) {
 	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbIconInformation)
 }
 
+// ShowYesNoInfoBox displays a native Windows informational dialog with Yes/No
+// buttons and returns true if the user clicked Yes.
+func ShowYesNoInfoBox(title, message string) bool {
+	const (
+		mbYesNo           = 0x00000004
+		mbIconInformation = 0x00000040
+		idYes             = 6
+	)
+	t, _ := windows.UTF16PtrFromString(title)
+	m, _ := windows.UTF16PtrFromString(message)
+	r, _, _ := procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbYesNo|mbIconInformation)
+	return r == idYes
+}
+
 func DefWindowProc(h uintptr, msg uint32, wp, lp uintptr) uintptr {
 	r, _, _ := procDefWindowProcW.Call(h, uintptr(msg), wp, lp)
 	return r
