@@ -342,6 +342,14 @@ func ShowErrorBox(title, message string) {
 	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbIconError)
 }
 
+// ShowInfoBox displays a native Windows informational dialog (useful for windowsgui builds).
+func ShowInfoBox(title, message string) {
+	const mbIconInformation = 0x40
+	t, _ := windows.UTF16PtrFromString(title)
+	m, _ := windows.UTF16PtrFromString(message)
+	procMessageBoxW.Call(0, uintptr(unsafe.Pointer(m)), uintptr(unsafe.Pointer(t)), mbIconInformation)
+}
+
 func DefWindowProc(h uintptr, msg uint32, wp, lp uintptr) uintptr {
 	r, _, _ := procDefWindowProcW.Call(h, uintptr(msg), wp, lp)
 	return r

@@ -3,6 +3,7 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 )
@@ -36,6 +37,9 @@ type Config struct {
 	// AVSyncOffsetMS is a manual fine-tune offset in milliseconds for audience
 	// outputs (+ delays audio further, - delays video further; clamped [-200..200]).
 	AVSyncOffsetMS int `json:"av_sync_offset_ms"`
+	// AudioMirrorDownstreamMS stores calibrated downstream audio latency (ms)
+	// keyed by mirror WASAPI endpoint ID (e.g. VB-Cable CABLE Input ID).
+	AudioMirrorDownstreamMS map[string]float64 `json:"audio_mirror_downstream_ms,omitempty"`
 }
 
 // Default returns sensible defaults for first launch.
@@ -101,6 +105,25 @@ func Load(path string) (Config, error) {
 		cfg.AVSyncOffsetMS = -200
 	} else if cfg.AVSyncOffsetMS > 200 {
 		cfg.AVSyncOffsetMS = 200
+	}
+	if len(cfg.AudioMirrorDownstreamMS) > 0 {
+		cleaned := make(map[string]float64, len(cfg.AudioMirrorDownstreamMS))
+		for k, v := range cfg.AudioMirrorDownstreamMS {
+			if k == "" || math.IsNaN(v) || math.IsInf(v, 0) {
+				continue
+			}
+			if v < 0 {
+				v = 0
+			} else if v > 250 {
+				v = 250
+			}
+			cleaned[k] = v
+		}
+		if len(cleaned) > 0 {
+			cfg.AudioMirrorDownstreamMS = cleaned
+		} else {
+			cfg.AudioMirrorDownstreamMS = nil
+		}
 	}
 	return cfg, nil
 }

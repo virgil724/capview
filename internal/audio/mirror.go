@@ -20,26 +20,6 @@ const (
 	MirrorCapMS    = 300
 )
 
-// VirtualCableLoopbackMS is the typical internal render-to-capture FIFO delay
-// of virtual audio cable drivers (e.g. VB-Audio Virtual Cable, VoiceMeeter)
-// that sits downstream of the WASAPI render pin and is therefore invisible to
-// IAudioClient::GetStreamLatency(). Empirically measured on VB-Cable at ~30 ms;
-// using 25 ms keeps end-to-end receiver A/V error well within +/-20 ms across
-// common virtual-cable buffer configurations.
-const VirtualCableLoopbackMS = 25.0
-
-// mirrorEndpointExtraLatencyMS returns additional downstream loopback latency
-// for known virtual audio cable render endpoints (0 for physical speakers/DACs).
-func mirrorEndpointExtraLatencyMS(endpointName string) float64 {
-	nl := strings.ToLower(endpointName)
-	for _, pat := range []string{"vb-audio", "cable input", "voicemeeter", "virtual audio cable"} {
-		if strings.Contains(nl, pat) {
-			return VirtualCableLoopbackMS
-		}
-	}
-	return 0
-}
-
 // MirrorRingFrames returns (cap, target, max) ring sizes in frames at rate Hz.
 func MirrorRingFrames(rate int) (capFrames, targetFrames, maxFrames int) {
 	return MirrorRingFramesForTarget(rate, MirrorTargetMS)
@@ -165,10 +145,12 @@ func (t *mirrorTap) Push(lr []float32) {
 	t.pending = append(t.pending, lr...)
 }
 
-// EndpointInfo identifies an audio endpoint for menus.
+// EndpointInfo identifies an audio endpoint for menus and calibration pairing.
 type EndpointInfo struct {
-	ID   string
-	Name string
+	ID      string
+	Name    string
+	Desc    string // optional MMDevice PKEY_Device_DeviceDesc
+	Adapter string // optional MMDevice PKEY_DeviceInterface_FriendlyName
 }
 
 // MirrorChoice is one entry of the "Audio Mirror Output" submenu.

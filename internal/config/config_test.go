@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -44,7 +45,7 @@ func TestLoadSaveRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load saved: %v", err)
 	}
-	if got != cfg {
+	if !reflect.DeepEqual(got, cfg) {
 		t.Fatalf("round-trip mismatch:\ngot:  %+v\nwant: %+v", got, cfg)
 	}
 }
@@ -144,5 +145,48 @@ func TestAVSyncConfigFields(t *testing.T) {
 	clampedLo, _ := Load(p)
 	if clampedLo.AVSyncOffsetMS != -200 {
 		t.Fatalf("low clamp = %d, want -200", clampedLo.AVSyncOffsetMS)
+	}
+}
+
+func TestAudioMirrorDownstreamMSRoundTrip(t *testing.T) {
+	if Default().AudioMirrorDownstreamMS != nil {
+		t.Fatal("AudioMirrorDownstreamMS must default to nil")
+	}
+
+	p := filepath.Join(t.TempDir(), "config.json")
+	cfg := Default()
+	cfg.AudioMirrorDownstreamMS = map[string]float64{
+		"{0.0.0.00000000}.{cable}": 61.5,
+		"{0.0.0.00000000}.{other}": 12.0,
+	}
+	if err := Save(p, cfg); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(raw), `"audio_mirror_downstream_ms"`) {
+		t.Fatalf("missing snake_case audio_mirror_downstream_ms in JSON:\n%s", raw)
+	}
+
+	got, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !reflect.DeepEqual(got.AudioMirrorDownstreamMS, cfg.AudioMirrorDownstreamMS) {
+		t.Fatalf("round-trip map mismatch: got %+v, want %+v", got.AudioMirrorDownstreamMS, cfg.AudioMirrorDownstreamMS)
+	}
+
+	// Out-of-range values clamp to [0, 250].
+	if err := os.WriteFile(p, []byte(`{"audio_mirror_downstream_ms":{"a":-10,"b":999,"c":42.5}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clamped, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load clamped: %v", err)
+	}
+	if clamped.AudioMirrorDownstreamMS["a"] != 0 || clamped.AudioMirrorDownstreamMS["b"] != 250 || clamped.AudioMirrorDownstreamMS["c"] != 42.5 {
+		t.Fatalf("unexpected clamped values: %+v", clamped.AudioMirrorDownstreamMS)
 	}
 }

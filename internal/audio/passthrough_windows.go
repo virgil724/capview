@@ -35,7 +35,7 @@ func ListEndpointInfos() (inputs, outputs []EndpointInfo, err error) {
 			return e
 		}
 		for _, ep := range inEps {
-			inputs = append(inputs, EndpointInfo{ID: ep.ID, Name: ep.Name})
+			inputs = append(inputs, EndpointInfo{ID: ep.ID, Name: ep.Name, Desc: ep.Desc, Adapter: ep.Adapter})
 			ep.Device.Release()
 		}
 		outEps, e := win.AudioEndpoints(win.ERender)
@@ -43,12 +43,28 @@ func ListEndpointInfos() (inputs, outputs []EndpointInfo, err error) {
 			return e
 		}
 		for _, ep := range outEps {
-			outputs = append(outputs, EndpointInfo{ID: ep.ID, Name: ep.Name})
+			outputs = append(outputs, EndpointInfo{ID: ep.ID, Name: ep.Name, Desc: ep.Desc, Adapter: ep.Adapter})
 			ep.Device.Release()
 		}
 		return nil
 	})
 	return inputs, outputs, err
+}
+
+// DefaultOutputEndpointID returns the MMDevice ID of the Windows default
+// console audio playback (render) endpoint.
+func DefaultOutputEndpointID() (string, error) {
+	var id string
+	err := withCOM(func() error {
+		ep, e := win.DefaultAudioEndpoint(win.ERender)
+		if e != nil {
+			return e
+		}
+		defer ep.Device.Release()
+		id = ep.ID
+		return nil
+	})
+	return id, err
 }
 
 func withCOM(f func() error) error {
@@ -67,10 +83,11 @@ func Start(cfg Config) (*Passthrough, error) {
 		cfg.Volume = 1.0
 	}
 	p := &Passthrough{
-		sync:           cfg.Sync,
-		freq:           win.QPCFrequency(),
-		mirrorTargetMS: cfg.MirrorTargetMS,
-		done:           make(chan struct{}),
+		sync:             cfg.Sync,
+		downstreamLookup: cfg.DownstreamLookup,
+		freq:             win.QPCFrequency(),
+		mirrorTargetMS:   cfg.MirrorTargetMS,
+		done:             make(chan struct{}),
 	}
 	if p.freq <= 0 {
 		p.freq = 10_000_000
@@ -521,6 +538,8 @@ func (p *Passthrough) runMirror(st *mirrorState, baseTargetFrames, baseMaxFrames
 	}
 	defer ep.Device.Release()
 	st.name = ep.Name
+	st.desc = ep.Desc
+	st.adapter = ep.Adapter
 
 	const bufHNS = 200_000
 	cl, err := win.NewAudioClientStereoFloat(ep.Device, bufHNS, p.InputRate)
@@ -544,18 +563,22 @@ func (p *Passthrough) runMirror(st *mirrorState, baseTargetFrames, baseMaxFrames
 	}
 	defer cl.Stop()
 
-	var streamLatMS float64
-	if hns, err := cl.StreamLatency(); err == nil && hns > 0 {
-		streamLatMS = avsync.HNSToMS(hns)
-	} else if defHNS, _, err := cl.DevicePeriod(); err == nil && defHNS > 0 {
-		// On Windows 10/11 shared-mode streams (especially with AUTOCONVERTPCM),
-		// GetStreamLatency() often reports 0; use the shared audio engine period
-		// (~10 ms) as the floor engine latency.
-		streamLatMS = avsync.HNSToMS(defHNS)
+	pureStreamLatMS := pureWASAPIStreamLatencyMS(cl)
+	st.renderBufMS = float64(cl.Frames) * 1000.0 / float64(p.InputRate)
+	st.pureStreamLatMS = pureStreamLatMS
+	streamLatMS := pureStreamLatMS
+	if p.sync != nil {
+		var dsMS float64
+		var dsCal bool
+		if p.downstreamLookup != nil {
+			dsMS, dsCal = p.downstreamLookup(ep.ID, ep.Name)
+		} else {
+			dsMS, dsCal = DefaultDownstreamMS(ep.Name), false
+		}
+		p.sync.SetAudioDownstreamMS(dsMS, dsCal)
+		p.sync.SetAudioMirrorActive(true)
+		defer p.sync.SetAudioMirrorActive(false)
 	}
-	streamLatMS += mirrorEndpointExtraLatencyMS(ep.Name)
-	p.sync.SetAudioMirrorActive(true)
-	defer p.sync.SetAudioMirrorActive(false)
 
 	ready <- nil
 
@@ -631,7 +654,20 @@ func (p *Passthrough) runMirror(st *mirrorState, baseTargetFrames, baseMaxFrames
 				lastExtraF = extraFrames
 			}
 		}
-		if primed {
+		if inj := st.calib.Load(); inj != nil {
+			// Calibration mode: drain the mirror ring silently at normal pace so
+			// it neither overruns nor underruns, while injecting clean 1 kHz test
+			// pulses directly into the mirror render buffer (local playback untouched).
+			if primed {
+				if ring.Read(out, 0) < avail {
+					primed = false
+				}
+			}
+			submitNS := avsync.QPCTicksToNS(win.QPC(), p.freq)
+			if !inj.Fill(out, avail, pad, submitNS, pureStreamLatMS) {
+				st.calib.CompareAndSwap(inj, nil)
+			}
+		} else if primed {
 			srcFrames := adaptiveMirrorReadFrames(avail, ringAvail, baseTargetFrames, extraFrames, p.InputRate)
 			if srcFrames == avail {
 				if ring.Read(out, p.mirrorGain()) < avail {

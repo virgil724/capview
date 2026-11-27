@@ -41,6 +41,9 @@ const (
 	// faster than video or the user requests positive manual audio delay.
 	MaxAudioDelayMS = 220.0
 
+	// MaxAudioDownstreamMS bounds configured/calibrated downstream audio latency.
+	MaxAudioDownstreamMS = 250.0
+
 	// initialLockSamples is the number of audio and video samples required
 	// before snapping the initial startup compensation (thereafter strictly
 	// slew-rate limited at SlewRateMSPerSec).
@@ -60,14 +63,16 @@ func ClampOffsetMS(ms int) int {
 
 // Options configures a Controller. Zero values select sensible defaults.
 type Options struct {
-	AutoEnabled       bool
-	ManualOffsetMS    int
-	EMAAlpha          float64
-	SlewRateMSPerSec  float64
-	VcamCadenceMS     float64
-	SpoutCadenceMS    float64
-	DisableInitSnap   bool // if true, slew from 0 even on initial startup lock
-	LogClamp          func(msg string)
+	AutoEnabled               bool
+	ManualOffsetMS            int
+	AudioDownstreamMS         float64
+	AudioDownstreamCalibrated bool
+	EMAAlpha                  float64
+	SlewRateMSPerSec          float64
+	VcamCadenceMS             float64
+	SpoutCadenceMS            float64
+	DisableInitSnap           bool // if true, slew from 0 even on initial startup lock
+	LogClamp                  func(msg string)
 }
 
 // Snapshot is a thread-safe readout of current audience A/V sync state for
@@ -76,10 +81,12 @@ type Snapshot struct {
 	AutoEnabled    bool
 	ManualOffsetMS int
 
-	AudioActive    bool
-	AudioBaseMS    float64
-	AudioDelayMS   float64
-	AudioSamples   uint64
+	AudioActive               bool
+	AudioBaseMS               float64
+	AudioDownstreamMS         float64
+	AudioDownstreamCalibrated bool
+	AudioDelayMS              float64
+	AudioSamples              uint64
 
 	VcamActive     bool
 	VcamBaseMS     float64
@@ -106,13 +113,18 @@ func (s Snapshot) FormatStats() string {
 		return ""
 	}
 	vidActive := s.VcamActive || s.SpoutActive
+	dsSrc := "default"
+	if s.AudioDownstreamCalibrated {
+		dsSrc = "cal"
+	}
 	if !s.AudioActive || !vidActive {
 		mode := "auto"
 		if !s.AutoEnabled {
 			mode = "off"
 		}
 		if s.AudioActive {
-			return fmt.Sprintf("sync | aud %.1fms vid off -> idle (%s off %+dms)", s.AudioBaseMS, mode, s.ManualOffsetMS)
+			return fmt.Sprintf("sync | aud %.1fms (ds %.1fms %s) vid off -> idle (%s off %+dms)",
+				s.AudioBaseMS, s.AudioDownstreamMS, dsSrc, mode, s.ManualOffsetMS)
 		}
 		vidMS := s.VcamBaseMS
 		if !s.VcamActive {
@@ -144,8 +156,8 @@ func (s Snapshot) FormatStats() string {
 	if s.VideoClamped {
 		action += " [cap]"
 	}
-	return fmt.Sprintf("sync | aud %.1fms vid %.1fms -> %s (off %+dms)",
-		s.AudioBaseMS, vidBase, action, s.ManualOffsetMS)
+	return fmt.Sprintf("sync | aud %.1fms (ds %.1fms %s) vid %.1fms -> %s (off %+dms)",
+		s.AudioBaseMS, s.AudioDownstreamMS, dsSrc, vidBase, action, s.ManualOffsetMS)
 }
 
 type videoSinkState struct {
@@ -173,10 +185,12 @@ type Controller struct {
 	disableSnap    bool
 	logClamp       func(string)
 
-	audioActive   bool
-	audioBaseMS   float64
-	audioSamples  uint64
-	audioApplied  float64
+	audioActive               bool
+	audioBaseMS               float64
+	audioDownstreamMS         float64
+	audioDownstreamCalibrated bool
+	audioSamples              uint64
+	audioApplied              float64
 
 	sinks       [numVideoSinks]videoSinkState
 	locked      bool
@@ -202,14 +216,16 @@ func NewController(opts Options) *Controller {
 		spoutCad = DefaultSpoutCadenceMS
 	}
 	c := &Controller{
-		autoEnabled:    opts.AutoEnabled,
-		manualOffsetMS: ClampOffsetMS(opts.ManualOffsetMS),
-		alpha:          alpha,
-		slewPerSec:     slew,
-		vcamCadenceMS:  vcamCad,
-		spoutCadenceMS: spoutCad,
-		disableSnap:    opts.DisableInitSnap,
-		logClamp:       opts.LogClamp,
+		autoEnabled:               opts.AutoEnabled,
+		manualOffsetMS:            ClampOffsetMS(opts.ManualOffsetMS),
+		audioDownstreamMS:         clampAudioDownstreamMS(opts.AudioDownstreamMS),
+		audioDownstreamCalibrated: opts.AudioDownstreamCalibrated,
+		alpha:                     alpha,
+		slewPerSec:                slew,
+		vcamCadenceMS:             vcamCad,
+		spoutCadenceMS:            spoutCad,
+		disableSnap:               opts.DisableInitSnap,
+		logClamp:                  opts.LogClamp,
 	}
 	for i := range c.sinks {
 		c.sinks[i].fps = 60
@@ -276,6 +292,40 @@ func (c *Controller) ManualOffsetMS() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.manualOffsetMS
+}
+
+func clampAudioDownstreamMS(ms float64) float64 {
+	if math.IsNaN(ms) || math.IsInf(ms, 0) || ms < 0 {
+		return 0
+	}
+	if ms > MaxAudioDownstreamMS {
+		return MaxAudioDownstreamMS
+	}
+	return ms
+}
+
+// SetAudioDownstreamMS sets the downstream audio latency (ms) beyond capview's
+// mirror WASAPI render pin (e.g. VB-Cable + receiver capture buffering), along
+// with whether the value came from self-calibration (true) or a default (false).
+func (c *Controller) SetAudioDownstreamMS(ms float64, calibrated bool) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.audioDownstreamMS = clampAudioDownstreamMS(ms)
+	c.audioDownstreamCalibrated = calibrated
+	c.mu.Unlock()
+}
+
+// AudioDownstreamMS returns the configured downstream audio latency and whether
+// it was empirically calibrated.
+func (c *Controller) AudioDownstreamMS() (float64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.audioDownstreamMS, c.audioDownstreamCalibrated
 }
 
 // SetAudioMirrorActive marks whether the audio mirror audience output is active.
@@ -488,21 +538,23 @@ func (c *Controller) Snapshot() Snapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return Snapshot{
-		AutoEnabled:    c.autoEnabled,
-		ManualOffsetMS: c.manualOffsetMS,
-		AudioActive:    c.audioActive,
-		AudioBaseMS:    c.audioBaseMS,
-		AudioDelayMS:   c.audioApplied,
-		AudioSamples:   c.audioSamples,
-		VcamActive:     c.sinks[SinkVcam].active,
-		VcamBaseMS:     c.sinks[SinkVcam].baseMS,
-		VcamDelayMS:    c.sinks[SinkVcam].appliedMS,
-		VcamSamples:    c.sinks[SinkVcam].samples,
-		SpoutActive:    c.sinks[SinkSpout].active,
-		SpoutBaseMS:    c.sinks[SinkSpout].baseMS,
-		SpoutDelayMS:   c.sinks[SinkSpout].appliedMS,
-		SpoutSamples:   c.sinks[SinkSpout].samples,
-		VideoClamped:   c.sinks[SinkVcam].clamped || c.sinks[SinkSpout].clamped,
+		AutoEnabled:               c.autoEnabled,
+		ManualOffsetMS:            c.manualOffsetMS,
+		AudioActive:               c.audioActive,
+		AudioBaseMS:               c.audioBaseMS + c.audioDownstreamMS,
+		AudioDownstreamMS:         c.audioDownstreamMS,
+		AudioDownstreamCalibrated: c.audioDownstreamCalibrated,
+		AudioDelayMS:              c.audioApplied,
+		AudioSamples:              c.audioSamples,
+		VcamActive:                c.sinks[SinkVcam].active,
+		VcamBaseMS:                c.sinks[SinkVcam].baseMS,
+		VcamDelayMS:               c.sinks[SinkVcam].appliedMS,
+		VcamSamples:               c.sinks[SinkVcam].samples,
+		SpoutActive:               c.sinks[SinkSpout].active,
+		SpoutBaseMS:               c.sinks[SinkSpout].baseMS,
+		SpoutDelayMS:              c.sinks[SinkSpout].appliedMS,
+		SpoutSamples:              c.sinks[SinkSpout].samples,
+		VideoClamped:              c.sinks[SinkVcam].clamped || c.sinks[SinkSpout].clamped,
 	}
 }
 
@@ -591,17 +643,19 @@ func (c *Controller) computeTargetsLocked() (wantAudioMS float64, wantVideoMS [n
 	}
 
 	// Desired relative shift:
-	//   audioTotal = audioBase + wantAudio
+	//   audioBaseTotal = audioBase + audioDownstream
+	//   audioTotal = audioBaseTotal + wantAudio
 	//   videoTotal[i] = videoBase[i] + wantVideo[i]
 	// We want: audioTotal - videoTotal[i] == manual
-	//   => (audioBase - videoBase[i] - manual) = wantVideo[i] - wantAudio
+	//   => (audioBaseTotal - videoBase[i] - manual) = wantVideo[i] - wantAudio
 	// To delay ONLY the faster path(s) (never both audio and the slowest video):
-	//   If slowestVidMS + manual > audioBase -> audio is faster -> delay audio.
+	//   If slowestVidMS + manual > audioBaseTotal -> audio is faster -> delay audio.
 	//   Otherwise -> audio is slower -> delay video(s).
-	if slowestVidMS+manual > c.audioBaseMS {
-		wantAudioMS = math.Min((slowestVidMS+manual)-c.audioBaseMS, MaxAudioDelayMS)
+	audioBaseTotal := c.audioBaseMS + c.audioDownstreamMS
+	if slowestVidMS+manual > audioBaseTotal {
+		wantAudioMS = math.Min((slowestVidMS+manual)-audioBaseTotal, MaxAudioDelayMS)
 	}
-	effectiveAudioMS := c.audioBaseMS + wantAudioMS
+	effectiveAudioMS := audioBaseTotal + wantAudioMS
 
 	for i := range c.sinks {
 		if !c.sinks[i].active || c.sinks[i].samples == 0 {

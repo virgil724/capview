@@ -266,12 +266,12 @@ func TestControllerClampToFrameCapLogsOnce(t *testing.T) {
 	})
 	c.SetAudioMirrorActive(true)
 	c.SetVideoSinkActive(SinkVcam, true, 120)
-	c.SetManualOffsetMS(-150) // push desired video delay past 15-frame cap (~125ms @ 120fps)
+	c.SetManualOffsetMS(-180) // push desired video delay past 23-frame cap (~191.7ms @ 120fps)
 
 	now := int64(1_000_000_000)
 	for i := 0; i < 20; i++ {
 		now += 8_333_333
-		c.ReportAudioMirror(10, 30, 10, 10, now) // 60ms + 150ms manual -> 210ms desired
+		c.ReportAudioMirror(10, 30, 10, 10, now) // 60ms + 180ms manual -> 240ms desired
 		c.ReportVideoEmit(SinkVcam, now-1_000_000, 0, now, 120)
 	}
 	gotMS := NSToMS(c.VideoDelayNS(SinkVcam))
@@ -408,17 +408,17 @@ func TestVideoDelayQueueNoStarvationAtCap60And120FPSAndModeSwitch(t *testing.T) 
 		return emitted, nowNS
 	}
 
-	// Phase 1: 60 frames at 60fps under max cap delay (~250ms = 15 frames).
+	// Phase 1: 60 frames at 60fps under max cap delay (~383ms = 23 frames).
 	emitted60, nowNS := runPhase(60, 16_666_667, 60, 1_000_000_000, 1)
 	if q.Dropped() != 0 {
 		t.Fatalf("60fps capped run dropped %d frames, want 0", q.Dropped())
 	}
-	// 60 arrivals with 15 frames buffered in flight -> ~45 frames emitted.
-	if emitted60 < 42 {
-		t.Fatalf("60fps capped run emitted only %d frames (starvation!), want >=42", emitted60)
+	// 60 arrivals with up to 23 frames buffered in flight -> >= 34 frames emitted.
+	if emitted60 < 34 {
+		t.Fatalf("60fps capped run emitted only %d frames (starvation!), want >=34", emitted60)
 	}
 
-	// Phase 2: live switch 60fps -> 120fps (GC553 1080p120). Cap shrinks from ~250ms to ~125ms.
+	// Phase 2: live switch 60fps -> 120fps (GC553 1080p120). Cap shrinks from ~383ms to ~191.7ms.
 	c.SetVideoSinkActive(SinkVcam, true, 120)
 	if got := NSToMS(c.VideoDelayNS(SinkVcam)); got > maxVideoDelayMS(120)+0.01 {
 		t.Fatalf("after 60->120fps switch, applied delay = %.2fms exceeds 120fps cap %.2fms", got, maxVideoDelayMS(120))
@@ -428,9 +428,9 @@ func TestVideoDelayQueueNoStarvationAtCap60And120FPSAndModeSwitch(t *testing.T) 
 	if q.Dropped() != 0 {
 		t.Fatalf("120fps capped run dropped %d frames, want 0", q.Dropped())
 	}
-	// 120 arrivals with 15 frames buffered in flight -> ~105 frames emitted.
-	if emitted120 < 100 {
-		t.Fatalf("120fps capped run emitted only %d frames (starvation!), want >=100", emitted120)
+	// 120 arrivals with 23 frames buffered in flight -> ~97 frames emitted.
+	if emitted120 < 92 {
+		t.Fatalf("120fps capped run emitted only %d frames (starvation!), want >=92", emitted120)
 	}
 }
 
@@ -479,15 +479,81 @@ func TestSnapshotFormatStats(t *testing.T) {
 		t.Fatalf("empty stats = %q, want empty", got)
 	}
 	s := Snapshot{
-		AutoEnabled:  true,
-		AudioActive:  true,
-		AudioBaseMS:  28.4,
-		VcamActive:   true,
-		VcamBaseMS:   10.2,
-		VcamDelayMS:  18.2,
+		AutoEnabled:               true,
+		AudioActive:               true,
+		AudioBaseMS:               63.4,
+		AudioDownstreamMS:         35.0,
+		AudioDownstreamCalibrated: false,
+		VcamActive:                true,
+		VcamBaseMS:                10.2,
+		VcamDelayMS:               53.2,
 	}
 	line := s.FormatStats()
-	if !strings.Contains(line, "aud 28.4ms") || !strings.Contains(line, "vid 10.2ms") || !strings.Contains(line, "delay vid +18.2ms") {
-		t.Fatalf("unexpected stats line: %q", line)
+	if !strings.Contains(line, "aud 63.4ms (ds 35.0ms default)") || !strings.Contains(line, "vid 10.2ms") || !strings.Contains(line, "delay vid +53.2ms") {
+		t.Fatalf("unexpected default stats line: %q", line)
+	}
+	s.AudioDownstreamMS = 61.5
+	s.AudioDownstreamCalibrated = true
+	lineCal := s.FormatStats()
+	if !strings.Contains(lineCal, "(ds 61.5ms cal)") {
+		t.Fatalf("expected calibrated downstream tag in stats line: %q", lineCal)
+	}
+}
+
+func TestControllerDownstreamAndManualOffsetStackingAt120FPS(t *testing.T) {
+	// Verify MaxDelayFrames=24 gives sufficient headroom at 120fps (~191.7ms)
+	// for 65ms internal audio + 62ms calibrated VB-Cable downstream + -20ms manual offset (~144.5ms).
+	if MaxDelayFrames != 24 {
+		t.Fatalf("MaxDelayFrames = %d, want 24", MaxDelayFrames)
+	}
+	c := NewController(Options{AutoEnabled: true})
+	c.SetAudioDownstreamMS(35.0, false)
+	c.SetAudioMirrorActive(true)
+	c.SetVideoSinkActive(SinkVcam, true, 120)
+
+	now := int64(1_000_000_000)
+	step := func(seconds int) {
+		for i := 0; i < seconds*120; i++ {
+			now += 8_333_333
+			vidDel := c.VideoDelayNS(SinkVcam)
+			c.ReportAudioMirror(10, 25, 20, 10, now) // 65.0 ms internal
+			c.ReportVideoEmit(SinkVcam, now-500_000-vidDel, vidDel, now, 120) // 2.5 ms vid
+		}
+	}
+
+	step(1)
+	// Default 35.0ms downstream: total aud = 100.0ms, vid = 2.5ms -> vid delay = 97.5ms.
+	if got := NSToMS(c.VideoDelayNS(SinkVcam)); math.Abs(got-97.5) > 0.3 {
+		t.Fatalf("default 35ms downstream: vidDelay = %.2fms, want ~97.5ms", got)
+	}
+	if snap := c.Snapshot(); snap.AudioDownstreamCalibrated || math.Abs(snap.AudioDownstreamMS-35.0) > 1e-6 || math.Abs(snap.AudioBaseMS-100.0) > 0.3 {
+		t.Fatalf("unexpected default snapshot: %+v", snap)
+	}
+
+	// Apply calibrated downstream 62.0ms -> total aud = 127.0ms -> target vid delay = 124.5ms (slews at 3ms/s -> 9s).
+	c.SetAudioDownstreamMS(62.0, true)
+	step(12)
+	if got := NSToMS(c.VideoDelayNS(SinkVcam)); math.Abs(got-124.5) > 0.3 {
+		t.Fatalf("calibrated 62ms downstream: vidDelay = %.2fms, want ~124.5ms", got)
+	}
+	if snap := c.Snapshot(); !snap.AudioDownstreamCalibrated || snap.VideoClamped {
+		t.Fatalf("calibrated 120fps must be calibrated and unclamped: %+v", snap)
+	}
+
+	// Stack manual offset -20ms (delay video further) -> target vid delay = 144.5ms (still unclamped at 120fps!).
+	c.SetManualOffsetMS(-20)
+	step(10)
+	if got := NSToMS(c.VideoDelayNS(SinkVcam)); math.Abs(got-144.5) > 0.3 {
+		t.Fatalf("calibrated + manual -20ms: vidDelay = %.2fms, want ~144.5ms", got)
+	}
+	if snap := c.Snapshot(); snap.VideoClamped {
+		t.Fatalf("144.5ms at 120fps must NOT clamp with MaxDelayFrames=24: %+v", snap)
+	}
+
+	// Stack manual offset +15ms (delay audio further) -> target vid delay = 109.5ms.
+	c.SetManualOffsetMS(+15)
+	step(15)
+	if got := NSToMS(c.VideoDelayNS(SinkVcam)); math.Abs(got-109.5) > 0.3 {
+		t.Fatalf("calibrated + manual +15ms: vidDelay = %.2fms, want ~109.5ms", got)
 	}
 }
