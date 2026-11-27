@@ -82,16 +82,32 @@ go build -ldflags="-s -w" -o capview-cli.exe ./cmd/capview
 .\capview.exe
 ```
 
-Settings (device, resolution/FPS, audio input/output, volume, mute, VRR/VSync, Spout output, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
+Settings (device, resolution/FPS, audio input/output, audio mirror, volume, mute, VRR/VSync, Spout output, Virtual Camera, Audience A/V Sync, window size/position) are saved automatically to `%APPDATA%\capview\config.json`.
 
 ### Controls
 
-- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Audio Mirror Output, Fullscreen, VRR/VSync, Mute, Spout Output, Virtual Camera, Audience A/V Sync, Quit)
+- **Right-Click**: Native menu (switch Video Device, Resolution/FPS, Audio Input/Output, Audio Mirror Output, Fullscreen, VRR/VSync, Mute, Spout Output, Virtual Camera, Audience A/V Sync, Setup Check, Quit)
 - `F11` / `F` / `Alt+Enter`: Toggle borderless fullscreen (cursor auto-hides after 2s; engages Independent Flip / VRR for <1 ms display latency)
 - `V`: Toggle VRR / `ALLOW_TEARING` vs VSync
 - `M`: Mute / unmute audio
 - `Up` / `Down` / Mouse Wheel: Volume +/- 5%
 - `ESC` / `Q`: Quit
+
+## Sharing with an Audience
+
+Play locally at full VRR speed (~23 ms) while sharing your capture feed to friends, calls, or streams — **zero added latency** to your local monitor or headphones.
+
+> **One-stop check**: Right-click → **`Setup Check...`** (or run `capview-cli.exe setup-check`) inspects VB-Cable, OBS / `obs-spout2-plugin`, Virtual Camera registration, and Audience A/V Sync calibration status in one view *(added in the companion Setup Check PR)*.
+
+Pick the setup that matches where your audience is watching:
+
+| Scenario | Video Path | Audio Path | Sync & Recommended Steps |
+| :--- | :--- | :--- | :--- |
+| **1. Video Calls** *(Google Meet, Zoom, Teams, Browser)* | **Virtual Camera** (`capview Virtual Camera`; Win11 MF / Win10 DirectShow) | **Audio Mirror Output** → VB-Cable **`CABLE Input`**; select **`CABLE Output`** as your mic in the call app | **Audience A/V Sync** is on by default. Run **`Audience A/V Sync ▸ Calibrate`** once, then fine-tune with **`Delay Audio / Video +10 ms`** (`av_sync_offset_ms`) if the call app adds extra buffering. |
+| **2. OBS Streaming & Recording** | **Spout2 Output** *(recommended — GPU zero-copy, lowest latency; requires [obs-spout2-plugin](https://github.com/Off-World-Live/obs-spout2-plugin))* **or** **Virtual Camera** | **Audio Mirror Output** → **`CABLE Output`** (add as Audio Input Capture in OBS) **or** OBS **Application Audio Capture** targeting `capview.exe` | Run **`Audience A/V Sync ▸ Calibrate`** once when routing through VB-Cable so OBS receives tightly aligned video and audio (`\|Δ\| ≤ 20 ms`). |
+| **3. Discord Screen Share** | Share the **`capview`** window directly in Discord | Native window audio capture *(carried automatically with the shared window)* | No virtual camera, Spout plugin, or VB-Cable needed. |
+
+See the technical sections below for full details on [Spout2 Output (OBS)](#spout2-output-obs), [Windows x64 Virtual Camera](#windows-x64-virtual-camera-windows-11--windows-10), and [Audience A/V Sync](#audience-av-sync).
 
 ### Spout2 output (OBS)
 
@@ -122,7 +138,7 @@ The sender is pure Go (no Spout DLL): a separate thread with its own D3D11 devic
   - Everyday **Enable** / **Disable** runs with **zero admin privileges**.
 - **Standby placeholder**: When capture is idle, paused, or disabled (on Windows 10), the virtual camera outputs a dark `"capview"` placeholder frame at the negotiated resolution/FPS (`1080p60`, `1080p30`, `720p60`, `720p30`) and format (`NV12`, `YUY2`, or bottom-up `RGB24`).
 - **Backend override flag (testing/diagnostics)**: `-vcam-backend=auto|mf|dshow` (plus `both` for `-vcam-install` diagnostics) lets you explicitly test the DirectShow path on Windows 11 without changing the default single-backend behavior.
-- **TODO (Code Signing)**: Release binaries (`capview.exe` and `capview_vcam.dll`) are not yet Authenticode-signed. Adding an Authenticode signing step to the release workflow is tracked before public distribution to avoid Microsoft Defender SmartScreen prompts and WDAC/HVCI `svchost.exe` load restrictions.
+- **Code Signing Status**: Release binaries (`capview.exe`, `capview-cli.exe`, and `capview_vcam.dll`) are currently unsigned; opt-in Authenticode signing hooks are wired into `.github/workflows/ci.yml` pending certificate selection (see [docs/code-signing-options.md](docs/code-signing-options.md)). Unsigned builds may trigger Microsoft Defender SmartScreen prompts or strict WDAC/HVCI `svchost.exe` load restrictions.
 
 ### Windows 10 Manual Verification Checklist
 1. Place `capview.exe`, `capview-cli.exe`, and `capview_vcam.dll` in the same folder on a Windows 10 x64 machine.

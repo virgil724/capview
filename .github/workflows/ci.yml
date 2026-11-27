@@ -7,7 +7,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   linux:
@@ -114,7 +114,144 @@ jobs:
           name: capview-vcam-dll-x64
           path: dist
 
-      - name: Bundle windows/amd64 zip & Checksums
+      # ------------------------------------------------------------------
+      # Optional Authenticode Signing Hooks (run BEFORE zip & checksums)
+      # See docs/code-signing-options.md for setup details.
+      # Hook 1: PFX / signtool.exe
+      #   Requires secrets: CODESIGN_PFX_BASE64, CODESIGN_PFX_PASSWORD
+      #   Optional var:     CODESIGN_TIMESTAMP_URL (default: http://timestamp.digicert.com)
+      # Hook 2: SignPath Foundation (Free OSS Signing)
+      #   Requires var:     SIGNPATH_ORG_ID
+      #   Requires secret:  SIGNPATH_API_TOKEN
+      #   Optional vars:    SIGNPATH_PROJECT_SLUG (default: capview),
+      #                     SIGNPATH_SIGNING_POLICY_SLUG (default: release-signing)
+      # ------------------------------------------------------------------
+      - name: Sign Windows binaries (PFX / signtool.exe)
+        shell: pwsh
+        env:
+          CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
+          CODESIGN_PFX_PASSWORD: ${{ secrets.CODESIGN_PFX_PASSWORD }}
+          CODESIGN_TIMESTAMP_URL: ${{ vars.CODESIGN_TIMESTAMP_URL }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CODESIGN_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:CODESIGN_PFX_PASSWORD)) {
+            Write-Host "Skipping PFX Authenticode signing (CODESIGN_PFX_BASE64 / CODESIGN_PFX_PASSWORD not configured)."
+            exit 0
+          }
+
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) {
+            throw "signtool.exe not found under Windows Kits 10"
+          }
+
+          $timestampUrl = if ([string]::IsNullOrWhiteSpace($env:CODESIGN_TIMESTAMP_URL)) {
+            "http://timestamp.digicert.com"
+          } else {
+            $env:CODESIGN_TIMESTAMP_URL
+          }
+
+          $pfxPath = Join-Path $env:RUNNER_TEMP "capview-codesign.pfx"
+          $targets = @(
+            "dist\capview-windows-amd64.exe",
+            "dist\capview-cli-windows-amd64.exe",
+            "dist\capview_vcam.dll",
+            "dist\capview-windows-arm64.exe",
+            "dist\capview-cli-windows-arm64.exe"
+          )
+
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:CODESIGN_PFX_BASE64.Trim()))
+            foreach ($file in $targets) {
+              Write-Host "Signing $file ..."
+              & $signtool sign /fd SHA256 /f $pfxPath /p $env:CODESIGN_PFX_PASSWORD /tr $timestampUrl /td SHA256 $file
+              if ($LASTEXITCODE -ne 0) {
+                throw "signtool failed for $file with exit code $LASTEXITCODE"
+              }
+            }
+          } finally {
+            if (Test-Path $pfxPath) {
+              Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
+            }
+          }
+
+      - name: Clean up temporary PFX certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "capview-codesign.pfx"
+          if (Test-Path $pfxPath) {
+            Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
+            Write-Host "Removed temporary PFX certificate."
+          }
+
+      - name: Check SignPath Foundation signing configuration
+        id: signpath_check
+        shell: pwsh
+        env:
+          SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_ORG_ID) -or [string]::IsNullOrWhiteSpace($env:SIGNPATH_API_TOKEN)) {
+            Write-Host "Skipping SignPath Foundation signing (vars.SIGNPATH_ORG_ID / secrets.SIGNPATH_API_TOKEN not configured)."
+            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          Write-Host "SignPath Foundation signing enabled for organization '$($env:SIGNPATH_ORG_ID)'."
+          "enabled=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Upload unsigned Windows binaries for SignPath
+        id: upload_unsigned_signpath
+        if: steps.signpath_check.outputs.enabled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: capview-windows-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 1
+          path: |
+            dist/capview-windows-amd64.exe
+            dist/capview-cli-windows-amd64.exe
+            dist/capview_vcam.dll
+            dist/capview-windows-arm64.exe
+            dist/capview-cli-windows-arm64.exe
+
+      - name: Sign Windows binaries (SignPath Foundation)
+        if: steps.signpath_check.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'capview' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.upload_unsigned_signpath.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signpath-signed
+
+      - name: Apply SignPath-signed Windows binaries
+        if: steps.signpath_check.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $signedDir = Join-Path $env:RUNNER_TEMP "signpath-signed"
+          $zips = Get-ChildItem -Path $signedDir -Filter *.zip -Recurse -ErrorAction SilentlyContinue
+          foreach ($z in $zips) {
+            Expand-Archive -Path $z.FullName -DestinationPath $signedDir -Force
+          }
+
+          $targets = @(
+            "capview-windows-amd64.exe",
+            "capview-cli-windows-amd64.exe",
+            "capview_vcam.dll",
+            "capview-windows-arm64.exe",
+            "capview-cli-windows-arm64.exe"
+          )
+          foreach ($name in $targets) {
+            $match = Get-ChildItem -Path $signedDir -Filter $name -Recurse | Select-Object -First 1
+            if (-not $match) {
+              throw "SignPath output missing expected signed file: $name"
+            }
+            Copy-Item -Path $match.FullName -Destination (Join-Path "dist" $name) -Force
+            Write-Host "Applied SignPath-signed $name"
+          }
+
+      - name: Bundle windows/amd64 zip & Windows Checksums
         shell: pwsh
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "capview-amd64-bundle"
@@ -134,9 +271,35 @@ jobs:
           name: capview-windows
           path: dist/*
 
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: capview-windows
+          path: release-dist
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: capview-linux
+          path: release-dist
+
+      - name: Generate unified SHA256SUMS.txt
+        run: |
+          rm -f release-dist/SHA256SUMS.txt
+          (cd release-dist && LC_ALL=C sha256sum *) | sort -k2 > SHA256SUMS.txt
+          mv SHA256SUMS.txt release-dist/SHA256SUMS.txt
+          cat release-dist/SHA256SUMS.txt
+
+      - name: Create Draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           generate_release_notes: true
-          files: dist/*
+          files: release-dist/*
