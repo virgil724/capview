@@ -21,6 +21,7 @@ import (
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
+	"github.com/virgil724/capview/internal/setupcheck"
 	"github.com/virgil724/capview/internal/vcam"
 	"github.com/virgil724/capview/internal/win"
 )
@@ -35,6 +36,20 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "vkinfo" {
 		if err := render.PrintVulkanInfo(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "setup-check" {
+		if err := runSetupCheckCLI(os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if hasSetupCheckFlag(os.Args[1:]) {
+		if err := runSetupCheckCLI(os.Args[1:], os.Stdout); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}
@@ -85,6 +100,32 @@ func hasAVSyncCalibrateFlag(args []string) bool {
 		}
 	}
 	return false
+}
+
+func hasSetupCheckFlag(args []string) bool {
+	for _, a := range args {
+		switch {
+		case a == "-setup-check", a == "--setup-check":
+			return true
+		case strings.HasPrefix(a, "-setup-check="), strings.HasPrefix(a, "--setup-check="):
+			v := strings.ToLower(strings.TrimSpace(a[strings.IndexByte(a, '=')+1:]))
+			return v != "false" && v != "0"
+		}
+	}
+	return false
+}
+
+func runSetupCheckCLI(args []string, w io.Writer) error {
+	fs := flag.NewFlagSet("capview-setup-check", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_ = fs.Bool("setup-check", true, "check optional third-party integrations and exit")
+	cfgPath := fs.String("config", config.DefaultPath(), "path to config.json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	rep := setupcheck.RunWithConfigPath(*cfgPath)
+	_, err := io.WriteString(w, rep.FormatText())
+	return err
 }
 
 func runAVSyncCalibrateCLI(args []string) error {
@@ -353,6 +394,8 @@ type appHost struct {
 	mirrorTargetMS int
 	calibrating    atomic.Bool
 	calibWG        sync.WaitGroup
+	setupChecking  atomic.Bool
+	setupCheckWG   sync.WaitGroup
 	ctx            context.Context
 
 	// Dedicated lock protecting the in-memory downstream latency snapshot used
@@ -363,11 +406,14 @@ type appHost struct {
 	downstreamMS map[string]float64
 
 	// Optional overrides for deterministic unit tests (nil uses real implementations).
-	listEndpointsFn   func() (inputs, outputs []audio.EndpointInfo, err error)
-	defaultOutputIDFn func() (string, error)
-	calibrateFn       func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error)
-	showErrorBoxFn    func(title, msg string)
-	showInfoBoxFn     func(title, msg string)
+	listEndpointsFn    func() (inputs, outputs []audio.EndpointInfo, err error)
+	defaultOutputIDFn  func() (string, error)
+	calibrateFn        func(ctx context.Context, mirrorID, captureID string) (audio.CalibrationResult, error)
+	showErrorBoxFn     func(title, msg string)
+	showInfoBoxFn      func(title, msg string)
+	showYesNoInfoBoxFn func(title, msg string) bool
+	setClipboardTextFn func(text string) error
+	runSetupCheckFn    func(cfg config.Config) setupcheck.Report
 
 	// Menu action map populated on BuildMenu and consumed on HandleMenu.
 	menuActions map[uint32]func() (toggleFS, toggleVSync, quit bool)
@@ -394,6 +440,62 @@ func (h *appHost) showInfoBox(title, msg string) {
 		return
 	}
 	win.ShowInfoBox(title, msg)
+}
+
+func (h *appHost) showYesNoInfoBox(title, msg string) bool {
+	if h.showYesNoInfoBoxFn != nil {
+		return h.showYesNoInfoBoxFn(title, msg)
+	}
+	return win.ShowYesNoInfoBox(title, msg)
+}
+
+func (h *appHost) setClipboardText(text string) error {
+	if h.setClipboardTextFn != nil {
+		return h.setClipboardTextFn(text)
+	}
+	return win.SetClipboardText(text)
+}
+
+// startSetupCheckAsync runs read-only setup checks on a background goroutine so
+// low-latency video/audio playback continues uninterrupted while the user reads
+// the Setup Check dialog.
+func (h *appHost) startSetupCheckAsync() {
+	if !h.setupChecking.CompareAndSwap(false, true) {
+		return
+	}
+	h.mu.Lock()
+	cfg := h.cfg
+	cfg.AudioMirrorID = h.activeMirrorIDLocked()
+	if len(h.cfg.AudioMirrorDownstreamMS) > 0 {
+		cp := make(map[string]float64, len(h.cfg.AudioMirrorDownstreamMS))
+		for k, v := range h.cfg.AudioMirrorDownstreamMS {
+			cp[k] = v
+		}
+		cfg.AudioMirrorDownstreamMS = cp
+	}
+	runFn := h.runSetupCheckFn
+	h.mu.Unlock()
+
+	h.setupCheckWG.Add(1)
+	go func() {
+		defer h.setupCheckWG.Done()
+		defer h.setupChecking.Store(false)
+
+		var rep setupcheck.Report
+		if runFn != nil {
+			rep = runFn(cfg)
+		} else {
+			rep = setupcheck.Run(cfg)
+		}
+		text := rep.FormatText()
+		msg := text + "\nClick Yes to copy this report (with download links) to clipboard, or No to close."
+		if h.showYesNoInfoBox("capview — Setup Check", msg) {
+			if err := h.setClipboardText(text); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: copy Setup Check report to clipboard failed: %v\n", err)
+				h.showErrorBox("capview", fmt.Sprintf("Failed to copy report to clipboard:\n%v", err))
+			}
+		}
+	}()
 }
 
 // syncDownstreamFromConfigLocked clones h.cfg.AudioMirrorDownstreamMS into the
@@ -1075,6 +1177,12 @@ func (h *appHost) BuildMenu(fullscreen, vsync bool) []render.MenuItem {
 	items = append(items,
 		render.MenuItem{Separator: true},
 		render.MenuItem{
+			ID:       addAction(func() (bool, bool, bool) { h.startSetupCheckAsync(); return false, false, false }),
+			Label:    "Setup Check...",
+			Disabled: h.setupChecking.Load(),
+		},
+		render.MenuItem{Separator: true},
+		render.MenuItem{
 			ID:    addAction(func() (bool, bool, bool) { return false, false, true }),
 			Label: "Quit (ESC)",
 		},
@@ -1396,6 +1504,7 @@ func runView(args []string) error {
 	avSyncOffset := fs.Int("av-sync-offset", cfg.AVSyncOffsetMS, "manual audience A/V sync offset in ms (+ delays audio, - delays video; [-200..200])")
 	_ = fs.Bool("av-sync-calibrate", false, "calibrate downstream audio mirror latency, save to config.json, and exit")
 	_ = fs.String("av-sync-calibrate-in", "", "optional capture endpoint name/substring/ID for -av-sync-calibrate (default: auto-pair)")
+	_ = fs.Bool("setup-check", false, "check optional third-party integrations (VB-Cable, OBS Spout2, Virtual Camera, A/V Sync) and exit")
 	syncTest := fs.Bool("sync-test", false, "in synthetic mode, emit synchronized 1 Hz white flash + 1 kHz beep test signal")
 	mirrorTargetMS := fs.Int("audio-mirror-target-ms", 0, "optional audio mirror ring target fill duration in ms (0 = default)")
 	if err := fs.Parse(args); err != nil {

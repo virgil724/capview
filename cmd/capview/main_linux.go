@@ -15,7 +15,9 @@ import (
 	"github.com/virgil724/capview/internal/audio"
 	"github.com/virgil724/capview/internal/capture"
 	"github.com/virgil724/capview/internal/clock"
+	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
+	"github.com/virgil724/capview/internal/setupcheck"
 )
 
 // Linux entry point: Wayland (or experimental direct-to-display) + Vulkan
@@ -32,6 +34,7 @@ type options struct {
 	noAudio                      bool
 	audioIn, audioOut            string
 	volume                       float64
+	setupCheck                   bool
 }
 
 func main() {
@@ -40,6 +43,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, "capview:", err)
 			os.Exit(1)
 		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "setup-check" {
+		fmt.Print(setupcheck.RunWithConfigPath(config.DefaultPath()).FormatText())
 		return
 	}
 	var o options
@@ -59,7 +66,13 @@ func main() {
 	fs.StringVar(&o.audioIn, "audio-in", "auto", "ALSA capture device (name, substring, hw:X,Y) or auto (the capture card's)")
 	fs.StringVar(&o.audioOut, "audio-out", "default", "ALSA playback device (name, substring, hw:X,Y) or default (PipeWire/PulseAudio)")
 	fs.Float64Var(&o.volume, "volume", 0.7, "initial audio volume 0..1 (Up/Down/wheel adjust, M mutes)")
+	fs.BoolVar(&o.setupCheck, "setup-check", false, "print setup check report and exit")
 	_ = fs.Parse(os.Args[1:])
+
+	if o.setupCheck {
+		fmt.Print(setupcheck.RunWithConfigPath(config.DefaultPath()).FormatText())
+		return
+	}
 
 	if err := run(o); err != nil {
 		fmt.Fprintln(os.Stderr, "capview:", err)

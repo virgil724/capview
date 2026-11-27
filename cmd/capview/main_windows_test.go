@@ -3,9 +3,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,6 +17,7 @@ import (
 	"github.com/virgil724/capview/internal/avsync"
 	"github.com/virgil724/capview/internal/config"
 	"github.com/virgil724/capview/internal/render"
+	"github.com/virgil724/capview/internal/setupcheck"
 )
 
 func TestMatchMirror(t *testing.T) {
@@ -540,4 +543,129 @@ func TestStartCalibrateAsyncContextCanceledSilent(t *testing.T) {
 	if errBoxes.Load() != 1 {
 		t.Fatalf("expected 1 error box for real calibration failure, got %d", errBoxes.Load())
 	}
+}
+
+func TestSetupCheckFlagHelpersAndCLI(t *testing.T) {
+	for _, args := range [][]string{
+		{"-setup-check"},
+		{"--setup-check"},
+		{"-setup-check=true"},
+		{"--setup-check=1"},
+		{"-config", "foo.json", "-setup-check"},
+	} {
+		if !hasSetupCheckFlag(args) {
+			t.Errorf("hasSetupCheckFlag(%v) = false, want true", args)
+		}
+	}
+	for _, args := range [][]string{
+		{},
+		{"-setup-check=false"},
+		{"--setup-check=0"},
+		{"-vkinfo"},
+	} {
+		if hasSetupCheckFlag(args) {
+			t.Errorf("hasSetupCheckFlag(%v) = true, want false", args)
+		}
+	}
+
+	var buf bytes.Buffer
+	cfgPath := filepath.Join(t.TempDir(), "config.json")
+	if err := runSetupCheckCLI([]string{"-config", cfgPath}, &buf); err != nil {
+		t.Fatalf("runSetupCheckCLI failed: %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{
+		"capview Setup Check",
+		"VB-Cable / Virtual Audio Cable",
+		"OBS Studio & Spout2 Plugin",
+		"Virtual Camera (capview_vcam.dll)",
+		"Audience A/V Sync Calibration",
+		"Summary:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("CLI output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestSetupCheckMenuYesCopiesClipboardAndNoSkips(t *testing.T) {
+	findItem := func(items []render.MenuItem, label string) *render.MenuItem {
+		for i := range items {
+			if items[i].Label == label {
+				return &items[i]
+			}
+		}
+		return nil
+	}
+
+	fakeReport := setupcheck.Report{
+		GOOS:   "windows",
+		GOARCH: "amd64",
+		Items: []setupcheck.CheckItem{
+			{
+				ID:      setupcheck.CheckVirtualAudioCable,
+				Name:    "VB-Cable / Virtual Audio Cable",
+				Status:  setupcheck.StatusMissing,
+				Summary: "Not detected.",
+				Links:   []setupcheck.Link{{Label: "VB-Cable", URL: setupcheck.URLVBCable}},
+			},
+		},
+	}
+
+	var gotTitle, gotMsg, copied string
+	var copyCalls atomic.Int32
+	h := &appHost{
+		cfg: config.Default(),
+		runSetupCheckFn: func(cfg config.Config) setupcheck.Report {
+			return fakeReport
+		},
+		showYesNoInfoBoxFn: func(title, msg string) bool {
+			gotTitle = title
+			gotMsg = msg
+			return true
+		},
+		setClipboardTextFn: func(text string) error {
+			copyCalls.Add(1)
+			copied = text
+			return nil
+		},
+	}
+
+	items := h.BuildMenu(false, false)
+	it := findItem(items, "Setup Check...")
+	if it == nil || it.Disabled || it.ID == 0 {
+		t.Fatalf("expected enabled Setup Check... menu item, got %+v", it)
+	}
+
+	h.HandleMenu(it.ID)
+	h.setupCheckWG.Wait()
+
+	if !strings.Contains(gotTitle, "Setup Check") {
+		t.Fatalf("unexpected dialog title %q", gotTitle)
+	}
+	if !strings.Contains(gotMsg, setupcheck.URLVBCable) || !strings.Contains(gotMsg, "Click Yes to copy") {
+		t.Fatalf("unexpected dialog message:\n%s", gotMsg)
+	}
+	if copyCalls.Load() != 1 || copied != fakeReport.FormatText() {
+		t.Fatalf("expected clipboard copy of FormatText() once, calls=%d copied=%q", copyCalls.Load(), copied)
+	}
+
+	// Clicking No must NOT copy to clipboard.
+	h.showYesNoInfoBoxFn = func(title, msg string) bool { return false }
+	items = h.BuildMenu(false, false)
+	it = findItem(items, "Setup Check...")
+	h.HandleMenu(it.ID)
+	h.setupCheckWG.Wait()
+	if copyCalls.Load() != 1 {
+		t.Fatalf("expected no additional clipboard copy on No, got %d", copyCalls.Load())
+	}
+
+	// While dialog is open, Setup Check... menu item is disabled and duplicate triggers are ignored.
+	h.setupChecking.Store(true)
+	items = h.BuildMenu(false, false)
+	it = findItem(items, "Setup Check...")
+	if it == nil || !it.Disabled {
+		t.Fatalf("expected Setup Check... disabled while open, got %+v", it)
+	}
+	h.setupChecking.Store(false)
 }
