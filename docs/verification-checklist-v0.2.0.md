@@ -6,7 +6,7 @@ Release candidate baseline: `main` @ `574f710` (plus companion Setup Check PR A 
 
 ## Part 1: Engineer Automated Regression (`main` `574f710`)
 
-> **Status: COMPLETED** — Independent regression run by `入門工程師-google` on `main` @ `574f71054411b867e59fcd98c68be78c116ae78a`.
+> **Status: COMPLETED** — Independent automated regression run on `main` @ `574f71054411b867e59fcd98c68be78c116ae78a`.
 
 ### 1.1 Cross-Platform Build, Vet & Unit Test Matrix (`CGO_ENABLED=0`)
 
@@ -113,3 +113,4 @@ Perform these manual checks on real hardware before converting the draft `v0.2.0
 - [ ] **`Audience A/V Sync`**: Verify **`Auto Sync`** toggle, **`Calibrate`** (and **`Calibrate With`** submenu when multiple capture devices exist), **`Delay Audio +10 ms`**, **`Delay Video +10 ms`**, and **`Reset Offset (0 ms)`** all update labels/checkmarks and persist cleanly.
 - [ ] **`Setup Check...`** *(after companion PR A merges)*: Click **`Setup Check...`** in the right-click menu and run `.\capview-cli.exe setup-check`.
   - **Expected**: Accurately reports status for VB-Cable (`CABLE Input` / `CABLE Output`), OBS & `obs-spout2-plugin`, Virtual Camera DLL / OS registration, and Audience A/V Sync calibration without crashing or mutating settings.
+- [ ] **Pre-tag docs cleanup**: After both PR #9 (Setup Check) and PR #10 (v0.2.0 release readiness) are merged and before tagging `v0.2.0`, remove the `*(companion PR)*` / `*(added in the companion Setup Check PR)*` parentheticals from `README.md`, `CHANGELOG.md`, and `docs/release-v0.2.0-draft.md`.

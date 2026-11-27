@@ -115,7 +115,10 @@ jobs:
           path: dist
 
       # ------------------------------------------------------------------
-      # Optional Authenticode Signing Hooks (run BEFORE zip & checksums)
+      # Optional Authenticode Signing Hooks (run ONLY on refs/tags/v* pushes,
+      # strictly BEFORE zip bundling & checksums). PRs and main pushes skip
+      # signing completely. If both hooks are configured, PFX runs and SignPath
+      # is skipped (mutual exclusion) to prevent double-signing.
       # See docs/code-signing-options.md for setup details.
       # Hook 1: PFX / signtool.exe
       #   Requires secrets: CODESIGN_PFX_BASE64, CODESIGN_PFX_PASSWORD
@@ -127,6 +130,8 @@ jobs:
       #                     SIGNPATH_SIGNING_POLICY_SLUG (default: release-signing)
       # ------------------------------------------------------------------
       - name: Sign Windows binaries (PFX / signtool.exe)
+        id: pfx_sign
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
           CODESIGN_PFX_BASE64: ${{ secrets.CODESIGN_PFX_BASE64 }}
@@ -135,6 +140,7 @@ jobs:
         run: |
           if ([string]::IsNullOrWhiteSpace($env:CODESIGN_PFX_BASE64) -or [string]::IsNullOrWhiteSpace($env:CODESIGN_PFX_PASSWORD)) {
             Write-Host "Skipping PFX Authenticode signing (CODESIGN_PFX_BASE64 / CODESIGN_PFX_PASSWORD not configured)."
+            "signed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             exit 0
           }
 
@@ -168,6 +174,7 @@ jobs:
                 throw "signtool failed for $file with exit code $LASTEXITCODE"
               }
             }
+            "signed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } finally {
             if (Test-Path $pfxPath) {
               Remove-Item -Force -ErrorAction SilentlyContinue $pfxPath
@@ -186,11 +193,18 @@ jobs:
 
       - name: Check SignPath Foundation signing configuration
         id: signpath_check
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
+          PFX_SIGNED: ${{ steps.pfx_sign.outputs.signed }}
           SIGNPATH_ORG_ID: ${{ vars.SIGNPATH_ORG_ID }}
           SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
         run: |
+          if ($env:PFX_SIGNED -eq 'true') {
+            Write-Host "Skipping SignPath Foundation signing (binaries already signed by PFX / signtool.exe hook)."
+            "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
           if ([string]::IsNullOrWhiteSpace($env:SIGNPATH_ORG_ID) -or [string]::IsNullOrWhiteSpace($env:SIGNPATH_API_TOKEN)) {
             Write-Host "Skipping SignPath Foundation signing (vars.SIGNPATH_ORG_ID / secrets.SIGNPATH_API_TOKEN not configured)."
             "enabled=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -201,7 +215,7 @@ jobs:
 
       - name: Upload unsigned Windows binaries for SignPath
         id: upload_unsigned_signpath
-        if: steps.signpath_check.outputs.enabled == 'true'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && steps.signpath_check.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: capview-windows-unsigned-${{ github.run_id }}-${{ github.run_attempt }}
@@ -214,7 +228,7 @@ jobs:
             dist/capview-cli-windows-arm64.exe
 
       - name: Sign Windows binaries (SignPath Foundation)
-        if: steps.signpath_check.outputs.enabled == 'true'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && steps.signpath_check.outputs.enabled == 'true'
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -226,7 +240,7 @@ jobs:
           output-artifact-directory: ${{ runner.temp }}/signpath-signed
 
       - name: Apply SignPath-signed Windows binaries
-        if: steps.signpath_check.outputs.enabled == 'true'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && steps.signpath_check.outputs.enabled == 'true'
         shell: pwsh
         run: |
           $signedDir = Join-Path $env:RUNNER_TEMP "signpath-signed"
@@ -272,7 +286,7 @@ jobs:
           path: dist/*
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [linux, build]
     runs-on: ubuntu-latest
     permissions:

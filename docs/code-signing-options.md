@@ -39,7 +39,11 @@ Without an Authenticode signature, first-time users see a **Microsoft Defender S
 
 ## Owner Next-Step Checklist (Matching `.github/workflows/ci.yml`)
 
-`.github/workflows/ci.yml` already ships **both** opt-in signing hooks before `capview-windows-amd64.zip` is assembled and before `SHA256SUMS.txt` is generated. Until you configure one of the paths below, both hooks safely no-op.
+`.github/workflows/ci.yml` already ships **both** opt-in signing hooks before `capview-windows-amd64.zip` is assembled and before `SHA256SUMS.txt` is generated:
+
+- **Tag-only execution**: Signing hooks are gated by `github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')` — they **never** run on pull requests or pushes to `main`, so PR CI never stalls or fails on release signing once credentials are configured.
+- **Mutual exclusion**: If both PFX and SignPath credentials are configured at the same time, the PFX (`signtool.exe`) hook runs and the SignPath Foundation hook is automatically skipped (with a clear log notice) so binaries are never double-signed or overwritten.
+- **Safe no-op default**: Until you configure one of the paths below, tag builds cleanly skip signing and produce unsigned draft release artifacts.
 
 ### Path A — Enable SignPath Foundation (Recommended)
 
@@ -52,7 +56,7 @@ Without an Authenticode signature, first-time users see a **Microsoft Defender S
      - `SIGNPATH_SIGNING_POLICY_SLUG` — optional *(defaults to `release-signing`)*
    - **Secrets**:
      - `SIGNPATH_API_TOKEN` — your SignPath CI submitter API token *(required to activate hook)*
-4. Trigger a workflow run and verify the signed binaries inside `capview-windows-amd64.zip` with `Get-AuthenticodeSignature`.
+4. Push a `v*` release tag (creating a **draft** GitHub Release) and verify the signed binaries inside `capview-windows-amd64.zip` with `Get-AuthenticodeSignature` before publishing.
 
 ### Path B — Enable PFX / `signtool.exe` (Self-Managed Certificate)
 
